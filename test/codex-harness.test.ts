@@ -2136,3 +2136,49 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
   assert.equal(result.reply, "denied");
   assert.equal(shared, false);
 });
+
+test("Codex resolves managed keys for each new turn and never falls back after disabling", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-codex-managed-"));
+  const binary = fakeCodexBinary(dir);
+  const capture = join(dir, "keys.jsonl");
+  writeFileSync(
+    binary,
+    readFileSync(binary, "utf8").replace(
+      'const readline = require("node:readline");',
+      `require("node:fs").appendFileSync(${JSON.stringify(capture)}, JSON.stringify(process.env.OPENAI_API_KEY) + "\\n");\nconst readline = require("node:readline");`,
+    ),
+  );
+  let key: string | null = "managed-one";
+  const harness = createCodexHarness({
+    binaryPath: binary,
+    env: { ...testHarnessEnv(dir), OPENAI_API_KEY: "stale-environment" },
+    resolveApiKey: async () => key,
+  });
+  t.after(async () => {
+    await harness.turns.close?.();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const turn = (): HarnessTurnInput => ({
+    session: { id: "managed-session" } as Session,
+    input: "hi",
+    systemPrompt: "be concise",
+    history: [],
+    tools: {} as HarnessTurnInput["tools"],
+    scopeLabel: "org:test" as ScopeId,
+    orgScopeId: "org:test" as ScopeId,
+    emit: async (entry) => ({ ...entry, sessionId: "managed-session", seq: 1, createdAt: Date.now() }) as SessionEntry,
+    recordModelCall: () => {},
+  });
+  await harness.turns.runTurn(turn());
+  key = "managed-two";
+  await harness.turns.runTurn(turn());
+  assert.deepEqual(
+    readFileSync(capture, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line)),
+    ["managed-one", "managed-two"],
+  );
+  key = null;
+  await assert.rejects(harness.turns.runTurn(turn()), /OpenAI API key is not configured/);
+});

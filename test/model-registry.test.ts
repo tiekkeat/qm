@@ -152,7 +152,7 @@ test("exposure is provider-key-aware: a model whose provider is unconfigured is 
   assert.deepEqual(serviceableModelIds(["claude-opus-4-8", "gpt-5.6-sol"], noOpenai), ["claude-opus-4-8"]);
 });
 
-test("provider-key gating applies only to key-authed harnesses (no over-hiding on CLI-auth harnesses)", () => {
+test("provider-key gating uses managed keys and explicit subscription authentication", () => {
   const noKeys = { anthropic: false, openai: false, openrouter: false };
   assert.deepEqual(modelProviderAvailabilityFor("pi", noKeys), noKeys);
   assert.deepEqual(modelProviderAvailabilityFor("opencode", noKeys), noKeys);
@@ -167,7 +167,7 @@ test("provider-key gating applies only to key-authed harnesses (no over-hiding o
       { anthropic: true, openai: true, openrouter: true },
       { anthropic: false, openai: false, openrouter: false },
     ),
-    { anthropic: true, openai: true, openrouter: false },
+    { anthropic: false, openai: false, openrouter: false },
   );
   assert.deepEqual(modelProviderAvailabilityFor("codex", noKeys), noKeys);
   assert.deepEqual(modelProviderAvailabilityFor("codex", { anthropic: false, openai: true, openrouter: false }), {
@@ -175,7 +175,7 @@ test("provider-key gating applies only to key-authed harnesses (no over-hiding o
     openai: true,
     openrouter: false,
   });
-  assert.deepEqual(modelProviderAvailabilityFor("claude", noKeys), { anthropic: true, openai: true, openrouter: true });
+  assert.deepEqual(modelProviderAvailabilityFor("claude", noKeys), noKeys);
   assert.deepEqual(modelProviderAvailabilityFor("mock", noKeys), { anthropic: true, openai: true, openrouter: true });
 });
 
@@ -194,4 +194,15 @@ test("fast-mode support is registry-driven", () => {
   assert.equal(modelSupportsFastMode("gpt-5.6-sol"), true);
   assert.equal(modelSupportsFastMode(undefined), false);
   assert.equal(modelSupportsFastMode("nonexistent-model"), false);
+});
+
+test("managed key rotation and disabling govern API-key harness availability while subscription auth remains available", () => {
+  const startup = { anthropic: true, openai: true, openrouter: true };
+  const disabled = { anthropic: false, openai: false, openrouter: false };
+  for (const harness of ["pi", "codex", "claude", "opencode"]) {
+    assert.deepEqual(modelProviderAvailabilityFor(harness, startup, disabled), disabled);
+  }
+  assert.equal(modelProviderAvailabilityFor("codex", { ...disabled, codexOAuth: true }, disabled).openai, true);
+  assert.equal(modelProviderAvailabilityFor("claude", { ...disabled, claudeOAuth: true }, disabled).anthropic, true);
+  assert.equal(modelProviderAvailabilityFor("codex", disabled, startup).openai, true);
 });

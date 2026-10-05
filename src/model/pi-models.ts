@@ -646,6 +646,7 @@ export interface ModelProviderAvailability {
   openrouter: boolean;
   modelIds?: ReadonlySet<string>;
   codexOAuth?: boolean;
+  claudeOAuth?: boolean;
 }
 
 function providerFlags(value: ModelProviderAvailability): ModelProviderAvailability {
@@ -676,9 +677,11 @@ export function modelProviderAvailabilityFor(
   managedKeys: ModelProviderAvailability = configKeys,
 ): ModelProviderAvailability {
   if (harness === "pi") return managedKeys;
-  if (harness === "opencode") return { ...providerFlags(configKeys), openrouter: false };
+  if (harness === "opencode") return { ...providerFlags(managedKeys), openrouter: false };
   if (harness === "codex")
-    return { ...providerFlags(configKeys), openai: configKeys.openai || Boolean(configKeys.codexOAuth) };
+    return { ...providerFlags(managedKeys), openai: managedKeys.openai || Boolean(configKeys.codexOAuth) };
+  if (harness === "claude")
+    return { anthropic: managedKeys.anthropic || Boolean(configKeys.claudeOAuth), openai: false, openrouter: false };
   return ALL_PROVIDERS_AVAILABLE;
 }
 

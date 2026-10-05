@@ -69,6 +69,7 @@ export interface OpenCodeHarnessOptions extends HarnessToolPlumbing {
   judgeModelId?: string;
   apiKey?: string;
   openaiApiKey?: string;
+  resolveProviderKeys?: () => Promise<{ anthropic?: string; openai?: string }>;
   turnWallClockMs?: number;
   signals?: RunSignalStore;
   binaryPath?: string;
@@ -733,6 +734,9 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
             },
           ]),
         );
+        const providerKeys = opts.resolveProviderKeys
+          ? await opts.resolveProviderKeys()
+          : { anthropic: opts.apiKey, openai: opts.openaiApiKey };
         const config = {
           plugin: [pluginUrl],
           autoupdate: false,
@@ -743,8 +747,8 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
           instructions: [],
           enabled_providers: ["anthropic", "openai", ...custom.map(({ spec }) => spec.id)],
           provider: {
-            anthropic: { options: { apiKey: opts.apiKey ?? "" } },
-            openai: { options: { apiKey: opts.openaiApiKey ?? "" } },
+            anthropic: { options: { apiKey: providerKeys.anthropic ?? "" } },
+            openai: { options: { apiKey: providerKeys.openai ?? "" } },
             ...customProviderConfig,
           },
           tools: {

@@ -429,7 +429,7 @@ test("admin scope keeps the selected runtime model visible when its provider is 
   }
 });
 
-test("managed Pi keys do not advertise unsupported OpenCode or browser credentials", async () => {
+test("managed provider keys advertise supported OpenCode and browser models", async () => {
   const srv = start({ harness: "opencode" });
   try {
     for (const provider of ["anthropic", "openai"] as const) {
@@ -447,10 +447,10 @@ test("managed Pi keys do not advertise unsupported OpenCode or browser credentia
       browseModelOptions: Array<{ id: string }>;
       modelsByHarness: Record<string, Array<{ id: string }>>;
     };
-    assert.deepEqual(data.baseModelOptions, []);
-    assert.deepEqual(data.browseModelOptions, []);
+    assert.ok(data.baseModelOptions.some((model) => model.id === "gpt-5.6-sol"));
+    assert.ok(data.browseModelOptions.some((model) => model.id === "gpt-5.6-sol"));
     assert.ok(data.modelsByHarness.pi!.some((model) => model.id === "gpt-5.6-sol"));
-    assert.ok(!data.modelsByHarness.opencode!.some((model) => model.id === "gpt-5.6-sol"));
+    assert.ok(data.modelsByHarness.opencode!.some((model) => model.id === "gpt-5.6-sol"));
   } finally {
     await srv.close();
   }
@@ -472,16 +472,18 @@ test("web turns gate the requested and scope-selected harness against its real k
       });
 
     const requested = await turn("web:alice:requested-opencode", { harness: "opencode", model: "gpt-5.6-sol" });
-    assert.equal(requested.status, "refused");
-    assert.match(requested.reason ?? "", /provider isn't configured/);
+    assert.equal(requested.status, "queued");
 
     await srv.built.config.setRuntimeSelectionLatest("personal:alice", {
       harnessId: "opencode",
       modelId: "gpt-5.6-sol",
     });
     const configured = await turn("web:alice:configured-opencode");
-    assert.equal(configured.status, "refused");
-    assert.match(configured.reason ?? "", /provider isn't configured/);
+    assert.equal(configured.status, "queued");
+    await srv.built.modelCredentials.delete("openai", "admin-alice");
+    const disabled = await turn("web:alice:disabled-opencode");
+    assert.equal(disabled.status, "refused");
+    assert.match(disabled.reason ?? "", /provider isn't configured/);
   } finally {
     await srv.close();
   }

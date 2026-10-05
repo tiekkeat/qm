@@ -734,3 +734,19 @@ test("Claude retains a queued message which the SDK never consumes", async () =>
   assert.equal(entries.filter((entry) => entry.type === "user").length, 1);
   assert.equal((await signals.pending("no-echo"))[0]?.signal.ts, "pending");
 });
+
+test("Claude resolves replacement and disabled API keys at turn boundaries", async () => {
+  currentScript = async function* () {
+    yield resultMessage("done");
+  };
+  let key = "managed-one";
+  const harness = createClaudeHarness({
+    env: { ANTHROPIC_API_KEY: "stale-environment" },
+    authEnv: async () => ({ ANTHROPIC_API_KEY: key }),
+  });
+  for (const replacement of ["managed-one", "managed-two", ""]) {
+    key = replacement;
+    await harness.turns.runTurn(harnessTurn().turn);
+    assert.equal((capturedOptions.env as Record<string, unknown>).ANTHROPIC_API_KEY, replacement);
+  }
+});

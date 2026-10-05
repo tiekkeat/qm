@@ -244,3 +244,21 @@ test("purpose runtime cards independently set and clear overrides using the runt
     dom.window.close();
   }
 });
+
+test("organization harness approval is independent of credential and model availability", () => {
+  const dom = setup();
+  try {
+    dom.window.eval('settingsUI.load({harnessDefault:"pi",approvedHarnesses:null},"org:test","approved-harnesses")');
+    const inputs = [...dom.window.document.querySelectorAll<HTMLInputElement>("#card-approved-harnesses input")];
+    assert.equal(inputs.length, 4);
+    assert.equal(inputs[0]!.checked, true);
+    assert.equal(inputs[0]!.disabled, true);
+    inputs[2]!.checked = true;
+    inputs[2]!.dispatchEvent(new dom.window.Event("change"));
+    assert.equal(dom.window.eval('settingsUI.collect("approved-harnesses").ids.join()'), "pi,codex");
+    dom.window.eval('settingsUI.load({},"personal:test","approved-harnesses")');
+    assert.equal(dom.window.document.getElementById("card-approved-harnesses")!.classList.contains("hidden"), true);
+  } finally {
+    dom.window.close();
+  }
+});

@@ -1363,6 +1363,7 @@ export function buildApp(
       "opencode",
       createOpenCodeHarness({
         ...openCodeHarnessConfigOptions(config),
+        resolveProviderKeys: resolveModelProviderKeys,
         signals: runSignals,
         tasks,
         mcpTools,
@@ -1389,6 +1390,7 @@ export function buildApp(
       "codex",
       createCodexHarness({
         ...codexHarnessConfigOptions(config),
+        resolveApiKey: () => modelCredentials.resolve("openai"),
         // Keychain custody: the subscription login lives encrypted in its
         // owner's keychain; core refreshes it centrally and hands the harness
         // ephemeral derived material. The credential can be (re)registered at
@@ -1403,14 +1405,15 @@ export function buildApp(
       "claude",
       createClaudeHarness({
         ...claudeHarnessConfigOptions(config),
-        ...(config.claudeAuthCredential && keychain
-          ? {
-              authEnv: keychainHarnessAuthEnv(keychain, config.claudeAuthCredential, [
+        authEnv: async () => ({
+          ANTHROPIC_API_KEY: (await modelCredentials.resolve("anthropic")) ?? "",
+          ...(config.claudeAuthCredential && keychain
+            ? await keychainHarnessAuthEnv(keychain, config.claudeAuthCredential, [
                 "CLAUDE_CODE_OAUTH_TOKEN",
                 "ANTHROPIC_AUTH_TOKEN",
-              ]),
-            }
-          : {}),
+              ])()
+            : {}),
+        }),
         signals: runSignals,
         tasks,
         mcpTools,

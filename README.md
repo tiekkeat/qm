@@ -84,6 +84,18 @@ Use `npm run dev-instance:both` when testing both surfaces together. Bare
 `npm run dev-instance` defaults to web for new instances and preserves the surface
 on reload. Switch an existing instance with an explicit surface command.
 
+## Organization model settings
+
+Organization administrators can use the Models page to approve Pi, Codex,
+Claude Code, and OpenCode and manage built-in OpenAI, Anthropic, and OpenRouter
+API keys alongside custom providers. Approving a harness makes it available in
+model pickers; it does not change the default runtime.
+
+Provider keys are validated before saving, encrypted in the credential store,
+and never displayed again. Administrator-saved keys override environment keys.
+Disabling a provider also suppresses its environment key. Updated credentials
+apply to new turns; existing personal and subscription logins remain separate.
+
 ## How it works
 
 Every turn runs through a central core, which can use a variety of models and harnesses

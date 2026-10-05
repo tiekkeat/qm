@@ -371,6 +371,9 @@ test("custom providers materialize into the opencode config (enabled + provider 
   chmodSync(wrapped, 0o755);
   const harness = createOpenCodeHarness({
     binaryPath: wrapped,
+    apiKey: "stale-anthropic",
+    openaiApiKey: "stale-openai",
+    resolveProviderKeys: async () => ({ openai: "managed-openai" }),
     resolveCustomProviders: async () => [
       {
         spec: {
@@ -399,6 +402,8 @@ test("custom providers materialize into the opencode config (enabled + provider 
   try {
     await harness.turns.runTurn(turnInput(entries, llmRows));
     const config = JSON.parse(readFileSync(dump, "utf8"));
+    assert.equal(config.provider.openai.options.apiKey, "managed-openai");
+    assert.equal(config.provider.anthropic.options.apiKey, "");
     assert.ok(config.enabled_providers.includes("litellm"));
     assert.ok(config.enabled_providers.includes("responses-proxy"));
     const litellm = config.provider.litellm;

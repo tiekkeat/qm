@@ -6602,6 +6602,8 @@
       </div>
     </dialog>
 
+    <template data-settings-card="card-approved-harnesses"></template>
+    <template data-settings-card="card-built-in-providers"></template>
     <template data-settings-card="custom-provider-dialog"></template>
 
     <script>
@@ -6661,6 +6663,8 @@
         $("card-feature-flags").classList.remove("hidden");
 
         [
+          $("card-approved-harnesses"),
+          $("card-built-in-providers"),
           $("card-base-model"),
           $("card-cron-runtime"),
           $("card-subagent-runtime"),
@@ -8050,6 +8054,8 @@
           governanceUI.settings.load(r.data, scope, "subagent-runtime");
           governanceUI.settings.load(r.data, scope, "fallback-runtime");
           governanceUI.settings.load(r.data, scope, "webui-models");
+          governanceUI.settings.load(r.data, scope, "approved-harnesses");
+          void governanceUI.settings.loadBuiltInProviders(scope);
         }
         refreshModelChoices.push(() => governanceUI.settings.updateCatalog(r.data));
         if (requestedView === "customize") {
@@ -8378,6 +8384,16 @@
         return governanceUI.onboarding.load();
       }
 
+      governanceUI.settings.configureBuiltInProviders({
+        api,
+        refresh: async () => {
+          const requestedScope = scope;
+          const fresh = await api("GET", "/api/scopes/" + encodeURIComponent(requestedScope) + "?view=models");
+          if (fresh.ok && scope === requestedScope && view === "models")
+            governanceUI.settings.updateCatalog(fresh.data);
+          await governanceUI.settings.loadBuiltInProviders(scope);
+        },
+      });
       governanceUI.settings.configureProviders({
         api,
         refresh: async () => {

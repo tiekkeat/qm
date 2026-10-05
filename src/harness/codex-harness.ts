@@ -57,6 +57,7 @@ export interface CodexHarnessOptions extends HarnessToolPlumbing {
   maxConcurrentUserServers?: number;
   /** Custodian of the ChatGPT-subscription Codex login (keychain-backed in production). */
   authStore?: CodexAuthStore;
+  resolveApiKey?: () => Promise<string | null>;
   signals?: RunSignalStore;
   tasks?: TaskStore;
 }
@@ -830,12 +831,9 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
       }
     };
     let rt: Runtime;
-    if (turn.codexAuth) {
-      // Per-user turn: a dedicated short-lived app-server on this user's
-      // account. No shared jail, no cross-account serialization — the org
-      // runtime is never touched.
-      const userAuth = childCodexAuthFromDerived(turn.codexAuth);
-      if (!userAuth) {
+    if (turn.codexAuth || (opts.resolveApiKey && !oauthConfigured)) {
+      const userAuth = turn.codexAuth ? childCodexAuthFromDerived(turn.codexAuth) : undefined;
+      if (turn.codexAuth && !userAuth) {
         finishSetup();
         throw new NonRetryableTurnError(
           "Your ChatGPT connection is incomplete — disconnect and sign in again from the AI account panel.",
@@ -844,8 +842,12 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
       const jail = mkdtempSync(join(tmpdir(), "qm-codex-user-"));
       try {
         releaseSpawnSlot = await awaitSetup(acquireSpawnSlot());
-        prepareCodexHome(sourceEnv, jail, userAuth);
-        const server = buildServer(jail, codexChildEnv(sourceEnv, jail, userAuth));
+        const managedKey = turn.codexAuth ? undefined : await awaitSetup(opts.resolveApiKey!());
+        if (!turn.codexAuth && !managedKey)
+          throw new NonRetryableTurnError("OpenAI API key is not configured for Codex");
+        const turnEnv = managedKey ? { ...sourceEnv, OPENAI_API_KEY: managedKey } : sourceEnv;
+        prepareCodexHome(turnEnv, jail, userAuth);
+        const server = buildServer(jail, codexChildEnv(turnEnv, jail, userAuth));
         ephemeral = { server, jail };
         ephemeralServers.add(server);
         server.process.once("close", () => {

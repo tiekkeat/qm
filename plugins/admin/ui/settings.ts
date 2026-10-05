@@ -1,3 +1,5 @@
+import { mountBuiltInProviders } from "./settings-built-in-providers.ts";
+export { configureBuiltInProviders, loadBuiltInProviders } from "./settings-built-in-providers.ts";
 import { mountTemplate } from "./shared.ts";
 import { saveButton, settingStatus, saveFooter } from "./setting-controls.ts";
 import { SettingState, settingRegistry } from "./setting-state.ts";
@@ -31,6 +33,8 @@ export class SettingsState extends SettingState {
   collect(_validate = true): Data {
     if (_validate && this.key === "soul" && (this.draft.content || "").length > 100000)
       throw new Error("Maximum length reached");
+    if (_validate && this.key === "approved-harnesses" && !this.draft.ids?.length)
+      throw new Error("Enable at least one harness.");
     if (this.key !== "runtime" && runtimeKeys.includes(this.key)) {
       if (this.draft.inherit) return { inherit: true };
       const { inherit: _inherit, ...selection } = this.draft;
@@ -100,13 +104,23 @@ export class SettingsState extends SettingState {
   }
 }
 export const states = new Map(
-  [...runtimeKeys, "webui-models", "soul", "branding"].map((key) => [key, new SettingsState(key)]),
+  [...runtimeKeys, "approved-harnesses", "webui-models", "soul", "branding"].map((key) => [
+    key,
+    new SettingsState(key),
+  ]),
 );
 export const { owns, collect, capture, commit, status, statusKey } = settingRegistry(states);
 export function load(data: Data, scope: string, only?: string) {
   for (const [key, s] of states) {
     if (only && only !== key) continue;
     s.context = data;
+    if (key === "approved-harnesses") {
+      s.available = scope.startsWith("org:");
+      s.draft = { ids: data.approvedHarnesses ?? [data.harnessDefault || "pi"] };
+      s.saving = false;
+      capture(key);
+      continue;
+    }
     if (key === "branding") {
       s.draft = {
         accent: data.branding?.accent || "",
@@ -156,7 +170,7 @@ export function updateCatalog(data: Data) {
   }
 }
 const harnessLabels: Record<string, string> = {
-  pi: "pi (default)",
+  pi: "Pi",
   opencode: "OpenCode",
   codex: "Codex",
   claude: "Claude Code",
@@ -178,6 +192,35 @@ const label = (s: SettingsState, id: string) => {
   return m?.name && m.name !== id ? `${m.name} (${id})` : id;
 };
 function card(s: SettingsState) {
+  if (s.key === "approved-harnesses")
+    return html`<section
+      class=${classMap({ card: true, "sv-models": true, hidden: !s.available, dirty: s.dirty })}
+      id="card-approved-harnesses"
+    >
+      <div class="head">
+        <h2>Allowed harnesses</h2>
+        <p>Choose which harnesses appear in model pickers. Each harness needs compatible provider credentials.</p>
+      </div>
+      <div class="body choice-stack">
+        ${Object.entries(harnessLabels).map(
+          ([id, title]) =>
+            html`<label class="setting-toggle">
+              <input
+                type="checkbox"
+                .checked=${s.draft.ids?.includes(id) || false}
+                ?disabled=${s.saving || id === (s.context.runtime?.harnessId || s.context.harnessDefault || "pi")}
+                @change=${(event: Event) => s.change("ids", (event.target as HTMLInputElement).checked ? [...s.draft.ids, id] : s.draft.ids.filter((item: string) => item !== id))}
+              />
+              <span class="setting-switch" aria-hidden="true"></span
+              ><span class="setting-copy"
+                ><strong>${title}</strong
+                >${id === (s.context.runtime?.harnessId || s.context.harnessDefault || "pi") ? html`<small>Current default. Select another default before disabling.</small>` : null}</span
+              >
+            </label>`,
+        )}
+      </div>
+      ${saveFooter(s)}
+    </section>`;
   if (s.key === "soul") return soulCard(s);
   if (s.key === "branding") return brandingCard(s);
   if (runtimeKeys.includes(s.key)) {
@@ -345,6 +388,7 @@ function card(s: SettingsState) {
   </section>`;
 }
 export function mountCards() {
+  mountBuiltInProviders();
   mountFlags();
   mountProviders();
   mountCredentials();
@@ -358,6 +402,7 @@ export function mountCards() {
     }
     const id = (
       {
+        "approved-harnesses": "card-approved-harnesses",
         soul: "card-soul",
         branding: "card-branding",
         "webui-models": "card-webui-models",

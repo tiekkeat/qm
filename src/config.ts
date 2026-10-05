@@ -228,6 +228,11 @@ export function providerKeysPresent(config: Config): ModelProviderAvailability {
     openai: Boolean(config.openaiApiKey),
     openrouter: Boolean(config.openrouterApiKey),
     ...(config.harness === "codex" && (config.codexAuthFile || config.codexAuthCredential) ? { codexOAuth: true } : {}),
+    ...(config.claudeAuthCredential ||
+    config.claudeProcessEnv.CLAUDE_CODE_OAUTH_TOKEN ||
+    config.claudeProcessEnv.ANTHROPIC_AUTH_TOKEN
+      ? { claudeOAuth: true }
+      : {}),
   };
 }
 
