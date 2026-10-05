@@ -1205,6 +1205,8 @@ export function buildApp(
       return async (host: string, token: OAuthToken, ctx?: { accountType?: string; clientRef?: string }) => {
         if (token.refreshToken && host === "auth.openai.com") {
           const fresh = await refreshChatGPTTokens(token.refreshToken);
+          if (token.accountId && fresh.accountId !== token.accountId)
+            throw new Error("ChatGPT refresh returned a different account");
           return oauthTokenFromUserTokens(fresh);
         }
         if (token.refreshToken && host === "claude.ai") {
@@ -1231,7 +1233,12 @@ export function buildApp(
   // Per-user AI accounts live in the keychain itself (unified custody):
   // same encryption, ownership, admin visibility, and removal flows as
   // every other personal credential.
-  const userModelCredentials = createUserModelCredentialStore({ keychain: credentialStore });
+  const userModelCredentials = createUserModelCredentialStore({
+    keychain: credentialStore,
+    sharedGrants: artifactMap<{ userId: string; enabled: boolean }>("shared_model_grants"),
+    sharedLogins: artifactMap<import("./model/user-model-credential-store.ts").SharedCodexLogin>("shared_model_logins"),
+    lock: advisoryLock,
+  });
   const keychain: Keychain | undefined = keychainKeyMaterial ? credentialStore : undefined;
   const mcpToolService = createMcpToolService({
     servers: mcpServers,

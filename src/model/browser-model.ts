@@ -16,6 +16,15 @@ export async function resolveBrowserModel(input: {
     const model = requested ?? (await input.config?.getBaseModelDurable(personalScope)) ?? input.companyModel;
     return { account, model, routing: null };
   }
+  if (account === "shared-openai") {
+    const available = await input.credentials?.hasSharedGrant(input.actorId);
+    const status = available ? await input.credentials?.sharedStatus() : undefined;
+    const credential = status?.connected && !status.needsReconnect
+      ? ({ provider: "openai", kind: "oauth", oauth: {}, updatedAt: 0 } as const)
+      : null;
+    const routing = resolveIndividualAuthRouting(null, credential, requested, "pi");
+    return { account, model: routing?.model, routing };
+  }
   const [anthropic, openai] = await Promise.all([
     account === "openai" ? null : input.credentials?.get(input.actorId, "anthropic"),
     account === "anthropic" ? null : input.credentials?.get(input.actorId, "openai"),

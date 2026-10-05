@@ -3361,6 +3361,36 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           const account = external
             ? "company"
             : (input.modelAccount ?? (await deps.config?.getModelAccountDurable(actor.id)) ?? "company");
+          if (userCredStore && account === "shared-openai") {
+            const derived = await userCredStore.sharedOAuth(actor.id);
+            if (!derived?.idToken)
+              throw new NonRetryableTurnError("Shared Codex access is unavailable. Ask an administrator to restore your grant or reconnect the account.");
+            const routing = resolveIndividualAuthRouting(
+              null,
+              { provider: "openai", kind: "oauth", oauth: {}, updatedAt: 0 },
+              runtime.modelId ?? input.model ?? purposeDefault?.modelId,
+              "codex",
+            );
+            if (routing?.kind !== "oauth" || routing.provider !== "openai" || routing.harness !== "codex")
+              throw new NonRetryableTurnError("The selected model cannot use shared Codex access.");
+            codexTurnAuth = {
+              accessToken: derived.accessToken,
+              idToken: derived.idToken,
+              ...(derived.accountId ? { accountId: derived.accountId } : {}),
+              ...(derived.expiresAt !== undefined ? { expiresAt: derived.expiresAt } : {}),
+            };
+            userHarnessOverride = routing.harness;
+            userModelOverride = routing.model;
+            deps.auditLog.record({
+              at: Date.now(),
+              principalId: actor.id,
+              action: "shared-codex.use",
+              resource: conversation.threadRef,
+              scopeLabel: scopeId,
+              detail: routing.model,
+            });
+            return { userProviderKeys, userModelOverride, userHarnessOverride, claudeOauthToken, codexTurnAuth };
+          }
           if (userCredStore && humanTurn && account !== "company") {
             const [anthCred, oaiCred] = await Promise.all([
               account === "openai" ? null : userCredStore.get(actor.id, "anthropic"),

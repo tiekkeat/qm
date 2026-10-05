@@ -96,6 +96,14 @@ and never displayed again. Administrator-saved keys override environment keys.
 Disabling a provider also suppresses its environment key. Updated credentials
 apply to new turns; existing personal and subscription logins remain separate.
 
+Where an OpenAI agreement explicitly permits shared subscription use, an
+administrator can connect a ChatGPT account with a device code in **Models →
+Built-in providers → Shared ChatGPT / Codex**. Grant access by QM principal ID;
+granted users can then choose **Shared Codex** in AI access settings. That
+choice applies to their new chats and scheduled turns. The OAuth token remains
+in the server keychain; users receive access through QM, not the token itself.
+Revoking a grant or disconnecting the account blocks new turns using it.
+
 ## How it works
 
 Every turn runs through a central core, which can use a variety of models and harnesses

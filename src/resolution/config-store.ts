@@ -59,10 +59,11 @@ export interface PersistedEgressPolicy {
   scopeId: ScopeId;
   policy: EgressPolicy;
 }
-export type ModelAccount = "company" | "personal" | "anthropic" | "openai";
+export type ModelAccount = "company" | "personal" | "anthropic" | "openai" | "shared-openai";
 
 export interface PersistedModelAccount extends PersistedScopedFlag {
   provider?: "anthropic" | "openai";
+  account?: "shared-openai";
 }
 
 export interface PersistedScopedFlag {
@@ -241,6 +242,7 @@ export interface ScopedConfigStore {
   setIndividualModelAuth(on: boolean): void;
   getIndividualModelAuthDurable(principalId?: string): Promise<boolean>;
   setPersonalModelAuth(principalId: string, on: boolean, provider?: "anthropic" | "openai"): Promise<void>;
+  setSharedModelAuth(principalId: string): Promise<void>;
   getModelAccountDurable(principalId: string): Promise<ModelAccount>;
   getBaseModelOwnDurable(id: ScopeId): Promise<string | null>;
   getWebuiModels(id: ScopeId): string[] | null;
@@ -999,12 +1001,17 @@ export function createMemoryConfigStore(
     },
     async getModelAccountDurable(principalId) {
       const row = await individualModelAuthStore.get(scopeId("personal", principalId));
+      if (row?.account === "shared-openai") return "shared-openai";
       if (row?.on) return row.provider ?? "personal";
       return (await individualModelAuthStore.get(org))?.on ? "personal" : "company";
     },
     async setPersonalModelAuth(principalId, on, provider) {
       const id = scopeId("personal", principalId);
       await individualModelAuthStore.put(id, { scopeId: id, on, ...(on && provider ? { provider } : {}) });
+    },
+    async setSharedModelAuth(principalId) {
+      const id = scopeId("personal", principalId);
+      await individualModelAuthStore.put(id, { scopeId: id, on: true, account: "shared-openai" });
     },
     getBaseModelOwnDurable: async (id) => (await baseModelStore.get(id))?.modelId ?? null,
     getBaseModelDurable: async (id) =>

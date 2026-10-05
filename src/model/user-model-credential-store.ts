@@ -1,4 +1,7 @@
 import type { DerivedOAuthAuth, Keychain } from "../credentials/keychain.ts";
+import { createMemoryMap, type DurableMap } from "../persistence/durable-map.ts";
+import { personKey } from "../directory/person.ts";
+import { createMemoryAdvisoryLock, type AdvisoryLock } from "../persistence/advisory-lock.ts";
 import type { ModelProvider } from "./pi-models.ts";
 
 type UserCredentialKind = "apikey" | "oauth";
@@ -37,6 +40,24 @@ export interface UserModelCredentialStore {
    */
   derivedOAuth(userId: string, provider: ModelProvider): Promise<DerivedOAuthAuth | null>;
   delete(userId: string, provider: ModelProvider): Promise<void>;
+  sharedStatus(): Promise<{ connected: boolean; needsReconnect?: boolean; grantees: string[] }>;
+  setSharedOAuth(tokens: UserOAuthTokens): Promise<void>;
+  completeSharedLogin(id: string, tokens: UserOAuthTokens): Promise<boolean>;
+  deleteSharedOAuth(): Promise<void>;
+  setSharedGrant(userId: string, enabled: boolean): Promise<void>;
+  hasSharedGrant(userId: string): Promise<boolean>;
+  sharedOAuth(userId: string): Promise<DerivedOAuthAuth | null>;
+  putSharedLogin(id: string, actorId: string, expiresAt: number): Promise<void>;
+  getSharedLogin(id: string): Promise<SharedCodexLogin | null>;
+  finishSharedLogin(id: string, status: "connected" | "failed"): Promise<void>;
+  deleteSharedLogin(id: string): Promise<void>;
+}
+
+export interface SharedCodexLogin {
+  id: string;
+  actorId: string;
+  expiresAt: number;
+  status: "pending" | "connected" | "failed";
 }
 
 const PROVIDERS: ModelProvider[] = ["anthropic", "openai"];
@@ -52,6 +73,9 @@ const AI_OAUTH_HOSTS: Record<"anthropic" | "openai", string> = {
 };
 /** Segregates AI subscription logins from any other connector use of the same host. */
 const AI_ACCOUNT_TYPE = "individual-model";
+const SHARED_ACCOUNT_TYPE = "shared-model";
+const SHARED_OWNER = "org-codex-model";
+const SHARED_HOST = "auth.openai.com";
 
 function serviceFor(provider: ModelProvider): string {
   return `model-${provider}`;
@@ -72,8 +96,16 @@ function oauthHostFor(provider: ModelProvider): string | null {
  *   `model-<provider>`, origin `individual-model-auth`), so admin visibility
  *   and "remove my credentials" apply.
  */
-export function createUserModelCredentialStore(input: { keychain: Keychain }): UserModelCredentialStore {
+export function createUserModelCredentialStore(input: {
+  keychain: Keychain;
+  sharedGrants?: DurableMap<{ userId: string; enabled: boolean }>;
+  sharedLogins?: DurableMap<SharedCodexLogin>;
+  lock?: AdvisoryLock;
+}): UserModelCredentialStore {
   const { keychain } = input;
+  const sharedGrants = input.sharedGrants ?? createMemoryMap<{ userId: string; enabled: boolean }>();
+  const sharedLogins = input.sharedLogins ?? createMemoryMap<SharedCodexLogin>();
+  const lock = input.lock ?? createMemoryAdvisoryLock();
 
   async function findApiKey(userId: string, provider: ModelProvider) {
     const all = await keychain.listByOwner(userId);
@@ -160,5 +192,84 @@ export function createUserModelCredentialStore(input: { keychain: Keychain }): U
       const meta = await findApiKey(userId, provider);
       if (meta) await keychain.remove(userId, meta.id);
     },
+
+    async sharedStatus() {
+      const status = await keychain.connectorTokenStatus(SHARED_HOST, SHARED_OWNER, SHARED_ACCOUNT_TYPE);
+      const grants = await sharedGrants.all();
+      return {
+        connected: status.connected,
+        ...(status.needsReconnect ? { needsReconnect: true } : {}),
+        grantees: grants.filter((row) => row.enabled).map((row) => row.userId),
+      };
+    },
+
+    async setSharedOAuth(tokens) {
+      if (!tokens.accessToken || !tokens.refreshToken || !tokens.idToken)
+        throw new Error("ChatGPT device login returned incomplete credentials");
+      await keychain.setConnectorToken(
+        SHARED_HOST,
+        SHARED_OWNER,
+        {
+          accessToken: tokens.accessToken,
+          refreshToken: tokens.refreshToken,
+          idToken: tokens.idToken,
+          ...(tokens.accountId ? { accountId: tokens.accountId } : {}),
+          ...(tokens.expiresAt !== undefined ? { expiresAt: tokens.expiresAt } : {}),
+        },
+        SHARED_ACCOUNT_TYPE,
+      );
+    },
+
+    async deleteSharedOAuth() {
+      await lock.withLock("shared-codex-login", async () => {
+        for (const row of await sharedLogins.all()) await sharedLogins.delete(row.id);
+        await keychain.deleteConnectorToken(SHARED_HOST, SHARED_OWNER, SHARED_ACCOUNT_TYPE);
+      });
+    },
+
+    async completeSharedLogin(id, tokens) {
+      return lock.withLock("shared-codex-login", async () => {
+        if ((await this.getSharedLogin(id))?.status !== "pending") return false;
+        await this.setSharedOAuth(tokens);
+        await this.finishSharedLogin(id, "connected");
+        return true;
+      });
+    },
+
+    async setSharedGrant(userId, enabled) {
+      const id = personKey(userId);
+      if (!id) throw new Error("userId is required");
+      await sharedGrants.put(id, { userId: id, enabled });
+    },
+
+    async hasSharedGrant(userId) {
+      return (await sharedGrants.get(personKey(userId)))?.enabled === true;
+    },
+
+    async sharedOAuth(userId) {
+      if (!(await this.hasSharedGrant(userId))) return null;
+      return keychain.connectorDerivedAuth(SHARED_HOST, SHARED_OWNER, SHARED_ACCOUNT_TYPE);
+    },
+
+    async putSharedLogin(id, actorId, expiresAt) {
+      for (const old of await sharedLogins.all()) {
+        if (old.expiresAt < Date.now()) await sharedLogins.delete(old.id);
+      }
+      await sharedLogins.put(id, { id, actorId, expiresAt, status: "pending" });
+    },
+
+    async getSharedLogin(id) {
+      const row = await sharedLogins.get(id);
+      return row && row.expiresAt >= Date.now() ? row : null;
+    },
+
+    async finishSharedLogin(id, status) {
+      await sharedLogins.merge(id, { status });
+    },
+
+    async deleteSharedLogin(id) {
+      await sharedLogins.delete(id);
+    },
+
   };
 }

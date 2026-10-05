@@ -28,7 +28,10 @@ async function getStatus(ctx: ApiCtx): Promise<void> {
   const connections = (await ctx.deps.userModelCredentials?.connections(principal)) ?? [];
   const individualModelAuth = (await ctx.deps.config?.getIndividualModelAuthDurable(principal)) ?? false;
   const account = (await ctx.deps.config?.getModelAccountDurable(principal)) ?? "company";
-  return sendJson(ctx.res, 200, { individualModelAuth, required, account, connections });
+  const shared = await ctx.deps.userModelCredentials?.sharedStatus();
+  const sharedAvailable = shared?.connected === true && !shared.needsReconnect &&
+    (await ctx.deps.userModelCredentials?.hasSharedGrant(principal)) === true;
+  return sendJson(ctx.res, 200, { individualModelAuth, required, account, connections, sharedAvailable });
 }
 
 async function setAccount(ctx: ApiCtx): Promise<void> {
@@ -36,12 +39,21 @@ async function setAccount(ctx: ApiCtx): Promise<void> {
   if (!principal) return sendJson(ctx.res, 401, { error: "unauthorized" });
   if (!ctx.deps.config || !ctx.deps.userModelCredentials) return sendJson(ctx.res, 404, { error: "not_found" });
   const account = bodyObj(ctx).account;
-  if (account !== "personal" && account !== "company") return sendJson(ctx.res, 400, { error: "bad_request" });
+  if (account !== "personal" && account !== "company" && account !== "shared-openai")
+    return sendJson(ctx.res, 400, { error: "bad_request" });
   if (account === "company" && (await ctx.deps.config.getIndividualModelAuthDurable())) {
     return sendJson(ctx.res, 403, { error: "Your organization requires a personal AI account." });
   }
   if (account === "personal" && !(await ctx.deps.userModelCredentials.connections(principal)).length) {
     return sendJson(ctx.res, 409, { error: "Connect an AI account first." });
+  }
+  if (account === "shared-openai") {
+    const shared = await ctx.deps.userModelCredentials.sharedStatus();
+    if (!shared.connected || shared.needsReconnect || !(await ctx.deps.userModelCredentials.hasSharedGrant(principal)))
+      return sendJson(ctx.res, 403, { error: "shared_codex_unavailable", message: "Shared Codex access is unavailable." });
+    await ctx.deps.config.setSharedModelAuth(principal);
+    audit(ctx.deps, { principalId: principal, action: "user-model-auth.account", resource: account, scopeLabel: principal });
+    return getStatus(ctx);
   }
   const provider = bodyObj(ctx).provider;
   if (provider !== undefined && provider !== "anthropic" && provider !== "openai")

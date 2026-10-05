@@ -57,3 +57,26 @@ test("rejected key does not change provider status and personal scopes cannot sa
   await state.save("openai");
   assert.equal(writes, 1);
 });
+
+test("shared Codex grants target the selected principal and reload their status", async () => {
+  const state = new BuiltInProvidersState();
+  const calls: Array<[string, string]> = [];
+  let grantees: string[] = [];
+  state.actions = {
+    api: async (method, path) => {
+      calls.push([method, path]);
+      if (path === "/api/model-providers?catalog=cached") return { ok: true, data: { providers: [] } };
+      if (path === "/api/shared-codex") return { ok: true, data: { connected: true, grantees } };
+      if (method === "PUT") grantees = ["user@example.com"];
+      if (method === "DELETE") grantees = [];
+      return { ok: true };
+    },
+    refresh: async () => {},
+  };
+  await state.load("org:test");
+  await state.setGrant("USER@EXAMPLE.COM", true);
+  assert.deepEqual(calls.find(([method]) => method === "PUT"), ["PUT", "/api/shared-codex/grants/USER%40EXAMPLE.COM"]);
+  assert.deepEqual(state.shared.grantees, ["user@example.com"]);
+  await state.setGrant("user@example.com", false);
+  assert.deepEqual(state.shared.grantees, []);
+});

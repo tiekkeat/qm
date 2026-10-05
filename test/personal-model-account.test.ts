@@ -11,6 +11,8 @@ import { createServer } from "../src/api/server.ts";
 import { mintPortalIdentity } from "../src/auth/portal-identity.ts";
 import { signRequest } from "../src/auth/source-auth.ts";
 import { buildApp } from "../src/wiring.ts";
+import { userRuntimeConfigBody } from "../src/api/runtime-config.ts";
+import { resolveBrowserModel } from "../src/model/browser-model.ts";
 import { testConfig } from "./support/test-config.ts";
 
 const SECRET = "personal-account-test-signing-secret";
@@ -73,9 +75,23 @@ test("account API binds choice to the signed-in person, preserves connections, a
       required: false,
       account: "personal",
       connections: [{ provider: "anthropic", kind: "apikey" }],
+      sharedAvailable: false,
     });
     assert.equal(await built.config.getIndividualModelAuthDurable("bob@default-org"), false);
     assert.equal((await request("company")).status, 200);
+    assert.equal((await request("shared-openai")).status, 403);
+    const jwtPart = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
+    await built.userModelCredentials.setSharedOAuth({
+      accessToken: "shared-access",
+      refreshToken: "shared-refresh",
+      idToken: `${jwtPart({ alg: "RS256" })}.${jwtPart({ "https://api.openai.com/auth": { chatgpt_account_id: "shared" } })}.sig`,
+    });
+    await built.userModelCredentials.setSharedGrant("alice@default-org", true);
+    assert.equal((await request("shared-openai")).status, 200);
+    assert.equal(await built.config.getModelAccountDurable("alice@default-org"), "shared-openai");
+    assert.equal((await request("shared-openai", "bob@default-org", "bob@default-org")).status, 403);
+    await built.userModelCredentials.setSharedGrant("alice@default-org", false);
+    assert.equal((await request("shared-openai")).status, 403);
     assert.equal((await built.userModelCredentials.connections("alice@default-org")).length, 1);
     assert.equal((await request("personal")).status, 200);
     await built.userModelCredentials.delete("alice@default-org", "anthropic");
@@ -133,4 +149,41 @@ test("shared chat messages queue instead of borrowing another person's account",
   assert.notEqual(other.steered, true);
   assert.equal((await built.runs.get(other.runId!))?.request.modelAccount, "company");
   assert.equal((await built.signals.takePending(first.runId!)).length, 0);
+});
+
+test("a granted shared Codex choice follows its owner into scheduled turns", async () => {
+  const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "shared-codex-scheduled-")) }));
+  const jwtPart = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
+  await built.userModelCredentials.setSharedOAuth({
+    accessToken: "shared-access",
+    refreshToken: "shared-refresh",
+    idToken: `${jwtPart({ alg: "RS256" })}.${jwtPart({ "https://api.openai.com/auth": { chatgpt_account_id: "shared" } })}.sig`,
+  });
+  await built.userModelCredentials.setSharedGrant("owner@default-org", true);
+  await built.config.setSharedModelAuth("owner@default-org");
+  built.config.setApprovedHarnesses(["pi", "codex"]);
+  await built.config.flushScope("org:default-org");
+  const runtime = await userRuntimeConfigBody(
+    { deps: { config: built.config, userModelCredentials: built.userModelCredentials } },
+    "personal:owner@default-org",
+    "owner@default-org",
+  );
+  assert.equal(runtime.effective.harnessId, "codex");
+  assert.ok(runtime.modelsByHarness.codex?.includes(runtime.effective.modelId));
+  const browser = await resolveBrowserModel({
+    actorId: "owner@default-org",
+    config: built.config,
+    credentials: built.userModelCredentials,
+  });
+  assert.equal(browser.account, "shared-openai");
+  assert.equal(browser.routing?.provider, "openai");
+  const submitted = await built.app.turn({
+    surface: "loop",
+    actor: { externalId: "owner@default-org" },
+    conversation: { kind: "dm", threadRef: "shared-codex-scheduled" },
+    text: "summarize the project",
+    triggered: true,
+    async: true,
+  });
+  assert.equal((await built.runs.get(submitted.runId!))?.request.modelAccount, "shared-openai");
 });

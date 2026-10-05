@@ -199,39 +199,39 @@ export function createTurnMethods(
       const origin = resolveTurnOrigin(privateRequest ?? req);
 
       const modelAccount =
-        !req.externalSlack && deps.userModelCredentials && origin.kind === "human"
+        !req.externalSlack && deps.userModelCredentials
           ? await deps.config.getModelAccountDurable(actor.id)
           : "company";
       const individualAuth = modelAccount !== "company";
       const runtimePurpose = turnRuntimePurpose(req, isSubagentThreadRef(req.conversation.threadRef));
       if (req.triggered && (req.model || req.harness)) {
-        const choices = await runtimeConfigBody(
-          { deps },
-          conversationScope(req.conversation, actor.id),
-          undefined,
-          runtimePurpose,
-          {
-            ...(req.harness && isHarnessId(req.harness) ? { harnessId: req.harness } : {}),
-            ...(req.model ? { modelId: req.model } : {}),
-            ...(req.thinkingLevel ? { effortLevel: req.thinkingLevel } : {}),
-            ...(typeof req.fastMode === "boolean" ? { fastMode: req.fastMode } : {}),
-          },
-        );
+        const scope = conversationScope(req.conversation, actor.id);
+        const choices = modelAccount === "shared-openai"
+          ? await userRuntimeConfigBody({ deps }, scope, actor.id)
+          : await runtimeConfigBody({ deps }, scope, undefined, runtimePurpose, {
+              ...(req.harness && isHarnessId(req.harness) ? { harnessId: req.harness } : {}),
+              ...(req.model ? { modelId: req.model } : {}),
+              ...(req.thinkingLevel ? { effortLevel: req.thinkingLevel } : {}),
+              ...(typeof req.fastMode === "boolean" ? { fastMode: req.fastMode } : {}),
+            });
         const harness = req.harness ?? choices.effective.harnessId;
         const model = req.model ?? choices.effective.modelId;
-        const error = !isHarnessId(harness)
-          ? "harness_not_approved"
-          : await availableRuntimeError(
-              { deps },
-              conversationScope(req.conversation, actor.id),
-              {
-                harnessId: harness,
-                modelId: model,
-                effortLevel: req.thinkingLevel,
-                fastMode: req.fastMode,
-              },
-              runtimePurpose,
-            );
+        let error: string | null;
+        if (!isHarnessId(harness)) error = "harness_not_approved";
+        else if (modelAccount === "shared-openai")
+          error = choices.modelsByHarness[harness]?.includes(model) ? null : "shared Codex access cannot serve this runtime";
+        else
+          error = await availableRuntimeError(
+            { deps },
+            scope,
+            {
+              harnessId: harness,
+              modelId: model,
+              effortLevel: req.thinkingLevel,
+              fastMode: req.fastMode,
+            },
+            runtimePurpose,
+          );
         if (error) return { status: "refused", reason: error };
       }
       let requestedModel = req.model;
@@ -376,7 +376,7 @@ export function createTurnMethods(
         actor,
         conversation,
         origin,
-        modelAccount: origin.kind === "human" ? modelAccount : ("company" as const),
+        modelAccount: origin.kind === "human" || modelAccount === "shared-openai" ? modelAccount : ("company" as const),
         text: req.text,
         ...(req.gatewayContext ? { gatewayContext: req.gatewayContext } : {}),
         ...(req.proactiveOpener ? { proactiveOpener: true } : {}),

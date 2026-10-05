@@ -104,6 +104,34 @@ test("user model credential store round-trips api key and oauth per user+provide
   assert.deepEqual(await store.connections("u1"), []);
 });
 
+test("shared Codex connection requires an explicit grant and stops after revocation", async () => {
+  const { store } = testStore();
+  await store.setSharedOAuth({
+    accessToken: "shared-access",
+    refreshToken: "shared-refresh",
+    idToken: fakeIdToken("shared-account"),
+    accountId: "shared-account",
+  });
+  assert.equal((await store.sharedStatus()).connected, true);
+  assert.equal(await store.sharedOAuth("user@example.com"), null);
+  await store.setSharedGrant("USER@EXAMPLE.COM", true);
+  assert.deepEqual((await store.sharedStatus()).grantees, ["user@example.com"]);
+  const derived = await store.sharedOAuth("user@example.com");
+  assert.equal(derived?.accessToken, "shared-access");
+  assert.equal("refreshToken" in (derived ?? {}), false);
+  await store.setSharedGrant("user@example.com", false);
+  assert.equal(await store.sharedOAuth("user@example.com"), null);
+  await store.putSharedLogin("pending-login", "admin@example.com", Date.now() + 60_000);
+  await store.deleteSharedOAuth();
+  assert.equal((await store.sharedStatus()).connected, false);
+  assert.equal(await store.completeSharedLogin("pending-login", {
+    accessToken: "resurrected-access",
+    refreshToken: "resurrected-refresh",
+    idToken: fakeIdToken("shared-account"),
+  }), false);
+  assert.equal((await store.sharedStatus()).connected, false);
+});
+
 test("stale subscription tokens refresh once (single-flight) inside the keychain", async () => {
   let refreshCalls = 0;
   const keychain = createKeychain({

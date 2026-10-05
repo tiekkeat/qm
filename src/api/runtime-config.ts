@@ -52,6 +52,21 @@ export async function userRuntimeConfigBody(ctx: { deps: RuntimeDeps }, scope: S
   const account = await ctx.deps.config?.getModelAccountDurable(actorId);
   const store = ctx.deps.userModelCredentials;
   if (!store || !account || account === "company") return runtimeConfigBody(ctx, scope);
+  if (account === "shared-openai") {
+    const shared = await store.sharedStatus();
+    const available = (await store.hasSharedGrant(actorId)) && shared.connected && !shared.needsReconnect;
+    const credential = available
+      ? ({ provider: "openai", kind: "oauth", oauth: {}, updatedAt: 0 } as const)
+      : null;
+    const snapshot = await runtimeConfigBody(ctx, scope, async (choice) => {
+      const route = resolveIndividualAuthRouting(null, credential, choice.modelId, "codex");
+      return route?.harness === choice.harnessId && route.model === choice.modelId ? null : "account_runtime_unavailable";
+    });
+    const route = resolveIndividualAuthRouting(null, credential, snapshot.effective.modelId, "codex");
+    return route?.model && snapshot.modelsByHarness[route.harness]?.includes(route.model)
+      ? { ...snapshot, effective: { ...snapshot.effective, harnessId: route.harness, modelId: route.model } }
+      : snapshot;
+  }
   const [anthropic, openai] = await Promise.all([
     account === "openai" ? null : store.get(actorId, "anthropic"),
     account === "anthropic" ? null : store.get(actorId, "openai"),

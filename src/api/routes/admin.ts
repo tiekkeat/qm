@@ -52,6 +52,7 @@ import {
   managedSlackRequest,
 } from "./admin/slack-installation.ts";
 import { deleteModelProvider, getModelProviders, putModelProvider } from "./admin/model-providers.ts";
+import { sharedCodexStatus, sharedCodexStart, sharedCodexPoll, sharedCodexDisconnect, sharedCodexGrant } from "./admin/shared-codex.ts";
 import { deleteCustomProvider, getCustomProviders, putCustomProvider } from "./admin/custom-providers.ts";
 import { deleteMcpServer, getMcpServers, putMcpServer } from "./admin/mcp-servers.ts";
 import { listSecurityFlags, releaseSecurityTaint } from "./admin/security.ts";
@@ -85,6 +86,12 @@ const routes: ReadonlyArray<Route<ApiCtx>> = [
   { method: "PUT", path: "/v1/admin/slack-installation", auth: "either", handle: putSlackInstallation },
   { method: "DELETE", path: "/v1/admin/slack-installation", auth: "either", handle: deleteSlackInstallation },
   { method: "GET", path: "/v1/admin/model-providers", auth: "either", handle: getModelProviders },
+  { method: "GET", path: "/v1/admin/shared-codex", auth: "either", handle: sharedCodexStatus },
+  { method: "POST", path: "/v1/admin/shared-codex/start", auth: "either", handle: sharedCodexStart },
+  { method: "POST", path: "/v1/admin/shared-codex/poll", auth: "either", handle: sharedCodexPoll },
+  { method: "DELETE", path: "/v1/admin/shared-codex", auth: "either", handle: sharedCodexDisconnect },
+  { method: "PUT", path: "/v1/admin/shared-codex/grants/:principalId", auth: "either", handle: sharedCodexGrant },
+  { method: "DELETE", path: "/v1/admin/shared-codex/grants/:principalId", auth: "either", handle: sharedCodexGrant },
   { method: "PUT", path: "/v1/admin/model-providers/:provider", auth: "either", handle: putModelProvider },
   { method: "GET", path: "/v1/admin/mcp-servers", auth: "either", handle: getMcpServers },
   { method: "PUT", path: "/v1/admin/mcp-servers/:id", auth: "either", handle: putMcpServer },

@@ -66,9 +66,10 @@ interface DevicePrompt {
 }
 
 export interface StatusResponse {
-  account: "company" | "personal" | "anthropic" | "openai";
+  account: "company" | "personal" | "anthropic" | "openai" | "shared-openai";
   individualModelAuth: boolean;
   required: boolean;
+  sharedAvailable?: boolean;
   connections: { provider: "anthropic" | "openai"; kind: ConnKind }[];
 }
 
@@ -89,6 +90,7 @@ interface State {
   notice: string;
   controller: AbortController;
   required: boolean;
+  sharedAvailable: boolean;
   personal: boolean;
   account: StatusResponse["account"];
   loading: boolean;
@@ -117,6 +119,7 @@ function fresh(mode: Mode): State {
     notice: "",
     controller: new AbortController(),
     required: false,
+    sharedAvailable: false,
     personal: false,
     account: "company",
     loading: true,
@@ -157,6 +160,7 @@ function current(state: State, revision = state.revision): boolean {
 
 function applyStatus(status: StatusResponse): void {
   s.required = status.required === true;
+  s.sharedAvailable = status.sharedAvailable === true;
   s.personal = status.individualModelAuth === true;
   s.account = status.account;
   s.connections = {};
@@ -168,7 +172,7 @@ function applyStatus(status: StatusResponse): void {
     appState.me.individualModelAuth = s.personal;
     appState.me.modelAuthConnected = status.connections.some(
       (c) => s.account === "personal" || s.account === c.provider,
-    );
+    ) || (s.account === "shared-openai" && s.sharedAvailable);
     window.dispatchEvent(new CustomEvent("model-account-changed", { detail: status }));
   }
 }
@@ -606,7 +610,7 @@ function providerRow(p: ProviderMeta): TemplateResult {
   `;
 }
 
-async function switchAccount(account: "personal" | "company", provider?: "anthropic" | "openai"): Promise<void> {
+async function switchAccount(account: "personal" | "company" | "shared-openai", provider?: "anthropic" | "openai"): Promise<void> {
   if (s.busy || (account === "company" && !s.personal) || (account === "personal" && provider === s.account)) return;
   resetFlow();
   s.open = null;
@@ -623,10 +627,9 @@ async function switchAccount(account: "personal" | "company", provider?: "anthro
     });
     if (!current(state, revision)) return;
     applyStatus(status);
-    s.notice =
-      account === "company"
-        ? "New chats will use company access."
-        : `New chats will use your ${provider === "anthropic" ? "Claude" : "ChatGPT / Codex"} account.`;
+    if (account === "company") s.notice = "New chats will use company access.";
+    else if (account === "shared-openai") s.notice = "New chats and scheduled turns will use shared Codex access.";
+    else s.notice = `New chats will use your ${provider === "anthropic" ? "Claude" : "ChatGPT / Codex"} account.`;
   } catch (e) {
     if (!current(state, revision)) return;
     s.error = friendly(e);
@@ -639,7 +642,7 @@ async function switchAccount(account: "personal" | "company", provider?: "anthro
 function view(): TemplateResult {
   const anyConnected = PROVIDERS.some(
     (p) => s.connections[p.key] && (s.account === "personal" || s.account === p.apiName),
-  );
+  ) || (s.account === "shared-openai" && s.sharedAvailable);
   let cta: TemplateResult | typeof nothing = nothing;
   if (s.loaded && (s.mode === "manager" || anyConnected || !s.personal)) {
     cta =
@@ -650,6 +653,9 @@ function view(): TemplateResult {
         : html`<button class="btn primary mc-cta" ?disabled=${s.saving} @click=${closeManager}>Done</button>`;
   }
   let choices: TemplateResult;
+  let accountHint = "Or use your own account. Connect a provider, then choose Use account.";
+  if (s.personal) accountHint = "Using a personal account. Choose a connected provider below.";
+  if (s.account === "shared-openai") accountHint = "Using shared Codex access.";
   if (!s.loaded) choices = html`<button type="button" class="btn" @click=${() => void load()}>Retry</button>`;
   else if (s.intent)
     choices = html`<div class="mc-simple-connect">
@@ -665,8 +671,14 @@ function view(): TemplateResult {
           if (!s.required) void switchAccount("company");
         },
       )}
+      ${s.sharedAvailable ? methodRow(
+        "Shared Codex access",
+        "Use the Codex account granted by your administrator.",
+        s.account === "shared-openai",
+        () => void switchAccount("shared-openai"),
+      ) : nothing}
       <p class="mc-account-hint">
-        ${s.personal ? "Using a personal account. Choose a connected provider below." : "Or use your own account. Connect a provider, then choose Use account."}
+        ${accountHint}
       </p>
       ${PROVIDERS.map((p) => providerRow(p))}
     </div>`;
@@ -685,7 +697,7 @@ function view(): TemplateResult {
       : `Use your ${s.intent?.subscription} subscription for new chats.`;
   const subCopy = s.intent
     ? personalCopy
-    : "Choose who provides access for your chats on the web and in Slack. Background tasks continue using company access.";
+    : "Choose who provides access for your chats on the web and in Slack. Shared Codex access also applies to your scheduled turns.";
   return html`
     <div class="signin">
       <div

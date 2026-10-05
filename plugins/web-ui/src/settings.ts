@@ -341,7 +341,7 @@ function acceptAiStatus(status: StatusResponse): void {
     appState.me.individualModelAuth = status.individualModelAuth;
     appState.me.modelAuthConnected = status.connections.some(
       (c) => status.account === "personal" || status.account === c.provider,
-    );
+    ) || (status.account === "shared-openai" && status.sharedAvailable === true);
   }
   drawSettings();
 }
@@ -371,14 +371,14 @@ async function loadAiStatus(): Promise<void> {
   drawSettings();
 }
 
-async function chooseAiAccount(account: "company" | "anthropic" | "openai"): Promise<void> {
+async function chooseAiAccount(account: "company" | "anthropic" | "openai" | "shared-openai"): Promise<void> {
   if (aiBusy || aiSaving) return;
   if (
     account === aiStatus?.account &&
-    (account === "company" || aiStatus.connections.some((c) => c.provider === account))
+    (account === "company" || account === "shared-openai" || aiStatus.connections.some((c) => c.provider === account))
   )
     return;
-  if (account !== "company" && !aiStatus?.connections.some((c) => c.provider === account)) {
+  if (account !== "company" && account !== "shared-openai" && !aiStatus?.connections.some((c) => c.provider === account)) {
     openModelConnectManager(account);
     return;
   }
@@ -389,8 +389,8 @@ async function chooseAiAccount(account: "company" | "anthropic" | "openai"): Pro
     const status = await api<StatusResponse>("/api/user-model-auth/account", {
       method: "POST",
       body: JSON.stringify({
-        account: account === "company" ? "company" : "personal",
-        provider: account === "company" ? undefined : account,
+        account: account === "company" || account === "shared-openai" ? account : "personal",
+        provider: account === "company" || account === "shared-openai" ? undefined : account,
       }),
     });
     acceptAiStatus(status);
@@ -407,7 +407,7 @@ function aiAccountsRow(): TemplateResult {
     <div class="settings-row">
       <div class="settings-row-copy">
         <div class="settings-row-title">AI access</div>
-        <div class="settings-row-note">Use company access or your own subscription.</div>
+        <div class="settings-row-note">Use company access, a granted shared Codex account, or your own subscription.</div>
         ${aiError ? html`<div class="settings-row-error" role="alert">${aiError} <button class="settings-theme-link" ?disabled=${aiSaving} @click=${loadAiStatus}>Retry</button></div>` : nothing}
       </div>
       <div class="settings-ai-controls">
@@ -415,6 +415,7 @@ function aiAccountsRow(): TemplateResult {
           ${(
             [
               ["company", "Company"],
+              ...(aiStatus?.sharedAvailable ? [["shared-openai", "Shared Codex"]] as const : []),
               ["anthropic", "Claude"],
               ["openai", "ChatGPT / Codex"],
             ] as const

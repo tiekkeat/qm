@@ -16,6 +16,33 @@ import { getRequiredModel, MODEL_REGISTRY, modelServiceable, resolveModel } from
 
 const ADMIN = { "content-type": "application/json", "x-admin-actor": "admin-alice@default-org" };
 
+test("shared Codex grants are admin-only and never expose OAuth tokens", async () => {
+  const srv = start();
+  try {
+    const jwtPart = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
+    await srv.built.userModelCredentials.setSharedOAuth({
+      accessToken: "shared-secret-access",
+      refreshToken: "shared-secret-refresh",
+      idToken: `${jwtPart({ alg: "RS256" })}.${jwtPart({ "https://api.openai.com/auth": { chatgpt_account_id: "shared" } })}.sig`,
+    });
+    const path = `${srv.base}/v1/admin/shared-codex/grants/user%40example.com`;
+    const denied = await fetch(path, { method: "PUT", headers: { ...ADMIN, "x-admin-actor": "nobody@default-org" } });
+    assert.equal(denied.status, 403);
+    const granted = await fetch(path, { method: "PUT", headers: ADMIN });
+    assert.equal(granted.status, 200);
+    const status = await fetch(`${srv.base}/v1/admin/shared-codex`, { headers: ADMIN });
+    assert.equal(status.status, 200);
+    const body = await status.text();
+    assert.deepEqual(JSON.parse(body), { connected: true, grantees: ["user@example.com"] });
+    assert.doesNotMatch(body, /shared-secret/);
+    const revoked = await fetch(path, { method: "DELETE", headers: ADMIN });
+    assert.equal(revoked.status, 200);
+    assert.equal(await srv.built.userModelCredentials.hasSharedGrant("user@example.com"), false);
+  } finally {
+    await srv.close();
+  }
+});
+
 function start(
   config: Parameters<typeof testConfig>[0] = {},
   modelCredentialFetch: typeof fetch = async () => new Response(null, { status: 200 }),

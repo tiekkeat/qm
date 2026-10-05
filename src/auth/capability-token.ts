@@ -42,7 +42,7 @@ export interface CapabilityClaims {
   externalSlack?: true;
   actorId: string;
   browserModel?: string;
-  browserAccount?: "company" | "personal" | "openai" | "anthropic";
+  browserAccount?: "company" | "personal" | "openai" | "anthropic" | "shared-openai";
   aud?: string;
   scopeId: ScopeId;
   scopeVersion?: string;
@@ -134,7 +134,7 @@ export async function verifyCapabilityToken(
   }
   if (
     claims.browserAccount !== undefined &&
-    !["company", "personal", "openai", "anthropic"].includes(claims.browserAccount)
+    !["company", "personal", "openai", "anthropic", "shared-openai"].includes(claims.browserAccount)
   )
     return null;
   if (claims.browserModel !== undefined && (typeof claims.browserModel !== "string" || !claims.browserModel))
