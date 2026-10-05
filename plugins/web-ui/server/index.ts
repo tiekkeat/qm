@@ -1390,6 +1390,7 @@ const apiRoutes: readonly WebRoute[] = [
       const parsed = JSON.parse(authStatus.text) as {
         individualModelAuth?: boolean;
         account?: string;
+        sharedAvailable?: boolean;
         connections?: { provider: string }[];
       };
       const permissions = allPermissions.filter((permission) => permission !== "loops" && permission !== "inbox");
@@ -1407,9 +1408,10 @@ const apiRoutes: readonly WebRoute[] = [
         slackWorkspaceUrl: workspaceUrl,
         individualModelAuth: parsed.individualModelAuth === true,
         modelAuthConnected:
-          parsed.connections?.some(
+          (parsed.account === "shared-openai" && parsed.sharedAvailable === true) ||
+          (parsed.connections?.some(
             (c) => !parsed.account || parsed.account === "personal" || parsed.account === c.provider,
-          ) ?? false,
+          ) ?? false),
         impersonatedBy: resolveIdentity(req)?.impersonator ?? null,
         displayName: resolveIdentity(req)?.name ?? null,
         ...(welcomeCohort ? { welcomeCohort } : {}),
