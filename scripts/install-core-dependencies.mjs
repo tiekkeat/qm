@@ -4,7 +4,7 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 
 execFileSync("npm", ["ci", "--omit=dev", "--ignore-scripts"], { stdio: "inherit" });
-const packages = JSON.parse(execFileSync("npm", ["query", "*"], { encoding: "utf8" }));
+const packages = JSON.parse(execFileSync("npm", ["query", "*"], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }));
 const rebuild = [
   ...new Set(
     packages
