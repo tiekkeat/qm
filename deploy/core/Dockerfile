@@ -19,7 +19,8 @@ WORKDIR /app
 
 COPY package.json package-lock.json ./
 COPY .husky/install.mjs .husky/install.mjs
-RUN npm ci --omit=dev && npm audit --omit=dev --audit-level=moderate \
+COPY scripts/install-core-dependencies.mjs ./scripts/install-core-dependencies.mjs
+RUN node scripts/install-core-dependencies.mjs && npm audit --omit=dev --audit-level=moderate \
   && rm -rf /root/.npm /tmp/node-compile-cache
 
 COPY --from=connector-sdk-build /app/.generated/connector-sdk ./.generated/connector-sdk
