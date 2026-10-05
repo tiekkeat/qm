@@ -65,6 +65,53 @@ function makeSandbox(fake: FakeDocker, opts: Record<string, unknown> = {}) {
 }
 const rw = (scope: string) => [{ scopeId: scope, mountPath: "", mode: "rw" as const }];
 
+test("computer status reports missing, running, and parked containers without provisioning or waking them", async () => {
+  const fake = installFakeDocker(daemonPort);
+  const scope = scopeId("group", "status-project");
+  const sb = makeSandbox(fake);
+  assert.deepEqual(await sb.computerStatus!(scope), {
+    machine: localContainerName(scope),
+    provisioned: false,
+    guestResponsive: false,
+  });
+  assert.equal(fake.runCount, 0);
+  const handle = await sb.provision(rw(scope));
+  assert.deepEqual(await sb.computerStatus!(scope), {
+    machine: handle.id,
+    provisioned: true,
+    lifecycleState: "running",
+    guestResponsive: true,
+  });
+  await sb.teardown(handle);
+  assert.deepEqual(await sb.computerStatus!(scope), {
+    machine: handle.id,
+    provisioned: true,
+    lifecycleState: "paused",
+    guestResponsive: false,
+  });
+  assert.equal(fake.containers.get(handle.id)!.running, false);
+  assert.equal(fake.runCount, 1);
+});
+
+test("computer status preserves daemon failures and Docker inspection failures", async () => {
+  const fake = installFakeDocker(daemonPort);
+  const scope = scopeId("personal", "status-failure");
+  await makeSandbox(fake).provision(rw(scope));
+  const sb = makeSandbox(fake, {
+    fetchImpl: async () => {
+      throw new Error("daemon unreachable");
+    },
+  });
+  const status = await sb.computerStatus!(scope);
+  assert.equal(status.provisioned, true);
+  assert.equal(status.guestResponsive, false);
+  assert.equal(status.probeError, "daemon unreachable");
+  const unhealthy = makeSandbox(fake, { fetchImpl: async () => new Response("", { status: 503 }) });
+  assert.equal((await unhealthy.computerStatus!(scope)).probeError, "exec daemon health returned HTTP 503");
+  fake.daemonDown = true;
+  await assert.rejects(sb.computerStatus!(scope), /Cannot connect to the Docker daemon/);
+});
+
 test("profile declares the local Docker substrate honestly", () => {
   const sb = makeSandbox(installFakeDocker(daemonPort));
   assert.equal(sb.profile.backend, "local-docker");
@@ -311,6 +358,7 @@ test("containerized core joins each sandbox network and reaches the daemon by co
   assert.equal(args.includes("-p"), false);
   assert.equal(fake.connections.has(`${localNetworkName(h.id)}|qm-test-core`), true);
   assert.ok(seen.includes(`http://${h.id}:8080/health`));
+  assert.equal((await sb.computerStatus!(scopeId("personal", "U40"))).guestResponsive, true);
   await sb.teardown(h, { destroy: true });
   assert.equal(fake.connections.has(`${localNetworkName(h.id)}|qm-test-core`), false);
 });

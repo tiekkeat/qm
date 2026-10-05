@@ -21,6 +21,7 @@ import { killableScript, killScript } from "./exec-kill.ts";
 import { execFailureDetail } from "./sandbox.ts";
 import type {
   AgentComputerProfile,
+  ComputerStatus,
   ExecOptions,
   ExecResult,
   ProvisionOptions,
@@ -144,7 +145,10 @@ export function createLocalSandbox(workspace: WorkspaceStore, opts: LocalSandbox
 
   async function containerState(name: string): Promise<{ running: boolean; imageId: string } | null> {
     const r = await dexec(["inspect", "-f", "{{.State.Running}} {{.Image}}", name]);
-    if (r.code !== 0) return null;
+    if (r.code !== 0) {
+      if (/no such (?:object|container)/i.test(r.stderr)) return null;
+      throw new Error(`docker inspect ${name} failed: ${r.stderr.trim() || r.stdout.trim()}`);
+    }
     const [running = "", imageId = ""] = r.stdout.trim().split(/\s+/);
     return { running: running === "true", imageId };
   }
@@ -384,6 +388,28 @@ export function createLocalSandbox(workspace: WorkspaceStore, opts: LocalSandbox
 
   const sandbox: Sandbox = {
     profile,
+    async computerStatus(scopeId: string): Promise<ComputerStatus> {
+      const name = localContainerName(scopeId);
+      const state = await containerState(name);
+      if (!state) return { machine: name, provisioned: false, guestResponsive: false };
+      const status: ComputerStatus = {
+        machine: name,
+        provisioned: true,
+        lifecycleState: state.running ? "running" : "paused",
+        guestResponsive: false,
+      };
+      if (!state.running) return status;
+      try {
+        const response = await daemon(name, "/health", undefined, 3000);
+        return {
+          ...status,
+          guestResponsive: response.status === 200,
+          ...(response.status === 200 ? {} : { probeError: `exec daemon health returned HTTP ${response.status}` }),
+        };
+      } catch (e) {
+        return { ...status, probeError: errMessage(e) };
+      }
+    },
     startProcess: procSessions.startProcess,
     readProcess: procSessions.readProcess,
     writeStdin: procSessions.writeStdin,
