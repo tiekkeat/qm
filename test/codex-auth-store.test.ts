@@ -94,12 +94,18 @@ const META = {
 
 test("child auth material never includes the refresh token", () => {
   const auth = authJson("acct", FRESH_EXP);
+  auth.last_refresh = "2000-01-01T00:00:00.000Z";
+  const before = Date.now();
   const child = childCodexOAuthAuth(auth);
+  const after = Date.now();
   const tokens = child.tokens as Record<string, unknown>;
   assert.equal(tokens.refresh_token, "");
   assert.equal(tokens.access_token, (auth.tokens as Record<string, unknown>).access_token);
   assert.equal(tokens.id_token, (auth.tokens as Record<string, unknown>).id_token);
   assert.equal(child.auth_mode, "chatgpt");
+  assert.ok(Date.parse(String(child.last_refresh)) >= before);
+  assert.ok(Date.parse(String(child.last_refresh)) <= after);
+  assert.equal(auth.last_refresh, "2000-01-01T00:00:00.000Z");
 });
 
 test("codexOAuthAuthFromValue validates shape and account binding", () => {

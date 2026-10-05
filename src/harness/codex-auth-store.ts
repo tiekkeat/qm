@@ -99,6 +99,10 @@ export function childCodexOAuthAuth(auth: JsonObject): JsonObject {
     const { refresh_token: _refresh, ...rest } = tokens;
     sanitized.tokens = { ...rest, refresh_token: "" };
   }
+  // Codex treats a missing/old last_refresh as a cue to renew its login.
+  // The child has no refresh token by design; the parent already supplied
+  // fresh derived tokens, so stamp this ephemeral auth at handoff time.
+  sanitized.last_refresh = new Date().toISOString();
   return sanitized;
 }
 
