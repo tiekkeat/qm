@@ -1446,11 +1446,7 @@ function tryDecodeUtf8(bytes: Uint8Array): string | null {
 
 const COMMAND_PATH_PROBE_TIMEOUT_MS = 10_000;
 
-async function collectTree(
-  sandbox: Sandbox,
-  handle: SandboxHandle,
-  dir?: string,
-): Promise<Array<{ path: string; data: Uint8Array }>> {
+async function collectTree(sandbox: Sandbox, handle: SandboxHandle, dir?: string): Promise<DeployFile[]> {
   const base = (dir ?? "").replace(/^\.?\/+/, "").replace(/\/+$/, "");
   if (supportsAgentComputerExport(sandbox)) {
     try {
@@ -1460,13 +1456,19 @@ async function collectTree(
         exclude: (entry) => carriesGitMetadata(entry.path),
         keepContentCaches: true,
       });
-      return entries.filter((e) => !carriesGitMetadata(e.path)).map((e) => ({ path: e.path, data: e.data }));
+      return entries
+        .filter((e) => !carriesGitMetadata(e.path))
+        .map((e) => ({
+          path: e.path,
+          data: e.data,
+          ...(e.mode !== undefined ? { mode: e.mode } : {}),
+        }));
     } catch (e) {
       if (!(e instanceof CapabilityUnsupportedError)) throw e;
       console.warn(`[publish] ${e.message}; falling back to per-file reads`);
     }
   }
-  const out: Array<{ path: string; data: Uint8Array }> = [];
+  const out: DeployFile[] = [];
   for (const path of await sandbox.listDir(handle, base || ".")) {
     if (carriesGitMetadata(path)) continue;
     const data = await sandbox.readFileBytes(handle, path);
@@ -1484,11 +1486,9 @@ function isUnderAnyDir(path: string, dirs: readonly string[]): boolean {
   });
 }
 
-function filesUnder(snapshot: Array<{ path: string; data: Uint8Array }>, dir?: string): DeployFile[] {
+function filesUnder(snapshot: DeployFile[], dir?: string): DeployFile[] {
   const d = (dir ?? "").replace(/^\.?\/+/, "").replace(/\/+$/, "");
-  if (!d || d === ".") return snapshot.map((f) => ({ path: f.path, data: f.data }));
+  if (!d || d === ".") return snapshot;
   const prefix = `${d}/`;
-  return snapshot
-    .filter((f) => f.path.startsWith(prefix))
-    .map((f) => ({ path: f.path.slice(prefix.length), data: f.data }));
+  return snapshot.filter((f) => f.path.startsWith(prefix)).map((f) => ({ ...f, path: f.path.slice(prefix.length) }));
 }

@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { DurableMap } from "../persistence/durable-map.ts";
@@ -13,13 +13,14 @@ import { normalizeRelPath } from "./deploy-fs.ts";
 export interface DeployGitInputFile {
   path: string;
   data: string | Uint8Array;
+  mode?: number;
 }
 
 export interface DeployGitTreeFile {
   path: string;
   sha: string;
   size: number;
-  mode: "100644";
+  mode: "100644" | "100755";
 }
 
 export interface DeployGitDiff {
@@ -220,9 +221,9 @@ export function createDeployGitStore(opts: DeployGitStoreOptions = {}): DeployGi
       .split("\0")
       .filter(Boolean)
       .map((entry) => {
-        const m = /^(100644) blob ([0-9a-f]{40})\s+(\d+)\t(.+)$/.exec(entry);
+        const m = /^(100644|100755) blob ([0-9a-f]{40})\s+(\d+)\t(.+)$/.exec(entry);
         if (!m) throw new Error(`unexpected git tree entry: ${entry}`);
-        return { mode: "100644" as const, sha: m[2]!, size: Number(m[3]!), path: m[4]! };
+        return { mode: m[1] as DeployGitTreeFile["mode"], sha: m[2]!, size: Number(m[3]!), path: m[4]! };
       })
       .sort(byPath);
   }
@@ -275,7 +276,7 @@ export function createDeployGitStore(opts: DeployGitStoreOptions = {}): DeployGi
         if (wanted && !wanted.has(entry.path)) continue;
         const data = await blob(deploymentId, entry.sha);
         if (data == null) throw new Error(`missing blob ${entry.sha} for ${entry.path}`);
-        files.push({ path: entry.path, data });
+        files.push({ path: entry.path, data, ...(entry.mode === "100755" ? { mode: 0o755 } : {}) });
       }
       return files;
     },
@@ -365,6 +366,7 @@ async function writeFiles(root: string, files: DeployGitInputFile[]): Promise<vo
     if (back.startsWith("..") || isAbsolute(back)) throw new Error(`deploy git file escapes worktree: ${file.path}`);
     await mkdir(dirname(target), { recursive: true });
     await writeFile(target, typeof file.data === "string" ? file.data : Buffer.from(file.data));
+    if (file.mode !== undefined) await chmod(target, file.mode & 0o111 ? 0o755 : 0o644);
   }
 }
 

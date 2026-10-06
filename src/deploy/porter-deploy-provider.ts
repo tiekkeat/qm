@@ -120,13 +120,18 @@ export function createPorterDeployProvider(opts: PorterDeployProviderOptions): D
   async function unpackTree(sandboxId: string, volumeId: string, guestDir: string, dir: string): Promise<void> {
     const files = await readTree(dir, { tolerateMissing: true });
     if (!files.length) return;
-    const entries = files.map((f) => ({ path: normalizeRelPath(f.path), data: f.data }));
+    const entries = files.map((f) => ({ ...f, path: normalizeRelPath(f.path) }));
     const bundle = `${BUNDLE_DIR}/${randomUUID()}.tar`;
     const uploaded = await client.volumes.raw
       .writeFile(volumeId, await makeTar(entries), { path: `/${bundle}` }, { timeoutMs: BUNDLE_UPLOAD_TIMEOUT_MS })
       .then(() => true, swallowAs("porter-deploy: bundle upload failed, writing files one at a time", false));
     if (!uploaded) {
-      for (const entry of entries) await writeAbsBytes(sandboxId, posixJoin(guestDir, entry.path), entry.data);
+      for (const entry of entries) {
+        const target = posixJoin(guestDir, entry.path);
+        await writeAbsBytes(sandboxId, target, entry.data);
+        const chmod = await execRaw(sandboxId, `chmod ${entry.mode.toString(8)} ${shq(target)}`, 30);
+        if (chmod.code !== 0) throw new Error(`porter deploy: chmod failed: ${chmod.stderr.slice(0, 300)}`);
+      }
       return;
     }
     const guestBundle = posixJoin(DATA_DIR, bundle);

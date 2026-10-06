@@ -1,11 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync } from "node:fs";
+import { mkdtempSync, readdirSync, statSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createToolContext } from "../src/tools/primitives.ts";
 import { createDeployStore, type DeployStore, type Deployment } from "../src/deploy/deploy-store.ts";
 import { createDeployService, type DeployService, type DeployOrUpdateInput } from "../src/deploy/deploy-service.ts";
+import { readTree } from "../src/deploy/deploy-fs.ts";
 import { createAclStore, type AclStore } from "../src/acl/acl-store.ts";
 import { createMemoryConfigStore } from "../src/resolution/config-store.ts";
 import type { ToolLedger } from "../src/runs/tool-ledger.ts";
@@ -17,12 +19,14 @@ function svc() {
   const deployStore: DeployStore = createDeployStore();
   const acl: AclStore = createAclStore();
   let starts = 0;
+  const appliedSnapshots: string[] = [];
   const deploy: DeployService = createDeployService({
     deployStore,
     provider: {
       profile: { managedScaleToZero: false },
-      apply: async () => {
+      apply: async (_deployment, version) => {
         starts++;
+        appliedSnapshots.push(version.snapshotDir);
         return { host: "127.0.0.1", port: 20000 };
       },
       destroy: async () => {},
@@ -35,6 +39,7 @@ function svc() {
     deploy,
     deployStore,
     acl,
+    appliedSnapshots,
     get starts() {
       return starts;
     },
@@ -42,7 +47,7 @@ function svc() {
 }
 
 interface CtxOpts {
-  files?: Array<{ path: string; data: Uint8Array }>;
+  files?: Array<{ path: string; data: Uint8Array; mode?: number }>;
   sandbox?: Sandbox;
   provision?: () => Promise<SandboxHandle>;
   ledger?: ToolLedger;
@@ -51,7 +56,7 @@ interface CtxOpts {
   splitEnv?: Record<string, string>;
 }
 
-function fileSandbox(files: Array<{ path: string; data: Uint8Array }>): Sandbox {
+function fileSandbox(files: Array<{ path: string; data: Uint8Array; mode?: number }>): Sandbox {
   const under = (dir: string) => {
     const d = (dir ?? "").replace(/^\.?\/+/, "").replace(/\/+$/, "");
     return files.filter((f) => !d || d === "." || f.path === d || f.path.startsWith(`${d}/`));
@@ -61,7 +66,7 @@ function fileSandbox(files: Array<{ path: string; data: Uint8Array }>): Sandbox 
     readFileBytes: async (_h: SandboxHandle, p: string) => files.find((f) => f.path === p)?.data ?? null,
     exportFiles: async (_h: SandboxHandle, opts?: { includePaths?: readonly string[] }) => {
       const dir = opts?.includePaths?.[0] ?? "";
-      return under(dir).map((f) => ({ area: "workspace" as const, path: f.path, data: f.data }));
+      return under(dir).map((f) => ({ area: "workspace" as const, ...f }));
     },
   } as unknown as Sandbox;
 }
@@ -115,6 +120,51 @@ test("publish collects only the published dir (prefix-stripped) and returns a /d
     ["public/index.html", "server.js"],
     "the app tree is also committed without outside-dir files",
   );
+});
+
+test("publish preserves an executable entrypoint through Git and local deployment snapshots", async () => {
+  const s = svc();
+  const files = [
+    { path: "login-demo/portal", data: bytes("#!/bin/sh\nprintf ready"), mode: 0o755 },
+    { path: "login-demo/config.json", data: bytes("{}"), mode: 0o644 },
+  ];
+  await ctx(s.deploy, { files }).publish({ dir: "login-demo", entrypoint: "./portal", name: "simple-login-demo" });
+
+  const d = (await s.deployStore.getByName("simple-login-demo"))!;
+  const snapshot = (await s.deployStore.versionOf(d.id, 1))!.snapshotDir;
+  assert.deepEqual(
+    (await s.deployStore.treeOf(d.id, 1))?.map((f) => [f.path, f.mode]),
+    [
+      ["config.json", "100644"],
+      ["portal", "100755"],
+    ],
+  );
+  assert.equal(statSync(join(snapshot, "portal")).mode & 0o111, 0o111);
+  assert.equal(statSync(join(snapshot, "config.json")).mode & 0o111, 0);
+  assert.deepEqual(
+    (await readTree(snapshot)).map((f) => [f.path, f.mode]).sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+    [
+      ["config.json", 0o644],
+      ["portal", 0o755],
+    ],
+  );
+  assert.equal(execFileSync(join(snapshot, "portal"), { encoding: "utf8" }), "ready");
+  assert.equal((await s.deployStore.filesOf(d.id, 1))?.find((f) => f.path === "portal")?.mode, 0o755);
+
+  const redeployed = await ctx(s.deploy, { files }).publish({ dir: "login-demo", name: "simple-login-demo" });
+  assert.equal(redeployed.version, 2);
+  assert.equal((await s.deployStore.treeOf(d.id, 2))?.find((f) => f.path === "portal")?.mode, "100755");
+
+  await s.deploy.rollbackDeployment(d.id, 1);
+  assert.equal(statSync(join(s.appliedSnapshots.at(-1)!, "portal")).mode & 0o111, 0o111);
+  assert.equal(execFileSync(join(s.appliedSnapshots.at(-1)!, "portal"), { encoding: "utf8" }), "ready");
+
+  await ctx(s.deploy, { files: files.map((f) => ({ ...f, mode: 0o644 })) }).publish({
+    dir: "login-demo",
+    name: "simple-login-demo",
+  });
+  assert.equal((await s.deployStore.treeOf(d.id, 3))?.find((f) => f.path === "portal")?.mode, "100644");
+  assert.equal(statSync(join(s.appliedSnapshots.at(-1)!, "portal")).mode & 0o111, 0);
 });
 
 test("publish falls back to per-file reads when the routed backend refuses exportFiles", async () => {

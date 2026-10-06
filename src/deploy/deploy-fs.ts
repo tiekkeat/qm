@@ -1,4 +1,4 @@
-import { readdir, readFile } from "node:fs/promises";
+import { readdir, readFile, stat } from "node:fs/promises";
 import { join, relative, sep } from "node:path";
 
 export function bytes(data: string | Uint8Array): Uint8Array {
@@ -41,7 +41,7 @@ export function posixJoin(base: string, rel: string): string {
 export async function readTree(
   root: string,
   opts: { tolerateMissing?: boolean } = {},
-): Promise<Array<{ path: string; data: Uint8Array }>> {
+): Promise<Array<{ path: string; data: Uint8Array; mode: number }>> {
   let entries;
   try {
     entries = await readdir(root, { recursive: true, withFileTypes: true });
@@ -49,11 +49,12 @@ export async function readTree(
     if (opts.tolerateMissing && (e as NodeJS.ErrnoException).code === "ENOENT") return [];
     throw e;
   }
-  const out: Array<{ path: string; data: Uint8Array }> = [];
+  const out: Array<{ path: string; data: Uint8Array; mode: number }> = [];
   for (const entry of entries) {
     if (!entry.isFile()) continue;
     const full = join(entry.parentPath, entry.name);
-    out.push({ path: relative(root, full).split(sep).join("/"), data: await readFile(full) });
+    const mode = (await stat(full)).mode & 0o777;
+    out.push({ path: relative(root, full).split(sep).join("/"), data: await readFile(full), mode });
   }
   return out;
 }

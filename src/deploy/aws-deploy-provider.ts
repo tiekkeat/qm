@@ -423,9 +423,16 @@ export function createAwsDeployProvider(opts: AwsDeployProviderOptions): DeployP
     id: string,
     endpoint: string,
     root: string,
-    files: Array<{ path: string; data: string | Uint8Array }>,
+    files: Array<{ path: string; data: string | Uint8Array; mode?: number }>,
   ): Promise<void> {
-    for (const f of files) await writeAbs(id, endpoint, posixJoin(root, normalizeRelPath(f.path)), bytes(f.data));
+    for (const f of files) {
+      const target = posixJoin(root, normalizeRelPath(f.path));
+      await writeAbs(id, endpoint, target, bytes(f.data));
+      if (f.mode !== undefined) {
+        const chmod = await execRaw(id, endpoint, `chmod ${(f.mode & 0o777).toString(8)} ${shq(target)}`, 30);
+        if (chmod.code !== 0) throw new Error(`aws deploy chmod failed: ${chmod.stderr.slice(0, 300)}`);
+      }
+    }
   }
 
   async function startApp(id: string, endpoint: string, version: DeploymentVersion): Promise<void> {

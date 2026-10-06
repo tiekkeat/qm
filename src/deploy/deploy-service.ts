@@ -3,7 +3,7 @@ import { notifyDeploymentShared } from "./share-notice.ts";
 import type { DeliveryStore } from "../delivery/delivery-store.ts";
 import { EMBED_ANCESTORS_HINT, parseEmbedAncestors } from "./embed-ancestors.ts";
 import { deploymentShareScope } from "./email-access.ts";
-import { mkdir, writeFile } from "node:fs/promises";
+import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { join, dirname, resolve, relative, isAbsolute } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { Grant, Permission, ScopeId } from "../types.ts";
@@ -30,6 +30,7 @@ import { errMessage, reportFailure, swallow } from "../util/errors.ts";
 export interface DeployFile {
   path: string;
   data: string | Uint8Array;
+  mode?: number;
 }
 
 export interface RedeployInput {
@@ -926,6 +927,7 @@ async function snapshotFiles(deployDir: string, files: DeployFile[]): Promise<st
     await mkdir(dirname(target), { recursive: true });
     if (typeof f.data === "string") await writeFile(target, f.data, "utf8");
     else await writeFile(target, Buffer.from(f.data));
+    if (f.mode !== undefined) await chmod(target, f.mode & 0o777);
   }
   return dir;
 }
