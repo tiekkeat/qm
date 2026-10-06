@@ -30,6 +30,38 @@ export function runChecks(
   const configError = (message: string, clause = "config.v1"): void => void configErrors.push({ clause, message });
   const provider = hostingProvider(config.target);
   configErrors.push(...provider.validateConfig(config, plugins));
+  if (config.target === "docker" && config.services.includes("portal")) {
+    const appsDomain = config.env.core?.DEPLOY_APPS_DOMAIN;
+    const portalAppsDomain = config.env.portal?.PORTAL_APPS_DOMAIN ?? config.env.portal?.DEPLOY_APPS_DOMAIN;
+    if (appsDomain) {
+      const publicUrl = new URL(config.publicUrl);
+      if (publicUrl.protocol !== "https:" || publicUrl.port) {
+        configError("Docker app subdomains require publicUrl to use HTTPS on port 443", "config.publicUrl");
+      }
+      const cookieDomain = (config.env.portal?.PORTAL_COOKIE_DOMAIN ?? publicUrl.hostname)
+        .toLowerCase()
+        .replace(/^\./, "");
+      const withinCookieDomain = (host: string): boolean =>
+        host.toLowerCase() === cookieDomain || host.toLowerCase().endsWith(`.${cookieDomain}`);
+      if (!withinCookieDomain(publicUrl.hostname) || !withinCookieDomain(appsDomain)) {
+        configError("The portal and app hostnames must share PORTAL_COOKIE_DOMAIN", "config.env");
+      }
+      if (portalAppsDomain !== appsDomain) {
+        configError("env.portal.PORTAL_APPS_DOMAIN must match env.core.DEPLOY_APPS_DOMAIN", "config.env");
+      }
+      const portalSecretSource = config.secretEnv?.portal?.PORTAL_SESSION_SECRET ?? "PORTAL_SESSION_SECRET";
+      const coreSecretSource =
+        config.secretEnv?.core?.DEPLOY_APPS_SESSION_SECRET ?? config.secretEnv?.core?.PORTAL_SESSION_SECRET;
+      if (coreSecretSource !== portalSecretSource) {
+        configError(
+          "secretEnv.core.DEPLOY_APPS_SESSION_SECRET must use the portal's PORTAL_SESSION_SECRET source",
+          "config.secretEnv",
+        );
+      }
+    } else if (portalAppsDomain) {
+      configError("env.core.DEPLOY_APPS_DOMAIN is required when the portal has an apps domain", "config.env");
+    }
+  }
   for (const skill of config.skills) {
     const path = resolve(configDir, skill);
     let isDirectory: boolean;
@@ -143,6 +175,11 @@ export function runChecks(
     const optional = secrets.filter((secret) => !secret.required).map((secret) => secret.name);
     if (optional.length) step(`optional secrets: ${optional.join(", ")}`);
     for (const w of layer.warnings) warn(w);
+    if (config.target === "docker" && config.services.includes("portal") && !config.env.core?.DEPLOY_APPS_DOMAIN) {
+      warn(
+        "Published apps will use /d/<app>/; JavaScript module apps need an HTTPS app subdomain (DEPLOY_APPS_DOMAIN). See docs/docker-app-hostnames.md.",
+      );
+    }
     const mockHarness = mockHarnessWarning(config);
     if (mockHarness) warn(mockHarness);
   }

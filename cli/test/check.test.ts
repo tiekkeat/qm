@@ -185,6 +185,40 @@ test("docker with sandbox.backend local passes without a Fly sandbox app", () =>
   }
 });
 
+test("Docker portal app domains require matching HTTPS and session wiring", () => {
+  const base = {
+    publicUrl: "https://qm.example.test",
+    services: ["core", "portal"] as QmConfig["services"],
+    env: {
+      core: { DEPLOY_APPS_DOMAIN: "apps.qm.example.test" },
+      portal: { PORTAL_APPS_DOMAIN: "apps.qm.example.test" },
+    },
+    secretEnv: { core: { DEPLOY_APPS_SESSION_SECRET: "PORTAL_SESSION_SECRET" } },
+  };
+  const d = deployment(() => {}, base);
+  try {
+    assert.doesNotThrow(() => check(d));
+    d.config.publicUrl = "https://qm.example.test:8443";
+    assert.throws(() => check(d), /HTTPS on port 443/);
+    d.config.publicUrl = base.publicUrl;
+    d.config.env.portal = { PORTAL_APPS_DOMAIN: "apps.other.test" };
+    assert.throws(() => check(d), /must match/);
+    d.config.env.portal = base.env.portal;
+    d.config.secretEnv = {};
+    assert.throws(() => check(d), /DEPLOY_APPS_SESSION_SECRET/);
+    d.config.secretEnv = base.secretEnv;
+    d.config.env = {
+      core: { DEPLOY_APPS_DOMAIN: "apps.example.test" },
+      portal: { PORTAL_APPS_DOMAIN: "apps.example.test", PORTAL_COOKIE_DOMAIN: "example.test" },
+    };
+    assert.doesNotThrow(() => check(d));
+    d.config.env.portal = { PORTAL_APPS_DOMAIN: "apps.example.test", PORTAL_COOKIE_DOMAIN: "other.test" };
+    assert.throws(() => check(d), /share PORTAL_COOKIE_DOMAIN/);
+  } finally {
+    rmSync(d.dir, { recursive: true, force: true });
+  }
+});
+
 test("AWS requires exact ECS/ECR coordinates for discovered plugins", () => {
   const plugin = { name: "linear", image: "ghcr.io/acme/linear:1" };
   const aws = {
