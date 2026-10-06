@@ -28,6 +28,7 @@ const runtimeReadKey = (key: string) => key.replace(/-runtime$/, "Runtime");
 export class SettingsState extends SettingState {
   context: Data = {};
   selected = "";
+  manualId = "";
   editing = false;
   history: Data[] = [];
   collect(_validate = true): Data {
@@ -52,6 +53,9 @@ export class SettingsState extends SettingState {
       ...Object.values(this.context.modelsByHarness || {}).flat(),
       ...(this.context.baseModelOptions || []),
     ].filter((m: any, i, all) => m?.id && all.findIndex((x: any) => x?.id === m.id) === i) as Model[];
+  }
+  get manualCodexModels(): Model[] {
+    return this.context.manualCodexModels || [];
   }
   get harnesses(): string[] {
     return this.context.harnessOptions?.length ? this.context.harnessOptions : [this.context.harnessDefault || "pi"];
@@ -96,6 +100,24 @@ export class SettingsState extends SettingState {
   add() {
     if (this.selected && !this.draft.ids.includes(this.selected)) this.draft.ids.push(this.selected);
     this.selected = "";
+    this.changed();
+  }
+  addManual() {
+    const id = this.manualId.trim();
+    if (!this.manualCodexModels.some((model) => model.id === id)) {
+      this.message = "Enter a supported Codex model ID.";
+      this.tone = "err";
+      this.render();
+      return;
+    }
+    if (this.draft.ids.includes(id)) {
+      this.message = "That model is already enabled.";
+      this.tone = "err";
+      this.render();
+      return;
+    }
+    this.draft.ids.push(id);
+    this.manualId = "";
     this.changed();
   }
   remove(id: string) {
@@ -145,7 +167,7 @@ export function load(data: Data, scope: string, only?: string) {
     }
     s.available =
       scope.startsWith("org:") &&
-      !!data.baseModelOptions?.length &&
+      (key === "webui-models" || !!data.baseModelOptions?.length) &&
       (!runtimeKeys.includes(key) || (!!data.baseModelDefault && runtimeReadKey(key) in data));
     const runtime = data[runtimeReadKey(key)];
     s.draft = runtimeKeys.includes(key)
@@ -160,6 +182,7 @@ export function load(data: Data, scope: string, only?: string) {
     s.normalize();
     s.saving = false;
     s.selected = "";
+    s.manualId = "";
     capture(key);
   }
 }
@@ -188,7 +211,7 @@ const effortLabels: Record<string, string> = {
 };
 const value = (event: Event) => (event.target as HTMLInputElement).value;
 const label = (s: SettingsState, id: string) => {
-  const m = s.catalog.find((x) => x.id === id);
+  const m = [...s.catalog, ...s.manualCodexModels].find((x) => x.id === id);
   return m?.name && m.name !== id ? `${m.name} (${id})` : id;
 };
 function card(s: SettingsState) {
@@ -357,6 +380,32 @@ function card(s: SettingsState) {
           + Add model
         </button>
       </div>
+      <div class="model-add-row">
+        <div class="model-add-field">
+          <label for="webui-models-manual">Add a Codex model ID</label
+          ><input
+            id="webui-models-manual"
+            type="text"
+            autocomplete="off"
+            placeholder="e.g. gpt-5.6-sol"
+            .value=${s.manualId}
+            @input=${(e: Event) => {
+              s.manualId = value(e);
+              s.render();
+            }}
+            @keydown=${(e: KeyboardEvent) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                s.addManual();
+              }
+            }}
+          />
+        </div>
+        <button type="button" id="webui-models-manual-button" ?disabled=${!s.manualId.trim()} @click=${() => s.addManual()}>
+          + Add ID
+        </button>
+      </div>
+      <p class="hint">Use an exact supported Codex ID. Users also need a connected shared Codex account and a grant.</p>
       <div id="webui-models-list" class="model-list">
         <p id="webui-models-empty" class=${classMap({ hint: true, hidden: !!ids.length })}>
           No additional models enabled.

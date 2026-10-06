@@ -25,6 +25,7 @@ const models = {
   harnessDefault: "pi",
   harnessOptions: ["pi", "codex"],
   modelsByHarness: { pi: [{ id: "a", name: "Alpha" }], codex: [{ id: "b", name: "Beta" }] },
+  manualCodexModels: [{ id: "gpt-5.6-sol", name: "GPT 5.6 Sol" }],
   thinkingLevelsByHarness: { pi: ["auto", "high"], codex: ["low"] },
   runtime: { harnessId: "pi", modelId: "a", effortLevel: "high", fastMode: true },
   fastModeHarnessIds: ["pi"],
@@ -60,6 +61,32 @@ test("model chips add and remove with stable keyed rendering", () => {
     assert.equal(dom.window.eval('settingsUI.collect("webui-models").ids.join()'), "b");
     dom.window.document.querySelector<HTMLButtonElement>('[aria-label="Remove b"]')!.click();
     assert.equal(dom.window.eval('settingsUI.states.get("webui-models").dirty'), false);
+  } finally {
+    dom.window.close();
+  }
+});
+test("manual Codex IDs can be added without provider-backed dropdown choices", () => {
+  const dom = setup();
+  try {
+    const noKeyModels = { ...models, baseModelOptions: [], modelsByHarness: { pi: [], codex: [] } };
+    dom.window.eval("settingsUI.load(" + JSON.stringify(noKeyModels) + ',"org:test","webui-models")');
+    assert.equal(dom.window.document.getElementById("card-webui-models")!.classList.contains("hidden"), false);
+    const input = dom.window.document.getElementById("webui-models-manual") as HTMLInputElement;
+    input.value = " gpt-5.6-sol ";
+    input.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+    dom.window.document.getElementById("webui-models-manual-button")!.click();
+    assert.deepEqual(JSON.parse(String(dom.window.eval('JSON.stringify(settingsUI.collect("webui-models"))'))), {
+      ids: ["gpt-5.6-sol"],
+    });
+    assert.equal(input.value, "");
+    input.value = "gpt-5.6-sol";
+    input.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+    dom.window.document.getElementById("webui-models-manual-button")!.click();
+    assert.equal(dom.window.eval('settingsUI.collect("webui-models").ids.length'), 1);
+    input.value = "not-a-model";
+    input.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+    dom.window.document.getElementById("webui-models-manual-button")!.click();
+    assert.equal(dom.window.eval('settingsUI.collect("webui-models").ids.length'), 1);
   } finally {
     dom.window.close();
   }

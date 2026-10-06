@@ -9,6 +9,7 @@ import {
   defaultModelForHarness,
   modelProviderAvailabilityFor,
   modelServiceable,
+  modelSupportedByHarness,
   ALL_PROVIDERS_AVAILABLE,
   resolveModel,
   thinkingLevelsForHarness,
@@ -350,8 +351,13 @@ async function scopeEgress(deps: ApiCtx["deps"], targetScope: string) {
 
 async function scopeModelOptions(deps: ApiCtx["deps"], values: Record<string, unknown>, nonblocking: boolean) {
   const configuredKeys = deps.providerKeys ?? ALL_PROVIDERS_AVAILABLE;
-  const managedKeys = deps.modelCredentials ? await deps.modelCredentials.availability() : configuredKeys;
-  const providersFor = (harnessId: string) => modelProviderAvailabilityFor(harnessId, configuredKeys, managedKeys);
+  const [managedKeys, sharedCodex] = await Promise.all([
+    deps.modelCredentials ? deps.modelCredentials.availability() : configuredKeys,
+    deps.userModelCredentials?.sharedStatus(),
+  ]);
+  const sharedCodexReady = sharedCodex?.connected === true && !sharedCodex.needsReconnect;
+  const codexKeys = sharedCodexReady ? { ...configuredKeys, codexOAuth: true } : configuredKeys;
+  const providersFor = (harnessId: string) => modelProviderAvailabilityFor(harnessId, codexKeys, managedKeys);
   const cached =
     deps.modelCredentials && managedKeys.openrouter && nonblocking
       ? cachedModelCatalog(deps.modelCredentialFetch)
@@ -361,6 +367,9 @@ async function scopeModelOptions(deps: ApiCtx["deps"], values: Record<string, un
     (deps.modelCredentials && managedKeys.openrouter
       ? await selectableModelCatalog(deps.modelCredentialFetch)
       : builtInModelCatalog());
+  const manualCodexModels = builtInModelCatalog().filter(
+    (model) => model.provider === "openai" && modelSupportedByHarness(model.id, "codex"),
+  );
   const runtime = values.runtime as { harnessId?: unknown; modelId?: unknown } | null | undefined;
   const approvedHarnesses = (await deps.config!.getApprovedHarnessesDurable()) ?? [deps.harnessId ?? "pi"];
   let currentId = defaultModelForHarness(deps.harnessId ?? "pi", deps.baseModelDefault);
@@ -419,6 +428,7 @@ async function scopeModelOptions(deps: ApiCtx["deps"], values: Record<string, un
         modelsFor(id).map((model) => ({ ...model, effortLevels: thinkingLevelsForHarness(id, model.id) })),
       ]),
     ),
+    manualCodexModels,
     thinkingLevelsByHarness: Object.fromEntries(
       HARNESS_IDS.filter((id) => id !== "mock").map((id) => [id, thinkingLevelsForHarness(id)]),
     ),

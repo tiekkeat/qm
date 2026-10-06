@@ -23,6 +23,46 @@ function start(overrides: Partial<ServerDeps> = {}) {
 
 const scopePath = "/v1/admin/scopes/org%3Adefault-org";
 
+test("shared Codex offers supported models in Admin without an OpenAI API key", async (t) => {
+  const srv = start();
+  t.after(srv.close);
+  const read = async () => {
+    const response = await fetch(srv.base + scopePath + "?view=models", { headers: ADMIN });
+    assert.equal(response.status, 200);
+    return (await response.json()) as {
+      modelsByHarness: Record<string, { id: string }[]>;
+      manualCodexModels: { id: string }[];
+    };
+  };
+  const before = await read();
+  assert.ok(before.manualCodexModels.some((model) => model.id === "gpt-5.6-sol"));
+  assert.equal(before.modelsByHarness.codex?.some((model) => model.id === "gpt-5.6-sol"), false);
+
+  const jwtPart = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
+  await srv.built.userModelCredentials.setSharedOAuth({
+    accessToken: "shared-access",
+    refreshToken: "shared-refresh",
+    idToken: `${jwtPart({ alg: "RS256" })}.${jwtPart({ "https://api.openai.com/auth": { chatgpt_account_id: "shared" } })}.sig`,
+  });
+  const ready = await read();
+  assert.ok(ready.modelsByHarness.codex?.some((model) => model.id === "gpt-5.6-sol"));
+  assert.equal(ready.modelsByHarness.pi?.some((model) => model.id === "gpt-5.6-sol"), false);
+
+  const saved = await fetch(srv.base + scopePath + "/webui-models", {
+    method: "PUT",
+    headers: { ...ADMIN, "content-type": "application/json" },
+    body: JSON.stringify({ ids: ["gpt-5.6-sol"] }),
+  });
+  assert.equal(saved.status, 200);
+  assert.deepEqual((await (await fetch(srv.base + scopePath + "?view=models", { headers: ADMIN })).json()).webuiModels, [
+    "gpt-5.6-sol",
+  ]);
+
+  await srv.built.userModelCredentials.deleteSharedOAuth();
+  const disconnected = await read();
+  assert.equal(disconnected.modelsByHarness.codex?.some((model) => model.id === "gpt-5.6-sol"), false);
+});
+
 test("settings projections preserve values while excluding unrelated payloads", async (t) => {
   const srv = start();
   t.after(srv.close);

@@ -564,6 +564,25 @@ test("surface-config reports whether any model provider is configured", async ()
   }
 });
 
+test("surface-config treats connected shared Codex as configured without an API key", async () => {
+  const srv = start();
+  try {
+    const jwtPart = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
+    await srv.built.userModelCredentials.setSharedOAuth({
+      accessToken: "shared-access",
+      refreshToken: "shared-refresh",
+      idToken: `${jwtPart({ alg: "RS256" })}.${jwtPart({ "https://api.openai.com/auth": { chatgpt_account_id: "shared" } })}.sig`,
+    });
+    const ready = await fetch(`${srv.base}/v1/surface-config`);
+    assert.equal(((await ready.json()) as { modelProviderConfigured?: boolean }).modelProviderConfigured, true);
+    await srv.built.userModelCredentials.deleteSharedOAuth();
+    const disconnected = await fetch(`${srv.base}/v1/surface-config`);
+    assert.equal(((await disconnected.json()) as { modelProviderConfigured?: boolean }).modelProviderConfigured, false);
+  } finally {
+    await srv.close();
+  }
+});
+
 test("surface-config respects an admin-disabled environment provider", async () => {
   const srv = start({ anthropicApiKey: "deployment-anthropic-key" });
   try {

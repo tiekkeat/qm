@@ -1121,11 +1121,12 @@ async function getSurfaceConfig(ctx: ApiCtx): Promise<void> {
   await ctx.deps.refreshModels?.();
   const { res, deps } = ctx;
   if (!deps.config) return sendJson(res, 404, { error: "not_found" });
-  const [webuiModels, baseModel, externalSlackParticipants, branding] = await Promise.all([
+  const [webuiModels, baseModel, externalSlackParticipants, branding, sharedCodex] = await Promise.all([
     deps.config.getWebuiModelsDurable(orgScope(deps)),
     deps.config.getBaseModelDurable(orgScope(deps)),
     deps.config.getExternalSlackParticipantsDurable(orgScope(deps)),
     resolveBranding(deps.config, orgScope(deps), deps.brandingDefault),
+    deps.userModelCredentials?.sharedStatus(),
   ]);
   const harnessId = deps.harnessId ?? "pi";
   const managedKeys = deps.modelCredentials ? await deps.modelCredentials.availability() : null;
@@ -1158,7 +1159,8 @@ async function getSurfaceConfig(ctx: ApiCtx): Promise<void> {
         providerStatus.openai ||
         providerStatus.openrouter ||
         providerStatus.modelIds?.size ||
-        deps.harnessCarriedModelAuth,
+        deps.harnessCarriedModelAuth ||
+        (sharedCodex?.connected && !sharedCodex.needsReconnect),
       ),
     }),
     externalSlackParticipants,
