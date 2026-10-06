@@ -62,7 +62,27 @@ test("unconfigured deployment: non-admin HTML navigation gets a not-set-up page,
     redirect: "manual",
   });
   assert.equal(r.status, 503);
-  assert.match(await r.text(), /isn&#39;t set up yet/);
+  const page = await r.text();
+  assert.match(page, /isn&#39;t set up yet/);
+  assert.match(page, /Browse without AI/);
+});
+
+test("unconfigured deployment: a member can browse the UI after acknowledging the missing model", async () => {
+  const cookie = sessionCookie("U-member");
+  const choice = await fetch(`${base}/?continue_without_model=1`, {
+    headers: { accept: "text/html", cookie },
+    redirect: "manual",
+  });
+  assert.equal(choice.status, 302);
+  assert.equal(choice.headers.get("location"), "/");
+  assert.match(choice.headers.get("set-cookie") ?? "", /portal_skip_model_setup=1/);
+
+  const ui = await fetch(`${base}/`, {
+    headers: { accept: "text/html", cookie: `${cookie}; portal_skip_model_setup=1` },
+    redirect: "manual",
+  });
+  assert.equal(ui.status, 200);
+  assert.equal(((await ui.json()) as { url: string }).url, "/");
 });
 
 test("unconfigured deployment: web-ui JSON requests still proxy through untouched", async () => {

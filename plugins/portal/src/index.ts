@@ -606,7 +606,8 @@ export function notConfiguredHtml(): string {
     msg: "An admin still needs to finish setup by adding a model API key. Until then the assistant can't answer.",
     icon: ALERT_ICON,
     warn: true,
-    actions: `<a class="btn primary" href="/">Try again</a>`,
+    actions: `<a class="btn primary" href="/?continue_without_model=1">Browse without AI</a>
+        <a class="btn ghost" href="/">Try again</a>`,
     help: "Ask your admin to complete onboarding in the Admin area.",
   });
 }
@@ -1365,7 +1366,17 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         res.writeHead(302, { location: "/admin/onboarding", "cache-control": "no-store" });
         return void res.end();
       }
-      return sendHtml(res, 503, notConfiguredHtml());
+      if (url.searchParams.get("continue_without_model") === "1") {
+        res.writeHead(302, {
+          location: "/",
+          "cache-control": "no-store",
+          "set-cookie": setCookie("portal_skip_model_setup", "1", { path: "/", secure: SECURE_COOKIES }),
+        });
+        return void res.end();
+      }
+      if (readCookie(req.headers.cookie, "portal_skip_model_setup") !== "1") {
+        return sendHtml(res, 503, notConfiguredHtml());
+      }
     }
   }
 
