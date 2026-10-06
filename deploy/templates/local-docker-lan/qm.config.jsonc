@@ -1,0 +1,45 @@
+{
+  "contract": 1,
+  "orgId": "qm-local",
+  "publicUrl": "https://qm.example.com",
+  "target": "docker",
+  "basePort": 8080,
+  "services": [
+    "core",
+    "web-ui",
+    "admin",
+    "portal",
+    "auth"
+  ],
+  "plugins": [],
+  "skills": [],
+  "env": {
+    "core": {
+      "HARNESS": "pi",
+      "NODE_ENV": "production",
+      "DEPLOY_APPS_DOMAIN": "apps.qm.example.com",
+      "HARNESS_SECURITY_POSTURE": "auto",
+      "HARNESS_SHARING_POSTURE": "isolated"
+    },
+    "web-ui": {
+      "NODE_ENV": "production"
+    },
+    "portal": {
+      "NODE_ENV": "production",
+      "PORTAL_APPS_DOMAIN": "apps.qm.example.com"
+    },
+    "auth": {
+      "NODE_ENV": "production",
+      "AUTH_EMAIL_TRANSPORT": "smtp"
+    }
+  },
+  "secretEnv": {
+    "core": {
+      "ADMIN_GRANTS": "ADMIN_GRANTS",
+      "DEPLOY_APPS_SESSION_SECRET": "PORTAL_SESSION_SECRET"
+    }
+  },
+  "sandbox": {
+    "backend": "local"
+  }
+}

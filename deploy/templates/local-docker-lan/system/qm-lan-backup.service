@@ -1,0 +1,9 @@
+[Unit]
+Description=Back up QM database and persistent storage
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/qm-lan/backup.sh
+UMask=0077

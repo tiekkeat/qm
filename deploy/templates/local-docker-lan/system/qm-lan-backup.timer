@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily QM backup
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+RandomizedDelaySec=300
+Unit=qm-lan-backup.service
+
+[Install]
+WantedBy=timers.target

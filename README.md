@@ -173,6 +173,11 @@ operator's own cloud account; initialization does not generate or enable deploym
 and this repository has no production deployment workflow. See
 [`deployment.md`](./deployment.md) for the details.
 
+For a private LAN Docker host with published app subdomains, copy the
+[local Docker LAN template](./deploy/templates/local-docker-lan/README.md) into a
+separate deployment directory. Its guide covers hostname settings, DNS, HTTPS,
+credentials, startup, and an optional Ubuntu host installer.
+
 ## Contributing
 
 We take contributions as _human-written_ text, not code — see

@@ -1,0 +1,13 @@
+[Unit]
+Description=Permit QM HTTPS access from any source address
+After=network-online.target
+Wants=network-online.target
+Before=caddy.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/qm-lan/firewall.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

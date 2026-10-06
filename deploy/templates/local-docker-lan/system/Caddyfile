@@ -1,0 +1,27 @@
+{
+	admin 127.0.0.1:2019
+	auto_https disable_redirects
+	servers {
+		protocols h1 h2
+	}
+}
+
+https://{$QM_LAN_IP}:8443 {
+	bind {$QM_LAN_IP}
+	tls internal
+	redir https://{$QM_PORTAL_HOST}{uri} 302
+}
+
+https://{$QM_PORTAL_HOST} {
+	bind {$QM_LAN_IP}
+	tls internal
+	reverse_proxy 127.0.0.1:8081
+}
+
+https://*.apps.{$QM_PORTAL_HOST} {
+	bind {$QM_LAN_IP}
+	tls internal
+	reverse_proxy 127.0.0.1:8080 {
+		header_up X-QM-App-Host 1
+	}
+}
