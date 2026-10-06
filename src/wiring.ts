@@ -1648,7 +1648,7 @@ export function buildApp(
       : undefined;
   const buildDeployProvider: Record<Config["deployProvider"], () => DeployProvider> = {
     aws: buildAwsDeploy,
-    docker: createDockerDeployProvider,
+    docker: () => createDockerDeployProvider({ coreContainer: config.localSandbox.coreContainer }),
     fly: () =>
       createFlyDeployProvider({
         ...config.flyDeploy,

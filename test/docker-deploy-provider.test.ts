@@ -9,6 +9,8 @@ test("Docker deployments use isolated networks and remove them on destroy", asyn
   const calls: string[][] = [];
   const dockerExec: DockerExec = async (args) => {
     calls.push(args);
+    if (args[0] === "inspect" && args[2] === "{{.State.Running}}")
+      return { code: 0, stdout: "true\n", stderr: "" };
     return {
       code: args[1] === "inspect" ? 1 : 0,
       stdout: "",
@@ -28,7 +30,7 @@ test("Docker deployments use isolated networks and remove them on destroy", asyn
     entrypoint: "node server.js",
     snapshotDir: "/snap/two",
   });
-  const provider = createDockerDeployProvider({ dockerExec });
+  const provider = createDockerDeployProvider({ dockerExec, fetchImpl: async () => new Response() });
 
   await provider.apply(first, first.versions[0]!);
   await provider.apply(second, second.versions[0]!);
@@ -41,6 +43,98 @@ test("Docker deployments use isolated networks and remove them on destroy", asyn
   assert.ok(calls.some((args) => args.join(" ").includes(`--name ${firstName} --network ${firstName}-net`)));
   assert.ok(calls.some((args) => args.join(" ").includes(`--name ${secondName} --network ${secondName}-net`)));
   assert.ok(calls.some((args) => args.join(" ") === `network rm ${firstName}-net`));
+  assert.ok(calls.some((args) => args.join(" ").includes(`${firstName}-data:/data`)));
+  assert.ok(calls.every((args) => args[0] !== "volume" || args[1] !== "rm"));
+});
+
+test("containerized core mounts its host snapshot, routes over a private network, and preserves app data", async () => {
+  const calls: string[][] = [];
+  let running = true;
+  let probed = "";
+  const store = createDeployStore();
+  const deployment = await store.create({
+    ownerScopeId: scopeId("personal", "U1"),
+    createdBy: "U1",
+    entrypoint: "node server.js",
+    snapshotDir: "/data/deployments/one",
+  });
+  const name = `agent-deploy-${deployment.id.slice(0, 12)}`;
+  const net = `${name}-net`;
+  const dockerExec: DockerExec = async (args) => {
+    calls.push(args);
+    if (args[0] === "inspect" && args[2] === "{{json .Mounts}}")
+      return { code: 0, stdout: JSON.stringify([{ Source: "/host/core-data", Destination: "/data" }]), stderr: "" };
+    if (args[0] === "inspect" && args[2] === "{{.State.Running}}")
+      return { code: 0, stdout: `${running}\n`, stderr: "" };
+    if (args[0] === "inspect" && args[2] === "{{json .NetworkSettings.Networks}}")
+      return { code: 0, stdout: JSON.stringify({ [net]: {} }), stderr: "" };
+    if (args[0] === "network" && args[1] === "inspect")
+      return { code: 1, stdout: "", stderr: "No such network" };
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const provider = createDockerDeployProvider({
+    dockerExec,
+    coreContainer: "qm-core",
+    fetchImpl: async (url) => {
+      probed = String(url);
+      return new Response();
+    },
+  });
+
+  assert.equal(provider.profile.dataDir, "/data");
+  const address = await provider.apply(deployment, deployment.versions[0]!);
+  assert.deepEqual(address, { host: name, port: 8080 });
+  assert.equal(probed, `http://${name}:8080/`);
+  const run = calls.find((args) => args[0] === "run")!;
+  assert.ok(run.includes("/host/core-data/deployments/one:/app:ro"));
+  assert.ok(run.includes(`${name}-data:/data`));
+  assert.ok(run.includes("DATA_DIR=/data"));
+  assert.ok(!run.includes("-p"));
+  assert.ok(calls.some((args) => args.join(" ") === `network connect ${net} qm-core`));
+  await store.setEndpoint(deployment.id, { host: "127.0.0.1", port: 9200 });
+  const existing = (await store.get(deployment.id))!;
+  assert.deepEqual(await provider.resolveEndpoint!(existing, existing.versions[0]!), address);
+  running = false;
+  assert.equal(await provider.resolveEndpoint!(existing, existing.versions[0]!), null);
+  await provider.destroy(deployment);
+  assert.ok(calls.some((args) => args.join(" ") === `network disconnect ${net} qm-core`));
+  assert.ok(calls.every((args) => args[0] !== "volume" || args[1] !== "rm"));
+});
+
+test("containerized core refuses snapshots outside its Docker mounts", async () => {
+  const store = createDeployStore();
+  const deployment = await store.create({
+    ownerScopeId: scopeId("personal", "U1"),
+    createdBy: "U1",
+    entrypoint: "node server.js",
+    snapshotDir: "/other/snapshot",
+  });
+  const dockerExec: DockerExec = async (args) => {
+    if (args[0] === "inspect")
+      return { code: 0, stdout: JSON.stringify([{ Source: "/host/core-data", Destination: "/data" }]), stderr: "" };
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const provider = createDockerDeployProvider({ dockerExec, coreContainer: "qm-core" });
+  await assert.rejects(provider.apply(deployment, deployment.versions[0]!), /outside the core container's Docker mounts/);
+});
+
+test("Docker publish reports startup errors from an exited app", async () => {
+  const store = createDeployStore();
+  const deployment = await store.create({
+    ownerScopeId: scopeId("personal", "U1"),
+    createdBy: "U1",
+    entrypoint: "node server.js",
+    snapshotDir: "/snap/one",
+  });
+  const dockerExec: DockerExec = async (args) => {
+    if (args[0] === "network" && args[1] === "inspect") return { code: 1, stdout: "", stderr: "missing" };
+    if (args[0] === "inspect" && args[2] === "{{.State.Running}}")
+      return { code: 0, stdout: "false\n", stderr: "" };
+    if (args[0] === "logs") return { code: 0, stdout: "", stderr: "Cannot find module '/app/server.js'" };
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const provider = createDockerDeployProvider({ dockerExec, fetchImpl: async () => new Response() });
+  await assert.rejects(provider.apply(deployment, deployment.versions[0]!), /Cannot find module/);
 });
 
 test("Docker provider migrates running deployments off the legacy shared network", async () => {
@@ -63,10 +157,12 @@ test("Docker provider migrates running deployments off the legacy shared network
     if (args[0] === "inspect") {
       return {
         code: 0,
-        stdout: JSON.stringify({
-          ...(legacyAttached ? { "agent-deploynet": {} } : {}),
-          ...(targetAttached ? { [`${containerName}-net`]: {} } : {}),
-        }),
+        stdout: args[2] === "{{.State.Running}}"
+          ? "true\n"
+          : JSON.stringify({
+              ...(legacyAttached ? { "agent-deploynet": {} } : {}),
+              ...(targetAttached ? { [`${containerName}-net`]: {} } : {}),
+            }),
         stderr: "",
       };
     }
@@ -107,7 +203,7 @@ test("an unrelated legacy migration failure does not block a new deployment", as
     if (args.join(" ") === "network inspect --format {{range .Containers}}{{println .Name}}{{end}} agent-deploynet") {
       return { code: 0, stdout: "agent-deploy-broken\n", stderr: "" };
     }
-    if (args[0] === "inspect") return { code: 1, stdout: "", stderr: "daemon unavailable" };
+    if (args[0] === "inspect") return { code: 0, stdout: "true\n", stderr: "" };
     if (args[0] === "network" && args[1] === "inspect") return { code: 1, stdout: "", stderr: "missing" };
     return { code: 0, stdout: "", stderr: "" };
   };
@@ -118,7 +214,7 @@ test("an unrelated legacy migration failure does not block a new deployment", as
     entrypoint: "node server.js",
     snapshotDir: "/snap/new",
   });
-  const provider = createDockerDeployProvider({ dockerExec });
+  const provider = createDockerDeployProvider({ dockerExec, fetchImpl: async () => new Response() });
 
   await assert.doesNotReject(provider.apply(deployment, deployment.versions[0]!));
 });
