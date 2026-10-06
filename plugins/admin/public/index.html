@@ -8573,6 +8573,7 @@
         "cron-runtime": "st-cron-runtime",
         "subagent-runtime": "st-subagent-runtime",
         "fallback-runtime": "st-fallback-runtime",
+        "approved-harnesses": "st-approved-harnesses",
         "webui-models": "st-webui-models",
         "ack-emoji": "st-ack-emoji",
         branding: "st-branding",
@@ -8833,13 +8834,14 @@
       document.querySelectorAll("[data-save]").forEach((btn) => {
         btn.onclick = async () => {
           const key = btn.dataset.save;
+          const statusId = SAVE_ST[key] || "st-" + key;
           const requestedScope = scope;
           const requestedGeneration = governanceReq;
           let body;
           try {
             body = SAVE[key]();
           } catch (err) {
-            setStatus(SAVE_ST[key], err instanceof Error ? err.message : "Could not save.", "err");
+            setStatus(statusId, err instanceof Error ? err.message : "Could not save.", "err");
             return;
           }
           if (
@@ -8851,7 +8853,7 @@
           const saveRequest = String(++governanceSaveSeq);
           btn.dataset.saveRequest = saveRequest;
           btn.disabled = true;
-          setStatus(SAVE_ST[key], "Saving...", "saving", true);
+          setStatus(statusId, "Saving...", "saving", true);
           const isBranding = key === "branding";
           const brandingBody = isBranding ? { ...savedBranding, ...body } : body;
           const r = await api(
@@ -8864,7 +8866,7 @@
             if (btn.dataset.saveRequest === saveRequest) {
               delete btn.dataset.saveRequest;
               btn.disabled = !btn.classList.contains("dirty");
-              setStatus(SAVE_ST[key], "", "");
+              setStatus(statusId, "", "");
             }
             return;
           }
@@ -8907,7 +8909,7 @@
               if (key === "command-policy") loadedCommandPolicyPresent = true;
               captureSection(key);
             }
-            setStatus(SAVE_ST[key], "Saved", "ok");
+            setStatus(statusId, "Saved", "ok");
           } else {
             if (key === "soul" && r.status === 409) await refreshSoulConflict();
             updateSectionDirty(key);
@@ -8917,7 +8919,7 @@
             } else if (r.status === 403) {
               message = "Not authorized for this scope.";
             }
-            setStatus(SAVE_ST[key], message, "err");
+            setStatus(statusId, message, "err");
           }
         };
       });

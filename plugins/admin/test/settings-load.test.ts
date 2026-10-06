@@ -355,3 +355,49 @@ test("models view loads and saves purpose cards through the real page handlers",
     f.dom.window.close();
   }
 });
+
+test("saving allowed harnesses sends the request and clears the unsaved draft", async () => {
+  const f = litFixture();
+  try {
+    f.root.innerHTML = '<template data-settings-card="card-approved-harnesses"></template>';
+    f.ui.settings.mountCards();
+    f.ui.settings.load({ harnessDefault: "pi", approvedHarnesses: ["pi"] }, "org:test", "approved-harnesses");
+    const requests: any[] = [];
+    const context = vm.createContext({
+      document: f.document,
+      governanceUI: f.ui,
+      scope: "org:test",
+      governanceReq: 1,
+      governanceSaveSeq: 0,
+      sectionSnapshots: new Map(),
+      governanceSaveReview: async () => true,
+      setStatus: (id: string, message: string, tone: string) => {
+        const key = f.ui.statusKey(id);
+        if (key) f.ui.status(key, message, tone);
+      },
+      api: async (...args: any[]) => {
+        requests.push(args);
+        return { ok: true };
+      },
+    });
+    vm.runInContext(extract("const SAVE = Object.fromEntries(", "const sectionSnapshots ="), context);
+    vm.runInContext(
+      extract('document.querySelectorAll("[data-save]").forEach', '$("view-governance").addEventListener("input"'),
+      context,
+    );
+    const inputs = [...f.document.querySelectorAll<HTMLInputElement>("#card-approved-harnesses input")];
+    inputs[2]!.checked = true;
+    inputs[2]!.dispatchEvent(new f.window.Event("change"));
+    const card = f.document.getElementById("card-approved-harnesses")!;
+    assert.equal(card.classList.contains("dirty"), true);
+    const button = card.querySelector<HTMLButtonElement>('[data-save="approved-harnesses"]')!;
+    await button.onclick!(new f.window.PointerEvent("click"));
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0][1], "/api/scopes/org%3Atest/approved-harnesses");
+    assert.deepEqual(requests[0][2].ids, ["pi", "codex"]);
+    assert.equal(f.ui.states.get("approved-harnesses").dirty, false);
+    assert.equal(card.classList.contains("dirty"), false);
+  } finally {
+    f.dom.window.close();
+  }
+});
