@@ -26,6 +26,7 @@ import {
   deploymentListRefreshCanRedraw,
   deploymentListAfterRestoreRefresh,
   deploymentLatestAt,
+  deploymentPendingStatus,
   deploymentSlug,
   deploymentTab,
   deploymentTabEmptyMessage,
@@ -71,25 +72,18 @@ let deployToast: { deployment: DeploymentView; text: string; undo?: boolean } | 
 let deployRefreshSeq = 0;
 
 function statusLabel(d: DeploymentView): string {
-  if (
-    d.status === "running" &&
-    d.appliedVersion !== undefined &&
-    d.currentVersion !== undefined &&
-    d.appliedVersion !== d.currentVersion
-  )
-    return "Deploying";
+  const pending = deploymentPendingStatus(d);
+  if (pending === "failed") return "Deploy failed";
+  if (pending === "stalled") return "Deploy stalled";
+  if (pending === "deploying") return "Deploying";
   const status = d.status || "unknown";
   return status.charAt(0).toLocaleUpperCase() + status.slice(1);
 }
 
 function statusClass(d: DeploymentView): string {
-  if (
-    d.status === "running" &&
-    d.appliedVersion !== undefined &&
-    d.currentVersion !== undefined &&
-    d.appliedVersion !== d.currentVersion
-  )
-    return "deploying";
+  const pending = deploymentPendingStatus(d);
+  if (pending === "failed" || pending === "stalled") return "failed";
+  if (pending === "deploying") return "deploying";
   if (d.status === "running") return "running";
   if (d.status === "archived") return "archived";
   return "stopped";
@@ -299,6 +293,8 @@ function drawDeployDetail(d: DeploymentView, loading = false): void {
           ${d.currentVersion !== undefined && d.appliedVersion !== undefined && d.currentVersion !== d.appliedVersion ? html`<span>Latest v${d.currentVersion}</span>` : nothing}
           ${deploymentLatestAt(d) ? html`<span ${tip(new Date(deploymentLatestAt(d)).toLocaleString())}>Updated ${relTime(deploymentLatestAt(d))}</span>` : nothing}
         </div>
+        ${d.deployFailure?.version === d.currentVersion ? html`<div class="status">Version ${d.currentVersion} failed to deploy. The recorded live version is ${d.appliedVersion ?? "none"}. Check the publish error and app logs before retrying.</div>` : nothing}
+        ${deploymentPendingStatus(d) === "stalled" ? html`<div class="status">Version ${d.currentVersion} has not become live after five minutes. Check the publish attempt and app logs.</div>` : nothing}
         <div class="deploy-access-line">
           <div>
             <span>${ownerLabel(d)}</span>

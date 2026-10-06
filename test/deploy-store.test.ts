@@ -13,7 +13,7 @@ import {
 } from "../src/deploy/deploy-store.ts";
 import { createDeployService } from "../src/deploy/deploy-service.ts";
 import { createAclStore } from "../src/acl/acl-store.ts";
-import type { DeployGitArchive } from "../src/deploy/deploy-git-store.ts";
+import type { DeployGitArchive, DeployGitInputFile } from "../src/deploy/deploy-git-store.ts";
 import { createMemoryDurableByteStore } from "../src/files/durable-byte-store.ts";
 import { createMemoryMap } from "../src/persistence/durable-map.ts";
 import { scopeId } from "../src/types.ts";
@@ -116,6 +116,49 @@ test("a provider without reconcile receives durable Git contents after a push", 
   execFileSync("git", ["push", "--quiet", repo!, "HEAD:current"], { cwd: work });
   await deploy.pushGit(d.id, async () => ({ result: true, ok: true }));
   assert.deepEqual(applied, ["v1", "v2"]);
+});
+
+test("a failed publish stays visible and a later wake restores the last applied version", async () => {
+  const root = mkdtempSync(join(tmpdir(), "deploy-failed-version-"));
+  const deployStore = createDeployStore({ git: { repoRoot: join(root, "repos") } });
+  const attempted: number[] = [];
+  const deploy = createDeployService({
+    deployStore,
+    provider: {
+      profile: { managedScaleToZero: false },
+      apply: async (_deployment, version) => {
+        attempted.push(version.version);
+        if (version.version === 2) throw new Error("app exited during startup");
+        return { host: "127.0.0.1", port: 8080 };
+      },
+      resolveEndpoint: async () => null,
+      destroy: async () => {},
+    },
+    deployDir: join(root, "snapshots"),
+    auditLog: { record() {}, events: async () => [], tail: async () => [] },
+    acl: createAclStore(),
+  });
+  const d = await deploy.deploy({
+    ownerScopeId: scopeId("personal", "U1"),
+    createdBy: "U1",
+    entrypoint: "node server.js",
+    files: [{ path: "server.js", data: "v1" }],
+  });
+  await assert.rejects(
+    deploy.redeploy(d.id, { entrypoint: "node server.js", files: [{ path: "server.js", data: "v2" }] }),
+    /app exited during startup/,
+  );
+  const failed = (await deployStore.get(d.id))!;
+  assert.equal(failed.currentVersion, 2);
+  assert.equal(failed.appliedVersion, 1);
+  assert.equal(failed.deployFailure?.version, 2);
+
+  assert.equal((await deploy.reachDeployment(d.id, "U1")).status, "ok");
+  assert.deepEqual(attempted, [1, 2, 1]);
+  assert.equal((await deployStore.get(d.id))?.deployFailure?.version, 2);
+
+  await deploy.redeploy(d.id, { entrypoint: "node server.js", files: [{ path: "server.js", data: "v3" }] });
+  assert.equal((await deployStore.get(d.id))?.deployFailure, undefined);
 });
 
 test("homeDir (resident-auth snapshot) round-trips through create + addVersion", async () => {
@@ -464,6 +507,43 @@ test("deploy git repos restore from the durable archive into a fresh repo root",
     git: { repoRoot: mkdtempSync(join(tmpdir(), "deploy-git-c-")), archiveStore },
   });
   assert.equal(await s3.refOf(d.id, deployCurrentGitRef), v1.commit, "ref-only changes are also durably archived");
+});
+
+test("materializing many deployment files reads the durable Git archive once", async () => {
+  const archiveStore = createMemoryMap<DeployGitArchive>();
+  const getArchive = archiveStore.get.bind(archiveStore);
+  let archiveReads = 0;
+  archiveStore.get = async (id) => {
+    archiveReads++;
+    return getArchive(id);
+  };
+  const s = createDeployStore({ git: { repoRoot: mkdtempSync(join(tmpdir(), "deploy-git-bulk-")), archiveStore } });
+  const files: DeployGitInputFile[] = Array.from({ length: 300 }, (_, i) => ({
+    path: `assets/file-${i}.txt`,
+    data: `value-${i}`,
+  }));
+  files.push({ path: "portal", data: "#!/bin/sh\necho ready" });
+  files.push({ path: ".gitattributes", data: "ignored.txt export-ignore\n" });
+  files.push({ path: "ignored.txt", data: "still deployed" });
+  files.push({ path: "binary.dat", data: Buffer.from([0, 10, 255, 32, 0]) });
+  const d = await s.create({
+    ownerScopeId: scopeId("personal", "U1"),
+    createdBy: "U1",
+    entrypoint: "./portal",
+    snapshotDir: "/snap/v1",
+    files: files.map((f) => ({ ...f, ...(f.path === "portal" ? { mode: 0o755 } : {}) })),
+  });
+  archiveReads = 0;
+  const restored = await s.filesOf(d.id, 1);
+  assert.equal(archiveReads, 1);
+  assert.equal(restored?.length, files.length);
+  assert.equal(restored?.find((f) => f.path === "portal")?.mode, 0o755);
+  assert.equal(Buffer.from(restored!.find((f) => f.path === "ignored.txt")!.data).toString(), "still deployed");
+  assert.deepEqual(Buffer.from(restored!.find((f) => f.path === "binary.dat")!.data), Buffer.from([0, 10, 255, 32, 0]));
+  assert.deepEqual(
+    (await s.filesOf(d.id, 1, ["assets/file-299.txt"]))?.map((f) => [f.path, Buffer.from(f.data).toString()]),
+    [["assets/file-299.txt", "value-299"]],
+  );
 });
 
 test("deploy git archives keep bundle bytes in the byte store, not the row", async () => {

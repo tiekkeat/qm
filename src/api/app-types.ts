@@ -130,6 +130,7 @@ export interface DeploymentView {
   displayName?: string;
   currentVersion: number;
   appliedVersion?: number;
+  deployFailure?: { version: number; at: number };
   status: Deployment["status"];
   alwaysOn?: boolean;
   embedAncestors?: string[];
@@ -160,6 +161,7 @@ export function deploymentView(d: Deployment): DeploymentView {
     ...(d.displayName ? { displayName: d.displayName } : {}),
     currentVersion: d.currentVersion,
     ...(d.appliedVersion !== undefined ? { appliedVersion: d.appliedVersion } : {}),
+    ...(d.deployFailure ? { deployFailure: d.deployFailure } : {}),
     status: d.status,
     ...(d.alwaysOn ? { alwaysOn: true } : {}),
     ...(d.embedAncestors?.length ? { embedAncestors: d.embedAncestors } : {}),

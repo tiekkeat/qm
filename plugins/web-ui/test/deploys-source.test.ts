@@ -310,6 +310,7 @@ test("detail redraws reuse the scroll container and retain focus", () => {
       statusLabel: () => "",
       deploymentSlug: () => "app",
       deploymentLatestAt: () => null,
+      deploymentPendingStatus: () => null,
       ownerLabel: () => "",
       permissionBadge: () => "",
       canManage: () => false,

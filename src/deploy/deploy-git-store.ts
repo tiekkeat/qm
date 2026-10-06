@@ -80,23 +80,35 @@ export function createDeployGitStore(opts: DeployGitStoreOptions = {}): DeployGi
   const archiveBytes = opts.archiveBytes;
   const repoPath = (deploymentId: string): string => join(repoRoot, `${safeRepoName(deploymentId)}.git`);
 
-  async function gitResult(args: string[], options: { cwd?: string; okExitCodes?: number[] } = {}): Promise<GitResult> {
+  async function gitResult(
+    args: string[],
+    options: { cwd?: string; okExitCodes?: number[]; input?: string } = {},
+  ): Promise<GitResult> {
     const ok = new Set(options.okExitCodes ?? [0]);
     return new Promise((resolveGit, rejectGit) => {
-      const child = spawn(gitBin, args, { cwd: options.cwd, stdio: ["ignore", "pipe", "pipe"] });
+      const child = spawn(gitBin, args, {
+        cwd: options.cwd,
+        stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+      });
       const stdout: Buffer[] = [];
       const stderr: Buffer[] = [];
-      child.stdout.on("data", (d) => stdout.push(Buffer.from(d)));
-      child.stderr.on("data", (d) => stderr.push(Buffer.from(d)));
+      child.stdout!.on("data", (d) => stdout.push(Buffer.from(d)));
+      child.stderr!.on("data", (d) => stderr.push(Buffer.from(d)));
       child.on("error", rejectGit);
+      if (options.input !== undefined) {
+        child.stdin!.on("error", rejectGit);
+        child.stdin!.end(options.input);
+      }
       child.on("close", (code) => {
         if (ok.has(code ?? -1)) return resolveGit({ code: code ?? -1, stdout: Buffer.concat(stdout) });
         rejectGit(new Error(`git ${args.join(" ")} exited ${code}: ${Buffer.concat(stderr).toString("utf8").trim()}`));
       });
     });
   }
-  const git = async (args: string[], options: { cwd?: string; okExitCodes?: number[] } = {}): Promise<Buffer> =>
-    (await gitResult(args, options)).stdout;
+  const git = async (
+    args: string[],
+    options: { cwd?: string; okExitCodes?: number[]; input?: string } = {},
+  ): Promise<Buffer> => (await gitResult(args, options)).stdout;
 
   async function localArchiveEtag(repo: string): Promise<string | null> {
     try {
@@ -213,8 +225,7 @@ export function createDeployGitStore(opts: DeployGitStoreOptions = {}): DeployGi
     return { repo, workdir };
   }
 
-  async function treeOf(deploymentId: string, commitSha: string): Promise<DeployGitTreeFile[]> {
-    const repo = await ensureRepo(deploymentId);
+  async function treeOfRepo(repo: string, commitSha: string): Promise<DeployGitTreeFile[]> {
     const out = await git(["--git-dir", repo, "ls-tree", "-r", "-z", "--long", commitSha]);
     return out
       .toString("utf8")
@@ -226,6 +237,10 @@ export function createDeployGitStore(opts: DeployGitStoreOptions = {}): DeployGi
         return { mode: m[1] as DeployGitTreeFile["mode"], sha: m[2]!, size: Number(m[3]!), path: m[4]! };
       })
       .sort(byPath);
+  }
+
+  async function treeOf(deploymentId: string, commitSha: string): Promise<DeployGitTreeFile[]> {
+    return treeOfRepo(await ensureRepo(deploymentId), commitSha);
   }
 
   async function blob(deploymentId: string, sha: string): Promise<Uint8Array | null> {
@@ -270,14 +285,35 @@ export function createDeployGitStore(opts: DeployGitStoreOptions = {}): DeployGi
     treeOf,
     async filesOf(deploymentId, commitSha, paths) {
       const wanted = paths ? new Set(paths.map(normalizeRelPath)) : null;
-      const entries = await treeOf(deploymentId, commitSha);
+      const repo = await ensureRepo(deploymentId);
+      const entries = (await treeOfRepo(repo, commitSha)).filter((entry) => !wanted || wanted.has(entry.path));
+      if (!entries.length) return [];
+      const output = await git(["--git-dir", repo, "cat-file", "--batch"], {
+        input: `${entries.map((entry) => entry.sha).join("\n")}\n`,
+      });
       const files: DeployGitInputFile[] = [];
+      let offset = 0;
       for (const entry of entries) {
-        if (wanted && !wanted.has(entry.path)) continue;
-        const data = await blob(deploymentId, entry.sha);
-        if (data == null) throw new Error(`missing blob ${entry.sha} for ${entry.path}`);
+        const headerEnd = output.indexOf(10, offset);
+        if (headerEnd < 0) throw new Error(`missing blob ${entry.sha} for ${entry.path}`);
+        const header = output.toString("ascii", offset, headerEnd).split(" ");
+        const size = Number(header[2]);
+        const start = headerEnd + 1;
+        const end = start + size;
+        if (
+          header[0] !== entry.sha ||
+          header[1] !== "blob" ||
+          !Number.isSafeInteger(size) ||
+          size !== entry.size ||
+          end >= output.length ||
+          output[end] !== 10
+        )
+          throw new Error(`invalid blob ${entry.sha} for ${entry.path}`);
+        const data = output.subarray(start, end);
+        offset = end + 1;
         files.push({ path: entry.path, data, ...(entry.mode === "100755" ? { mode: 0o755 } : {}) });
       }
+      if (offset !== output.length) throw new Error(`unexpected extra blob data for deployment ${deploymentId}`);
       return files;
     },
     async diff(deploymentId, fromCommit, toCommit) {

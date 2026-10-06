@@ -16,6 +16,13 @@ Publish with the `apps` tool, action `publish`. Build the app in the workspace w
 `exec` (`execute` before sandbox-resource activation). Then publish the directory.
 The app must listen on the `PORT` env var (the runtime sets it).
 
+Publish the smallest directory that can run the app. Check its file count and size
+before calling `publish`; keep build caches and development dependencies out of it.
+Include `node_modules` only when the published Node app needs those packages at
+runtime. A `.gitignore` file does not filter files collected by `publish`.
+For Go apps on the Docker runtime, build the executable in the sandbox first;
+the default app image does not include the Go toolchain.
+
 ## Match the house style (the default)
 
 Anything browsable you publish should look designed, not defaulted. Before you build the

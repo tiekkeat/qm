@@ -72,6 +72,7 @@ export interface Deployment {
   public?: true;
   lastAccessAt?: number;
   appliedVersion?: number;
+  deployFailure?: { version: number; at: number };
   versions: DeploymentVersion[];
 }
 
@@ -114,6 +115,7 @@ export interface DeployStore {
   setPublic(id: string, isPublic: boolean): Promise<void>;
   setDefaultAudience(id: string, snapshot: DefaultAudienceSnapshot): Promise<void>;
   setAppliedVersion(id: string, version: number): Promise<void>;
+  setDeployFailure(id: string, version: number): Promise<void>;
   touch(id: string, at: number): Promise<void>;
   versionOf(id: string, version: number): Promise<DeploymentVersion | null>;
   treeOf(id: string, version: number): Promise<DeployGitTreeFile[] | null>;
@@ -454,8 +456,15 @@ export function createDeployStore(backing?: DurableMap<Deployment> | DeployStore
       const v = d.versions.find((x) => x.version === version);
       if (!v) throw new Error(`no such version ${version}`);
       d.appliedVersion = version;
+      if (d.currentVersion === version) delete d.deployFailure;
       await backingMap.put(id, d);
       await updateAppliedRef(id, v);
+    },
+    async setDeployFailure(id, version) {
+      const d = await backingMap.get(id);
+      if (!d) return;
+      d.deployFailure = { version, at: Date.now() };
+      await backingMap.put(id, d);
     },
     async touch(id, at) {
       const prev = lastTouch.get(id);

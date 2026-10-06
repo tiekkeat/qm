@@ -13,6 +13,7 @@ export interface DeploymentView {
   createdInScope?: string;
   currentVersion?: number;
   appliedVersion?: number;
+  deployFailure?: { version: number; at: number };
   webUrl?: string;
   gitUrl?: string;
   name?: string;
@@ -30,6 +31,16 @@ export type DeploymentTab = "yours" | "shared" | "archived";
 export type DeploymentSort = "newest" | "name" | "status";
 export type DeploymentActionView = "target" | "other" | "list" | "away";
 export type DeploymentRefreshResult = "updated" | "failed" | "superseded";
+
+export function deploymentPendingStatus(
+  d: DeploymentView,
+  now = Date.now(),
+): "failed" | "stalled" | "deploying" | null {
+  if (d.status === "archived") return null;
+  if (d.deployFailure?.version === d.currentVersion) return "failed";
+  if (d.status !== "running" || d.appliedVersion === undefined || d.appliedVersion === d.currentVersion) return null;
+  return d.updatedAt !== undefined && now - d.updatedAt > 5 * 60_000 ? "stalled" : "deploying";
+}
 
 export function deploymentActionView(targetId: string, currentView: string, activeId?: string): DeploymentActionView {
   if (currentView !== "deploys") return "away";

@@ -227,9 +227,32 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
     await deps.deployStore.setAppliedVersion(id, version);
   };
 
+  const applyAndMarkVersion = async (
+    id: string,
+    version: DeploymentVersion,
+    fromVersion?: number,
+    alwaysOn?: boolean,
+  ): Promise<DeployEndpoint> => {
+    try {
+      const endpoint = await applyVersion(id, version, fromVersion, alwaysOn);
+      await markVersionRunning(id, version.version, endpoint);
+      return endpoint;
+    } catch (error) {
+      await deps.deployStore
+        .setDeployFailure(id, version.version)
+        .catch((storeError) => swallow("deploy failure status", storeError));
+      throw error;
+    }
+  };
+
+  const runnableVersion = (d: Deployment): DeploymentVersion | undefined =>
+    d.deployFailure?.version === d.currentVersion && d.appliedVersion !== undefined
+      ? (d.versions.find((v) => v.version === d.appliedVersion) ?? currentVersionOf(d))
+      : currentVersionOf(d);
+
   const liveEndpoint = async (d: Deployment): Promise<DeployEndpoint> => {
     if (!deps.provider.resolveEndpoint || d.endpoint == null) return d.endpoint!;
-    const version = currentVersionOf(d);
+    const version = runnableVersion(d);
     if (!version) return d.endpoint;
     const resolved = await deps.provider.resolveEndpoint(d, version);
     if (resolved) {
@@ -238,15 +261,13 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
     }
     return withDeployLock(d.id, async () => {
       const cur = (await deps.deployStore.get(d.id)) ?? d;
-      const v = currentVersionOf(cur) ?? version;
+      const v = runnableVersion(cur) ?? version;
       const again = await deps.provider.resolveEndpoint!(cur, v);
       if (again) {
         if (!endpointsEqual(again, cur.endpoint)) await deps.deployStore.setEndpoint(cur.id, again);
         return again;
       }
-      const fresh = await applyVersion(cur.id, v, cur.appliedVersion ?? cur.currentVersion);
-      await markVersionRunning(cur.id, v.version, fresh);
-      return fresh;
+      return applyAndMarkVersion(cur.id, v, cur.appliedVersion ?? cur.currentVersion);
     });
   };
 
@@ -401,8 +422,7 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
         ...(env ? { env } : {}),
         ...(input.alwaysOn !== undefined ? { alwaysOn: input.alwaysOn } : {}),
       });
-      const endpoint = await applyVersion(d.id, d.versions[0]!);
-      await markVersionRunning(d.id, d.versions[0]!.version, endpoint);
+      await applyAndMarkVersion(d.id, d.versions[0]!);
       void deps.appPublished?.(input.createdBy, d.id, d.versions[0]!.version).catch(() => {});
       deps.auditLog.record({
         at: Date.now(),
@@ -431,8 +451,7 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
           ...(homeDir ? { homeDir } : {}),
           ...(env ? { env } : {}),
         });
-        const endpoint = await applyVersion(id, v, before.appliedVersion ?? before.currentVersion, input.alwaysOn);
-        await markVersionRunning(id, v.version, endpoint);
+        await applyAndMarkVersion(id, v, before.appliedVersion ?? before.currentVersion, input.alwaysOn);
         void deps.appPublished?.(before.createdBy, id, v.version).catch(() => {});
         deps.auditLog.record({
           at: Date.now(),
@@ -460,8 +479,7 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
         const v = await deps.deployStore.versionOf(id, version);
         const d = await deps.deployStore.get(id);
         if (!d || !v) return;
-        const endpoint = await applyVersion(id, v, before?.appliedVersion ?? before?.currentVersion, options?.alwaysOn);
-        await markVersionRunning(id, v.version, endpoint);
+        await applyAndMarkVersion(id, v, before?.appliedVersion ?? before?.currentVersion, options?.alwaysOn);
         deps.auditLog.record({
           at: Date.now(),
           principalId: d.createdBy,
@@ -488,11 +506,10 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
         if (!d) throw new Error(`unknown deployment: ${id}`);
         if (d.status === "running") return d;
         if (d.status !== "archived") throw new Error(`deployment is not archived: ${id}`);
-        const version = currentVersionOf(d);
+        const version = runnableVersion(d);
         if (!version) throw new Error(`no such version ${d.currentVersion}`);
         try {
-          const endpoint = await applyVersion(id, version, d.appliedVersion);
-          await markVersionRunning(id, version.version, endpoint);
+          await applyAndMarkVersion(id, version, d.appliedVersion);
         } catch (error) {
           await deps.provider
             .destroy(d)
@@ -658,8 +675,7 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
           if (!pushed) return result;
           const v = await deps.deployStore.addVersionFromCommit(id, pushed);
           if (!v) return result;
-          const endpoint = await applyVersion(id, v, before.appliedVersion ?? before.currentVersion);
-          await markVersionRunning(id, v.version, endpoint);
+          await applyAndMarkVersion(id, v, before.appliedVersion ?? before.currentVersion);
           void deps.appPublished?.(before.createdBy, id, v.version).catch(() => {});
           deps.auditLog.record({
             at: Date.now(),

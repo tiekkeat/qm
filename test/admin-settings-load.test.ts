@@ -36,7 +36,10 @@ test("shared Codex offers supported models in Admin without an OpenAI API key", 
   };
   const before = await read();
   assert.ok(before.manualCodexModels.some((model) => model.id === "gpt-5.6-sol"));
-  assert.equal(before.modelsByHarness.codex?.some((model) => model.id === "gpt-5.6-sol"), false);
+  assert.equal(
+    before.modelsByHarness.codex?.some((model) => model.id === "gpt-5.6-sol"),
+    false,
+  );
 
   const jwtPart = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
   await srv.built.userModelCredentials.setSharedOAuth({
@@ -46,7 +49,10 @@ test("shared Codex offers supported models in Admin without an OpenAI API key", 
   });
   const ready = await read();
   assert.ok(ready.modelsByHarness.codex?.some((model) => model.id === "gpt-5.6-sol"));
-  assert.equal(ready.modelsByHarness.pi?.some((model) => model.id === "gpt-5.6-sol"), false);
+  assert.equal(
+    ready.modelsByHarness.pi?.some((model) => model.id === "gpt-5.6-sol"),
+    false,
+  );
 
   const saved = await fetch(srv.base + scopePath + "/webui-models", {
     method: "PUT",
@@ -54,13 +60,17 @@ test("shared Codex offers supported models in Admin without an OpenAI API key", 
     body: JSON.stringify({ ids: ["gpt-5.6-sol"] }),
   });
   assert.equal(saved.status, 200);
-  assert.deepEqual((await (await fetch(srv.base + scopePath + "?view=models", { headers: ADMIN })).json()).webuiModels, [
-    "gpt-5.6-sol",
-  ]);
+  const savedModels = (await (await fetch(srv.base + scopePath + "?view=models", { headers: ADMIN })).json()) as {
+    webuiModels: string[];
+  };
+  assert.deepEqual(savedModels.webuiModels, ["gpt-5.6-sol"]);
 
   await srv.built.userModelCredentials.deleteSharedOAuth();
   const disconnected = await read();
-  assert.equal(disconnected.modelsByHarness.codex?.some((model) => model.id === "gpt-5.6-sol"), false);
+  assert.equal(
+    disconnected.modelsByHarness.codex?.some((model) => model.id === "gpt-5.6-sol"),
+    false,
+  );
 });
 
 test("settings projections preserve values while excluding unrelated payloads", async (t) => {

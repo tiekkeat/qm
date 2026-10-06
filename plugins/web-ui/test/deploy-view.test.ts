@@ -10,6 +10,7 @@ import {
   deploymentListAfterRestoreRefresh,
   deploymentListRefreshCanRedraw,
   deploymentLatestAt,
+  deploymentPendingStatus,
   deploymentSlug,
   deploymentTab,
   deploymentTabEmptyMessage,
@@ -31,6 +32,14 @@ function deployment(patch: Partial<DeploymentView>): DeploymentView {
     ...patch,
   };
 }
+
+test("pending app versions distinguish deploying, stalled, and failed", () => {
+  const pending = deployment({ currentVersion: 2, appliedVersion: 1, updatedAt: 1_000 });
+  assert.equal(deploymentPendingStatus(pending, 2_000), "deploying");
+  assert.equal(deploymentPendingStatus(pending, 6 * 60_000 + 1_000), "stalled");
+  assert.equal(deploymentPendingStatus({ ...pending, deployFailure: { version: 2, at: 3_000 } }, 4_000), "failed");
+  assert.equal(deploymentPendingStatus({ ...pending, status: "archived" }, 4_000), null);
+});
 
 test("deployment labels prefer friendly metadata and retain durable fallbacks", () => {
   assert.equal(
