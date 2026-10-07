@@ -2,8 +2,10 @@ import { execFileSync } from "node:child_process";
 import { copyFileSync, chmodSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
+import { patchPiAi } from "./patch-pi-ai.mjs";
 
 execFileSync("npm", ["ci", "--omit=dev", "--ignore-scripts"], { stdio: "inherit" });
+patchPiAi();
 const packages = JSON.parse(execFileSync("npm", ["query", "*"], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }));
 const rebuild = [
   ...new Set(

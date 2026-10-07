@@ -3,9 +3,10 @@ import { createServer } from "node:http";
 import test from "node:test";
 import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
 import { stream } from "@earendil-works/pi-ai/api/openai-completions";
+import { normalizeContext } from "@earendil-works/pi-ai";
 import { providerTurnError } from "../src/harness/provider-error.ts";
 
-test("vendored pi-ai keeps a LiteLLM 429 budget_exceeded as structured providerError", async (t) => {
+test("patched Pi AI keeps a LiteLLM 429 budget_exceeded as structured providerError", async (t) => {
   const body = {
     error: {
       message: "Budget has been exceeded! Current cost: 5.1, Max budget: 5.0",
@@ -34,14 +35,10 @@ test("vendored pi-ai keeps a LiteLLM 429 budget_exceeded as structured providerE
     maxTokens: 100,
   } as Model<"openai-completions">;
 
-  const failed = await stream(
-    model,
-    { messages: [{ role: "user", content: "hi", timestamp: 0 }] },
-    {
-      apiKey: "test-key",
-      maxRetries: 0,
-    },
-  ).result();
+  const failed = await stream(model, normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: 0 }] }), {
+    apiKey: "test-key",
+    maxRetries: 0,
+  }).result();
 
   assert.equal(failed.stopReason, "error");
   assert.deepEqual(failed.providerError, { status: 429, type: "budget_exceeded", code: "400", body: body.error });

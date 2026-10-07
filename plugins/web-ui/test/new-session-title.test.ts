@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { getModel } from "@earendil-works/pi-ai";
+import { getBuiltinModel } from "@earendil-works/pi-ai/providers/all";
 import { harness } from "./deep-link-boot-fixture.ts";
 import type { CoreSession } from "../src/core-bridge.ts";
 
@@ -20,8 +20,8 @@ test("a new pane adopts its saved identity and later title while its first turn 
     assert.equal(conversation.state.sessionId, null);
     assert.match(document.querySelector(".split-pane-title-text")?.textContent ?? "", /New session/);
     await agent.waitForIdle();
-    agent.state.model = getModel("openai", "gpt-4o");
-    agent.streamFn = () =>
+    agent.state.model = getBuiltinModel("openai", "gpt-4o");
+    agent.streamFunction = () =>
       new Promise((_resolve, reject) => {
         stopStream = () => reject(new Error("QA stream stopped"));
       });

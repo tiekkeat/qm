@@ -1,4 +1,5 @@
 import { Agent } from "@earendil-works/pi-agent-core";
+import { disconnectedCoreStreamFn } from "./core-bridge.ts";
 import type { Attachment } from "@earendil-works/pi-web-ui";
 import { html, type TemplateResult } from "lit";
 import { AsyncDirective } from "lit/async-directive.js";
@@ -54,7 +55,7 @@ class EmbeddedComposer extends AsyncDirective {
         this.redraw();
       };
       ctx.composer = createComposerSurface(ctx, composerOptions);
-      this.agent = new Agent();
+      this.agent = new Agent({ streamFn: disconnectedCoreStreamFn });
       ctx.chat.state.agent = this.agent;
       ctx.chat.state.host = this.element;
       ctx.chat.state.threadRef = key;

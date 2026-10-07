@@ -1,6 +1,10 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { ProviderTurnError, type ProviderErrorCode } from "../core/turn-error.ts";
 
+type ProviderFailureMessage = AssistantMessage & {
+  providerError?: { status?: number; type?: string; code?: string; body?: unknown };
+};
+
 // Classifies a failed pi-ai AssistantMessage from structured fields only: providerError (HTTP status
 // plus the provider's documented error type/code, from our vendored pi-ai, see vendor/pi-ai/) and
 // rawStopReason. errorMessage is never inspected; it is carried as `raw` for the operator log.
@@ -27,7 +31,7 @@ function nearWindow(usage: ContextUsage | undefined): boolean {
   return !!contextWindow && !!lastInputTokens && lastInputTokens >= contextWindow * NEAR_WINDOW_RATIO;
 }
 
-function providerErrorCode(failed: AssistantMessage, usage?: ContextUsage): ProviderErrorCode {
+function providerErrorCode(failed: ProviderFailureMessage, usage?: ContextUsage): ProviderErrorCode {
   if (failed.rawStopReason === "refusal") return "refusal";
   const { status, type, code } = failed.providerError ?? {};
   if (type === "model_unavailable") return "model_unavailable";
@@ -51,7 +55,7 @@ function providerBodyMessage(body: unknown): string | undefined {
   return typeof nested.message === "string" && nested.message.trim() ? nested.message.trim() : undefined;
 }
 
-export function providerTurnError(failed: AssistantMessage, usage?: ContextUsage): ProviderTurnError {
+export function providerTurnError(failed: ProviderFailureMessage, usage?: ContextUsage): ProviderTurnError {
   const raw = failed.errorMessage?.trim() ?? "";
   const code = providerErrorCode(failed, usage);
   const status = failed.providerError?.status;

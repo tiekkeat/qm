@@ -1558,7 +1558,7 @@ export function createComposerSurface(ctx: ConvCtx, options: ComposerOptions = {
     ctx.chat.drawActiveChat(agent);
     clearComposerDom(agent);
     try {
-      if (ctx.chat.state.normalStreamFn) agent.streamFn = ctx.chat.state.normalStreamFn;
+      if (ctx.chat.state.normalStreamFn) agent.streamFunction = ctx.chat.state.normalStreamFn;
       ctx.chat.scrollToBottom();
       await agent.prompt(userSendMessage(text, attachments.length ? attachments : undefined));
       restoreBlockedSend(agent, sentFromThread, text, attachments);

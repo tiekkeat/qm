@@ -18,7 +18,7 @@ import {
   type HookJSONOutput,
 } from "@anthropic-ai/claude-agent-sdk";
 import { fromJSONSchema, type ZodObject } from "zod";
-import { contentText, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { contentText, createAssistantMessageEventStream, getSystemMessageText } from "@earendil-works/pi-ai";
 import { CONFIG_DEFAULTS, type Config } from "../config.ts";
 import { isDeliveryNote } from "../core/attachments.ts";
 import { NonRetryableTurnError } from "../core/turn-error.ts";
@@ -921,9 +921,13 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
           return result;
         });
         return summarizeHistory(input.history, model, async (_model, context, options) => {
+          const system = context.messages.find((message) => message.role === "system");
           const text = await summarize(
-            context.systemPrompt ?? "",
-            context.messages.map((message) => contentText(message.content)).join("\n\n"),
+            system ? getSystemMessageText(system) : "",
+            context.messages
+              .filter((message) => message.role !== "system")
+              .map((message) => contentText(message.content))
+              .join("\n\n"),
             options?.signal,
             { recordModelCall: input.recordModelCall },
             model.id,

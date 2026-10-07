@@ -197,7 +197,7 @@ test("the mounted conversation recovers a saved answer after a local polling tim
           if (String(args[0]) === "/api/sessions") await listHeld;
           return originalFetch(...args);
         };
-        const originalStream = agent.streamFn;
+        const originalStream = agent.streamFunction;
         const originalConvert = agent.convertToLlm;
         const originalModel = agent.state.model;
         Object.assign(agent.state, {
@@ -206,7 +206,7 @@ test("the mounted conversation recovers a saved answer after a local polling tim
           >,
         });
         agent.convertToLlm = () => [{ role: "user", content: "New request", timestamp: 300 }];
-        agent.streamFn = () => {
+        agent.streamFunction = () => {
           const stream = createAssistantMessageEventStream();
           queueMicrotask(() => {
             const error = { ...timeout(), interruptedRunId: undefined, errorMessage: "New send failed" };
@@ -230,7 +230,7 @@ test("the mounted conversation recovers a saved answer after a local polling tim
         } finally {
           releaseList();
           await settle();
-          agent.streamFn = originalStream;
+          agent.streamFunction = originalStream;
           agent.convertToLlm = originalConvert;
           Object.assign(agent.state, { model: originalModel });
         }

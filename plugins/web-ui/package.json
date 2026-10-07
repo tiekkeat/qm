@@ -22,8 +22,8 @@
     "@codemirror/state": "6.7.6",
     "@codemirror/view": "6.43.13",
     "@date-fns/tz": "^1.5.0",
-    "@earendil-works/pi-agent-core": "0.77.0",
-    "@earendil-works/pi-ai": "0.77.0",
+    "@earendil-works/pi-agent-core": "1.0.4",
+    "@earendil-works/pi-ai": "1.0.4",
     "@earendil-works/pi-web-ui": "0.75.3",
     "@lezer/highlight": "1.2.4",
     "@mariozechner/mini-lit": "^0.2.0",
@@ -54,9 +54,6 @@
     "vite": "^7.1.6"
   },
   "overrides": {
-    "@earendil-works/pi-web-ui": {
-      "@earendil-works/pi-ai": "$@earendil-works/pi-ai"
-    },
     "@mariozechner/mini-lit": {
       "marked": "^18.0.5"
     },

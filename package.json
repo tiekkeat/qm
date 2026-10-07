@@ -59,13 +59,14 @@
     "dev-instance:doctor": "bash scripts/dev-instance.sh doctor",
     "lint:knip": "knip",
     "migrate:transcript-tape": "node scripts/migrate-transcript-tape.ts",
-    "build:app-annotations": "node scripts/build-app-devbar.mjs"
+    "build:app-annotations": "node scripts/build-app-devbar.mjs",
+    "postinstall": "node scripts/patch-pi-ai.mjs"
   },
   "lint-staged": {
     "*": "prettier --write --ignore-unknown"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "0.3.280",
+    "@anthropic-ai/claude-agent-sdk": "0.3.292",
     "@anthropic-ai/tokenizer": "^0.0.4",
     "@aws-crypto/sha256-js": "^5.2.0",
     "@aws-sdk/client-ecs": "3.1096.0",
@@ -74,12 +75,12 @@
     "@aws-sdk/client-sts": "^3.1075.0",
     "@aws-sdk/credential-provider-node": "^3.972.70",
     "@aws-sdk/s3-request-presigner": "^3.1061.0",
-    "@earendil-works/pi-ai": "https://github.com/yc-software/qm/releases/download/vendored-pi-ai-0.82.0-qm.1/earendil-works-pi-ai-0.82.0-qm.1.tgz",
-    "@earendil-works/pi-coding-agent": "https://github.com/yc-software/qm/releases/download/vendored-pi-coding-agent-0.82.0-security.6/earendil-works-pi-coding-agent-0.82.0-qm-security.6.tgz",
+    "@earendil-works/pi-ai": "1.0.4",
+    "@earendil-works/pi-coding-agent": "1.0.4",
     "@fly/sprites": "0.2.3",
-    "@openai/codex": "0.156.1",
-    "@opencode-ai/plugin": "1.18.31",
-    "@opencode-ai/sdk": "1.18.31",
+    "@openai/codex": "0.160.1",
+    "@opencode-ai/plugin": "1.18.35",
+    "@opencode-ai/sdk": "1.18.35",
     "@sentry/node": "10.75.0",
     "@slack/bolt": "^4.7.3",
     "@slack/socket-mode": "^2.0.7",
@@ -94,7 +95,7 @@
     "lru-cache": "^11.5.2",
     "modal": "^0.10.1",
     "officeparser": "^8.0.0",
-    "opencode-ai": "1.18.31",
+    "opencode-ai": "1.18.35",
     "pg": "^8.13.1",
     "pg-boss": "^12.26.1",
     "porter-sandbox": "^0.1.41",
@@ -118,12 +119,13 @@
     },
     "undici": "8.10.2",
     "ip-address": "10.7.2",
-    "protobufjs": "7.6.5",
-    "@earendil-works/pi-ai": "$@earendil-works/pi-ai"
+    "protobufjs": "7.6.6",
+    "@earendil-works/pi-ai": "$@earendil-works/pi-ai",
+    "@modelcontextprotocol/sdk": "1.32.1"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "@modelcontextprotocol/sdk": "1.29.0",
+    "@modelcontextprotocol/sdk": "1.32.1",
     "@types/node": "^24.0.0",
     "@types/pg": "^8.11.10",
     "@types/tar-stream": "^3.1.4",

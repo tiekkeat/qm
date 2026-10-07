@@ -1201,7 +1201,7 @@ export async function buildModelRuntime(
   const modelsPath = customModelsPath();
   const runtime = await ModelRuntime.create({ credentials, modelsPath });
   for (const [provider, apiKey] of Object.entries(apiKeys)) {
-    if (apiKey) await runtime.setRuntimeApiKey(provider, apiKey, { allowNetwork: false });
+    if (apiKey) await runtime.setRuntimeApiKey(provider, apiKey);
   }
   if (modelGateway) {
     const providers = new Set(
@@ -2553,7 +2553,7 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
           summarizeHistory(input.history, getRequiredModel(compactModelId), (summaryModel, context, options) => {
             input.recordModelCall({
               model: compactModelId,
-              inputTokens: countTokens(context.systemPrompt ?? "") + countTokens(JSON.stringify(context.messages)),
+              inputTokens: countTokens(JSON.stringify(context.messages)),
               entryCount: input.history.length,
             });
             return runtime.streamSimple(summaryModel, context, options);

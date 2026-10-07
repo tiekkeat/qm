@@ -523,11 +523,10 @@ export function resolveBuiltinModel(id: string): PiModel | undefined {
     const providerId = codexProviderModelId(id);
     if (modelRequestOverrides(providerId)) return undefined;
     const m = getModel(CODEX_SUBSCRIPTION_PROVIDER, providerId);
-    if (m) return { ...m, id };
     const entry = REGISTRY_BY_ID.get(providerId);
     const template = entry?.clone ? getModel(CODEX_SUBSCRIPTION_PROVIDER, entry.clone.template) : undefined;
     const native = entry?.clone ? resolveBuiltinModel(providerId) : undefined;
-    if (!template || !native || native.provider !== "openai") return undefined;
+    if (!template || !native || native.provider !== "openai") return m ? { ...m, id } : undefined;
     return cloneModel(template, id, native.name, {
       contextWindow: native.contextWindow,
       maxTokens: native.maxTokens,

@@ -94,6 +94,7 @@ import {
   inheritedTranscript,
   loadInheritedTranscript,
   makeCoreStreamFn,
+  disconnectedCoreStreamFn,
   makeOpenerStreamFn,
   makeRunResumeStreamFn,
   resolveApproval,
@@ -290,7 +291,7 @@ export function createChatSurface(
     rememberedContextName: null as string | null,
     liveWork: null as WorkBlock | null,
     pendingSend: null as string | null,
-    normalStreamFn: null as Agent["streamFn"] | null,
+    normalStreamFn: null as Agent["streamFunction"] | null,
     onWork: null as ((work: WorkBlock) => void) | null,
     resolvingApprovals: new Set<string>(),
     transcriptAnchorSeq: null as number | null,
@@ -535,6 +536,7 @@ export function createChatSurface(
     const model = ctx.composer.currentModelOption()?.model;
     const defaultThinkingLevel = defaultEffortForModel(model);
     const agent = new Agent({
+      streamFn: disconnectedCoreStreamFn,
       initialState: {
         systemPrompt: "",
         ...(model ? { model } : {}),
@@ -555,7 +557,7 @@ export function createChatSurface(
       drawActiveChat(agent);
     };
     const normalStreamFn = makeCoreStreamFn(threadRef, agent, currentTurnOptions, onWork, runSlot, onSendIssues);
-    agent.streamFn = normalStreamFn;
+    agent.streamFunction = normalStreamFn;
     chatState.normalStreamFn = normalStreamFn;
     chatState.onWork = onWork;
     void ctx.composer.refreshRuntimeSelection(scopeId, agent);
@@ -621,7 +623,7 @@ export function createChatSurface(
   function startProactiveOpenerIfNew(
     agent: Agent,
     threadRef: string,
-    normalStreamFn: Agent["streamFn"],
+    normalStreamFn: Agent["streamFunction"],
     onWork: (work: WorkBlock) => void,
     sessionId: string | null,
     scopeId: string | null,
@@ -641,7 +643,7 @@ export function createChatSurface(
       return false;
     proactiveOpenerStarted = true;
     agent.state.messages = [{ role: "user", content: "", opener: true } as unknown as AgentMessage];
-    agent.streamFn = makeOpenerStreamFn(threadRef, agent, currentTurnOptions, onWork, runSlot);
+    agent.streamFunction = makeOpenerStreamFn(threadRef, agent, currentTurnOptions, onWork, runSlot);
     void (async () => {
       try {
         await agent.continue();
@@ -649,7 +651,7 @@ export function createChatSurface(
         if (agent === chatState.agent) ctx.composer.state.error = errMessage(err, "Could not start the conversation.");
       } finally {
         if (agent === chatState.agent) {
-          agent.streamFn = normalStreamFn;
+          agent.streamFunction = normalStreamFn;
           const last = agent.state.messages[agent.state.messages.length - 1] as AssistantMessage | undefined;
           if (
             last?.role === "assistant" &&
@@ -905,7 +907,7 @@ export function createChatSurface(
   async function followNextQueuedRun(
     agent: Agent,
     threadRef: string,
-    normalStreamFn: Agent["streamFn"],
+    normalStreamFn: Agent["streamFunction"],
     onWork: (work: WorkBlock) => void,
   ): Promise<void> {
     let active: Awaited<ReturnType<typeof activeRunForThread>>;
@@ -922,14 +924,14 @@ export function createChatSurface(
     const recorded = (agent.state.messages.at(-1) as { role?: string } | undefined)?.role === "user";
     if (active.run.input) agent.state.messages = continuableMessages(agent.state.messages, active.run.input).messages;
     else if (!recorded && !next) agent.state.messages = [...agent.state.messages, resumeAnchor()];
-    agent.streamFn = makeRunResumeStreamFn(active.runId, active.run, onWork, runSlot);
+    agent.streamFunction = makeRunResumeStreamFn(active.runId, active.run, onWork, runSlot);
     try {
       await (!active.run.input && next && !recorded ? agent.prompt(next.text) : agent.continue());
     } catch (err) {
       if (agent === chatState.agent) ctx.composer.state.error = errMessage(err, "Could not follow the queued message.");
     } finally {
       if (agent === chatState.agent) {
-        agent.streamFn = normalStreamFn;
+        agent.streamFunction = normalStreamFn;
         await refreshTranscriptFromEntries(agent);
       }
     }
@@ -938,7 +940,7 @@ export function createChatSurface(
   async function resumeTrackedRun(
     agent: Agent,
     threadRef: string,
-    normalStreamFn: Agent["streamFn"],
+    normalStreamFn: Agent["streamFunction"],
     onWork: (work: WorkBlock) => void,
   ): Promise<boolean> {
     let activeRun: Awaited<ReturnType<typeof activeRunForThread>>;
@@ -957,7 +959,7 @@ export function createChatSurface(
   async function resumeRun(
     agent: Agent,
     threadRef: string,
-    normalStreamFn: Agent["streamFn"],
+    normalStreamFn: Agent["streamFunction"],
     onWork: (work: WorkBlock) => void,
     runId: string,
     initialRun?: RunPoll,
@@ -979,7 +981,7 @@ export function createChatSurface(
       .map((m) => messageText(m).trim())
       .filter(Boolean)
       .join("\n\n");
-    agent.streamFn = makeRunResumeStreamFn(runId, initialRun, onWork, runSlot, seedText);
+    agent.streamFunction = makeRunResumeStreamFn(runId, initialRun, onWork, runSlot, seedText);
     try {
       const completion = agent.continue();
       if (agent.state.isStreaming) onStarted?.();
@@ -989,7 +991,7 @@ export function createChatSurface(
         ctx.composer.state.error = err instanceof Error ? err.message : "Could not reconnect to the running task.";
     } finally {
       if (agent === chatState.agent) {
-        agent.streamFn = normalStreamFn;
+        agent.streamFunction = normalStreamFn;
         await refreshTranscriptFromEntries(agent);
       }
     }
@@ -1221,7 +1223,11 @@ export function createChatSurface(
       draw();
       let completed = false;
       try {
-        await runApprovalTurn(new Agent({ initialState: { model: transcriptModel() } }), decision, undefined);
+        await runApprovalTurn(
+          new Agent({ streamFn: disconnectedCoreStreamFn, initialState: { model: transcriptModel() } }),
+          decision,
+          undefined,
+        );
         completed = true;
       } catch (error) {
         if (current()) ctx.composer.state.error = errMessage(error, "Could not send the approval.");

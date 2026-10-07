@@ -2,28 +2,19 @@
 +++ b/dist/api/anthropic-messages.js
 @@ -1,3 +1,4 @@
 +import { extractProviderError } from "../utils/error-body.js";
- import Anthropic from "@anthropic-ai/sdk";
+ import Anthropic, {} from "@anthropic-ai/sdk";
+ import { ANTHROPIC_FEDERATION_RULE_ID_ENV, ANTHROPIC_IDENTITY_TOKEN_FILE_ENV, ANTHROPIC_ORGANIZATION_ID_ENV, ANTHROPIC_SERVICE_ACCOUNT_ID_ENV, ANTHROPIC_WORKSPACE_ID_ENV, } from "../env-api-keys.js";
  import { calculateCost } from "../models.js";
- import { splitDeferredTools } from "../utils/deferred-tools.js";
-@@ -531,6 +532,8 @@
-                         if (stopReasonResult.errorMessage) {
-                             output.errorMessage = stopReasonResult.errorMessage;
-                         }
-+                        if (stopReasonResult.stopReason === "error")
-+                            output.rawStopReason = event.delta.stop_reason;
-                     }
-                     // Only update usage fields if present (not null).
-                     // Preserves input_tokens from message_start when proxies omit it in message_delta.
-@@ -579,6 +582,9 @@
+@@ -682,6 +683,9 @@
+                 delete block.partialJson;
              }
              output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-             output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
 +            const providerError = extractProviderError(error);
 +            if (providerError)
 +                output.providerError = providerError;
+             output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
              stream.push({ type: "error", reason: output.stopReason, error: output });
              stream.end();
-         }
 --- a/dist/api/azure-openai-responses.js
 +++ b/dist/api/azure-openai-responses.js
 @@ -1,6 +1,6 @@
@@ -33,47 +24,38 @@
 +import { formatProviderError, normalizeProviderError, extractProviderError } from "../utils/error-body.js";
  import { AssistantMessageEventStream } from "../utils/event-stream.js";
  import { headersToRecord } from "../utils/headers.js";
- import { getProviderEnvValue } from "../utils/provider-env.js";
-@@ -107,6 +107,9 @@
+ import { getPiUserAgent } from "../utils/pi-user-agent.js";
+@@ -92,6 +92,9 @@
+                 delete block.customInput;
              }
              output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-             output.errorMessage = formatAzureOpenAIError(error);
 +            const providerError = extractProviderError(error);
 +            if (providerError)
 +                output.providerError = providerError;
+             output.errorMessage = formatAzureOpenAIError(error);
              stream.push({ type: "error", reason: output.stopReason, error: output });
              stream.end();
-         }
 --- a/dist/api/bedrock-converse-stream.js
 +++ b/dist/api/bedrock-converse-stream.js
-@@ -3,7 +3,7 @@
- import { HttpProxyAgent } from "http-proxy-agent";
+@@ -4,7 +4,7 @@
  import { HttpsProxyAgent } from "https-proxy-agent";
  import { calculateCost } from "../models.js";
+ import { appendAssistantMessageDiagnostic } from "../utils/diagnostics.js";
 -import { normalizeProviderError } from "../utils/error-body.js";
 +import { normalizeProviderError, extractProviderError } from "../utils/error-body.js";
  import { AssistantMessageEventStream } from "../utils/event-stream.js";
  import { providerHeadersToRecord } from "../utils/headers.js";
  import { parseStreamingJson } from "../utils/json-parse.js";
-@@ -164,6 +164,8 @@
-                     if (errorMessage) {
-                         output.errorMessage = errorMessage;
-                     }
-+                    if (stopReason === "error")
-+                        output.rawStopReason = item.messageStop.stopReason;
-                 }
-                 else if (item.metadata) {
-                     handleMetadata(item.metadata, model, output);
-@@ -201,6 +203,9 @@
+@@ -233,6 +233,9 @@
+                 finalizeStreamingBlock(block);
              }
              output.stopReason = options.signal?.aborted ? "aborted" : "error";
-             output.errorMessage = formatBedrockError(error);
 +            const providerError = extractProviderError(error);
 +            if (providerError)
 +                output.providerError = providerError;
-             stream.push({ type: "error", reason: output.stopReason, error: output });
-             stream.end();
-         }
+             output.errorMessage = formatBedrockError(error);
+             if (output.stopReason === "error") {
+                 appendBedrockFailureDiagnostic(output, error, responseRequestId);
 --- a/dist/api/google-generative-ai.js
 +++ b/dist/api/google-generative-ai.js
 @@ -1,6 +1,6 @@
@@ -83,75 +65,75 @@
 +import { formatProviderError, normalizeProviderError, extractProviderError } from "../utils/error-body.js";
  import { AssistantMessageEventStream } from "../utils/event-stream.js";
  import { providerHeadersToRecord } from "../utils/headers.js";
- import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
-@@ -212,6 +212,9 @@
+ import { getPiUserAgent } from "../utils/pi-user-agent.js";
+@@ -226,6 +226,9 @@
+                 }
              }
              output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-             output.errorMessage = formatProviderError(normalizeProviderError(error));
 +            const providerError = extractProviderError(error);
 +            if (providerError)
 +                output.providerError = providerError;
+             output.errorMessage = formatProviderError(normalizeProviderError(error));
              stream.push({ type: "error", reason: output.stopReason, error: output });
              stream.end();
-         }
 --- a/dist/api/google-vertex.js
 +++ b/dist/api/google-vertex.js
 @@ -1,6 +1,6 @@
- import { GoogleGenAI, ResourceScope, ThinkingLevel, } from "@google/genai";
+ import { GoogleGenAI, ResourceScope, } from "@google/genai";
  import { calculateCost, clampThinkingLevel } from "../models.js";
 -import { formatProviderError, normalizeProviderError } from "../utils/error-body.js";
 +import { formatProviderError, normalizeProviderError, extractProviderError } from "../utils/error-body.js";
  import { AssistantMessageEventStream } from "../utils/event-stream.js";
  import { providerHeadersToRecord } from "../utils/headers.js";
- import { getProviderEnvValue } from "../utils/provider-env.js";
-@@ -221,6 +221,9 @@
+ import { getPiUserAgent } from "../utils/pi-user-agent.js";
+@@ -228,6 +228,9 @@
+                 }
              }
              output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-             output.errorMessage = formatProviderError(normalizeProviderError(error));
 +            const providerError = extractProviderError(error);
 +            if (providerError)
 +                output.providerError = providerError;
+             output.errorMessage = formatProviderError(normalizeProviderError(error));
              stream.push({ type: "error", reason: output.stopReason, error: output });
              stream.end();
-         }
 --- a/dist/api/mistral-conversations.js
 +++ b/dist/api/mistral-conversations.js
 @@ -1,3 +1,4 @@
 +import { extractProviderError } from "../utils/error-body.js";
- import { Mistral } from "@mistralai/mistralai";
  import { calculateCost, clampThinkingLevel } from "../models.js";
  import { AssistantMessageEventStream } from "../utils/event-stream.js";
-@@ -52,6 +53,9 @@
+ import { shortHash } from "../utils/hash.js";
+@@ -53,6 +54,9 @@
+                 delete block.partialArgs;
              }
              output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-             output.errorMessage = formatMistralError(error);
 +            const providerError = extractProviderError(error);
 +            if (providerError)
 +                output.providerError = providerError;
+             output.errorMessage = formatMistralError(error);
              stream.push({ type: "error", reason: output.stopReason, error: output });
              stream.end();
-         }
 --- a/dist/api/openai-codex-responses.js
 +++ b/dist/api/openai-codex-responses.js
-@@ -11,7 +11,7 @@
+@@ -2,7 +2,7 @@
+ import { registerSessionResourceCleanup } from "../session-resources.js";
  import { combineAbortSignals } from "../utils/abort-signals.js";
- import { splitDeferredTools } from "../utils/deferred-tools.js";
  import { appendAssistantMessageDiagnostic, createAssistantMessageDiagnostic, formatThrownValue, } from "../utils/diagnostics.js";
 -import { formatProviderError, normalizeProviderError } from "../utils/error-body.js";
 +import { formatProviderError, normalizeProviderError, extractProviderError } from "../utils/error-body.js";
  import { AssistantMessageEventStream } from "../utils/event-stream.js";
  import { headersToRecord } from "../utils/headers.js";
  import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.js";
-@@ -340,6 +340,9 @@
+@@ -344,6 +344,9 @@
+                 delete block.customInput;
              }
              output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-             output.errorMessage = formatProviderError(normalizeProviderError(error));
 +            const providerError = extractProviderError(error);
 +            if (providerError)
 +                output.providerError = providerError;
+             output.errorMessage = formatProviderError(normalizeProviderError(error));
              stream.push({ type: "error", reason: output.stopReason, error: output });
              stream.end();
-         }
 --- a/dist/api/openai-completions.js
 +++ b/dist/api/openai-completions.js
 @@ -1,6 +1,6 @@
@@ -162,91 +144,68 @@
  import { AssistantMessageEventStream } from "../utils/event-stream.js";
  import { shortHash } from "../utils/hash.js";
  import { headersToRecord } from "../utils/headers.js";
-@@ -331,6 +331,8 @@
-                     if (finishReasonResult.errorMessage) {
-                         output.errorMessage = finishReasonResult.errorMessage;
-                     }
-+                    if (finishReasonResult.stopReason === "error")
-+                        output.rawStopReason = choice.finish_reason;
-                     hasFinishReason = true;
-                 }
-                 if (choice.delta) {
-@@ -450,6 +452,9 @@
+@@ -500,6 +500,9 @@
+                 delete block.streamIndex;
              }
              output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-             output.errorMessage = formatProviderError(normalizeProviderError(error));
 +            const providerError = extractProviderError(error);
 +            if (providerError)
 +                output.providerError = providerError;
+             output.errorMessage = formatProviderError(normalizeProviderError(error));
              // Some providers via OpenRouter give additional information in this field.
              // normalizeProviderError already stringifies the parsed body (error.error)
-             // into errorMessage, so only append the raw metadata when it is not already
 --- a/dist/api/openai-responses.js
 +++ b/dist/api/openai-responses.js
-@@ -1,7 +1,7 @@
+@@ -1,6 +1,6 @@
  import OpenAI from "openai";
  import { clampThinkingLevel } from "../models.js";
- import { splitDeferredTools } from "../utils/deferred-tools.js";
 -import { formatProviderError, normalizeProviderError } from "../utils/error-body.js";
 +import { formatProviderError, normalizeProviderError, extractProviderError } from "../utils/error-body.js";
  import { AssistantMessageEventStream } from "../utils/event-stream.js";
  import { headersToRecord } from "../utils/headers.js";
- import { getProviderEnvValue } from "../utils/provider-env.js";
-@@ -136,6 +136,9 @@
+ import { getPiUserAgent } from "../utils/pi-user-agent.js";
+@@ -163,6 +163,9 @@
+                 delete block.customInput;
              }
              output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-             output.errorMessage = formatOpenAIResponsesError(error);
 +            const providerError = extractProviderError(error);
 +            if (providerError)
 +                output.providerError = providerError;
-             stream.push({ type: "error", reason: output.stopReason, error: output });
-             stream.end();
-         }
+             const errorMessage = formatProviderError(normalizeProviderError(error), `${model.provider === "openai" ? "OpenAI" : model.provider} API error`);
+             // Sign in with ChatGPT shares the subscription's usage limit with other apps.
+             output.errorMessage = errorMessage.includes("subscription_sharing_usage_limit_exceeded")
 --- a/dist/types.d.ts
 +++ b/dist/types.d.ts
-@@ -288,8 +288,19 @@
-     usage: Usage;
-     stopReason: StopReason;
-     errorMessage?: string;
-+    /** qm patch: structured provider HTTP failure (status, error type/code, parsed body). errorMessage is unchanged. */
-+    providerError?: ProviderErrorInfo;
-+    /** qm patch: the provider's raw stop/finish reason when it mapped to stopReason "error" (e.g. Anthropic "refusal"). */
-+    rawStopReason?: string;
+@@ -371,6 +371,12 @@
+     content: string | (TextContent | ImageContent)[];
      timestamp: number;
  }
-+/** qm patch: structured provider HTTP failure kept alongside errorMessage. */
 +export interface ProviderErrorInfo {
 +    status?: number;
 +    type?: string;
 +    code?: string;
 +    body?: unknown;
 +}
- export interface ToolResultMessage<TDetails = any> {
-     role: "toolResult";
-     toolCallId: string;
---- a/dist/utils/error-body.d.ts
-+++ b/dist/utils/error-body.d.ts
-@@ -19,6 +19,9 @@
-  * - no prefix: `"<status>: <body>"`
-  * - prefix:    `"<prefix> (<status>): <body>"`
-  */
-+/** qm patch: structured provider failure; see AssistantMessage.providerError. */
-+export declare function extractProviderError(error: unknown): ProviderErrorInfo | undefined;
-+import type { ProviderErrorInfo } from "../types.js";
- export declare function formatProviderError(norm: NormalizedProviderError, prefix?: string): string;
- export declare function truncateErrorText(text: string, maxChars: number): string;
- export declare function safeJsonStringify(value: unknown): string;
+ export interface AssistantMessage {
+     role: "assistant";
+     content: (TextContent | ThinkingContent | ToolCall)[];
+@@ -388,6 +394,7 @@
+     stopReason: StopReason;
+     deferred?: DeferredHandle;
+     errorMessage?: string;
++    providerError?: ProviderErrorInfo;
+     rawStopReason?: string;
+     /**
+      * Provider indication of whether the model explicitly ended its turn.
 --- a/dist/utils/error-body.js
 +++ b/dist/utils/error-body.js
-@@ -29,6 +29,61 @@
-     };
+@@ -130,4 +130,53 @@
+         return String(value);
+     }
  }
- /**
-+ * qm patch (vendored-pi-ai-0.82.0-qm.1): structured copy of a provider HTTP
-+ * failure, kept next to errorMessage so callers can classify failures without
-+ * parsing display text. Returns undefined when the error carries neither an
-+ * HTTP status nor a response body (e.g. a plain network or abort error).
-+ */
+-//# sourceMappingURL=error-body.js.map
+\ No newline at end of file
++//# sourceMappingURL=error-body.js.map
 +export function extractProviderError(error) {
 +    if (!(error instanceof Error))
 +        return undefined;
@@ -270,10 +229,10 @@
 +    return result;
 +}
 +function pickBodyValue(error) {
-+    if (isNonEmptyObject(error.error))
++    if (isPlainNonEmptyObject(error.error))
 +        return error.error;
 +    const raw = typeof error.body === "string" ? error.body : error.$response?.body;
-+    if (isNonEmptyObject(raw))
++    if (isPlainNonEmptyObject(raw))
 +        return raw;
 +    if (typeof raw !== "string" || raw.trim().length === 0)
 +        return undefined;
@@ -296,7 +255,44 @@
 +    }
 +    return undefined;
 +}
-+/**
-  * Probe the HTTP status, first numeric hit wins, in SDK-field order:
-  * `statusCode` (Mistral) → `status` (`openai`, `@google/genai`) →
-  * `$metadata.httpStatusCode` (Bedrock) → `$response.statusCode` (Bedrock).
+--- a/dist/utils/error-body.d.ts
++++ b/dist/utils/error-body.d.ts
+@@ -1,3 +1,4 @@
++import type { ProviderErrorInfo } from "../types.js";
+ export declare const MAX_PROVIDER_ERROR_BODY_CHARS = 4000;
+ export interface NormalizedProviderError {
+     /** HTTP status code, when one could be extracted from the SDK error object. */
+@@ -22,4 +23,5 @@
+ export declare function formatProviderError(norm: NormalizedProviderError, prefix?: string): string;
+ export declare function truncateErrorText(text: string, maxChars: number): string;
+ export declare function safeJsonStringify(value: unknown): string;
+-//# sourceMappingURL=error-body.d.ts.map
+\ No newline at end of file
++//# sourceMappingURL=error-body.d.ts.map
++export declare function extractProviderError(error: unknown): ProviderErrorInfo | undefined;
+--- a/dist/api/lazy.js
++++ b/dist/api/lazy.js
+@@ -1,3 +1,4 @@
++import { extractProviderError } from "../utils/error-body.js";
+ import { AssistantMessageEventStream } from "../utils/event-stream.js";
+ function createSetupErrorMessage(model, error) {
+     return {
+@@ -14,7 +15,8 @@
+             totalTokens: 0,
+             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+         },
+-        stopReason: "error",
++        stopReason: error instanceof Error && error.name === "AbortError" ? "aborted" : "error",
++        providerError: extractProviderError(error),
+         errorMessage: error instanceof Error ? error.message : String(error),
+         timestamp: Date.now(),
+     };
+@@ -39,7 +41,7 @@
+         .then((inner) => forwardStream(outer, inner))
+         .catch((error) => {
+         const message = createSetupErrorMessage(model, error);
+-        outer.push({ type: "error", reason: "error", error: message });
++        outer.push({ type: "error", reason: message.stopReason, error: message });
+         outer.end(message);
+     });
+     return outer;
