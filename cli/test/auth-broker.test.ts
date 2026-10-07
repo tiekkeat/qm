@@ -10,7 +10,7 @@ import { serviceEnvironment } from "../src/backends/aws.ts";
 import { dockerServiceEnv } from "../src/backends/docker.ts";
 import { computedSecrets, runtimeSecretNames, secretsForService } from "../src/secrets.ts";
 import { stageFlyEmailAllowlist } from "../src/backends/fly.ts";
-import { isReservedContainerName, SERVICE_NAMES, serviceDef } from "../src/services.ts";
+import { isReservedContainerName, SERVICE_NAMES, serviceDef, hostedServiceEnv } from "../src/services.ts";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const brokerStack = join(repoRoot, "deploy", "stacks", "broker", "qm.config.jsonc");
@@ -129,6 +129,7 @@ test("docker and AWS wire the broker with parity", () => {
   assert.equal(awsPortal.OIDC_JWKS_URI, "http://127.0.0.1:8099/.well-known/jwks.json");
   assert.equal(awsPortal.OIDC_ALLOWED_EMAIL_DOMAIN, "example.com");
   assert.equal(serviceEnvironment(aws, "core").AUTH_ALLOWED_EMAIL_DOMAIN, "example.com");
+  assert.equal(serviceEnvironment(aws, "core").AUTH_EMAIL_TRANSPORT, "smtp");
   assert.equal(
     awsPortal.PORTAL_XFF_TRUSTED_HOPS,
     "1",
@@ -191,7 +192,11 @@ test("without a configured domain the allowlist becomes a required secret on bot
   const resend = computedSecrets(config).find((secret) => secret.name === "RESEND_API_KEY")!;
   assert.equal(resend.required, false, "the unselected transport's key stays optional");
   assert.deepEqual(runtimeSecretNames("auth", resend), []);
-  assert.deepEqual(runtimeSecretNames("core", resend), ["RESEND_API_KEY"], "core alone keeps it for invitations");
+  assert.deepEqual(
+    runtimeSecretNames("core", resend),
+    ["RESEND_API_KEY"],
+    "core retains the optional key for an explicit Resend override",
+  );
 });
 
 test("the config refuses a broker without a portal, a bad transport, and hand-set derived env", () => {
@@ -269,4 +274,30 @@ const fs=require("node:fs"); fs.appendFileSync(${JSON.stringify(log)}, process.a
   assert.match(calls, new RegExp(`-a ${prefix}-core AUTH_ALLOWED_EMAILS=- value=new@example.com,other@example.com`));
   assert.match(calls, new RegExp(`-a ${prefix}-portal AUTH_ALLOWED_EMAILS=- value=new@example.com,other@example.com`));
   assert.match(calls, new RegExp(`-a ${prefix}-portal OIDC_ALLOWED_EMAILS=- value=new@example.com,other@example.com`));
+});
+
+test("core inherits the broker email transport and routes SMTP secrets on every target", () => {
+  const config = configWith(
+    configText({
+      env: '{ "auth": { "AUTH_EMAIL_TRANSPORT": "smtp", "SMTP_PORT": "465", "SMTP_TLS": "implicit", "AUTH_ALLOWED_EMAIL_DOMAIN": "example.com" } }',
+    }),
+  );
+  const expected = { AUTH_EMAIL_TRANSPORT: "smtp", SMTP_PORT: "465", SMTP_TLS: "implicit" };
+  assert.deepEqual(hostedServiceEnv(config.services, config.env, "core"), expected);
+  for (const name of ["SMTP_HOST", "SMTP_USERNAME", "SMTP_PASSWORD"]) {
+    const secret = computedSecrets(config).find((s) => s.name === name)!;
+    assert.equal(secret.required, false);
+    assert.deepEqual(runtimeSecretNames("core", secret), [name]);
+    assert.deepEqual(runtimeSecretNames("portal", secret), [name]);
+  }
+  const fly = derivedTomlFor(config, "core", repoRoot);
+  for (const [name, value] of Object.entries(expected)) assert.ok(fly.includes(`${name} = "${value}"`));
+  config.env.core = { AUTH_EMAIL_TRANSPORT: "resend", SMTP_PORT: "587", SMTP_TLS: "starttls" };
+  assert.deepEqual(hostedServiceEnv(config.services, config.env, "core"), config.env.core);
+  assert.equal(
+    computedSecrets(config)
+      .find((s) => s.name === "SMTP_HOST")!
+      .services.includes("core"),
+    false,
+  );
 });

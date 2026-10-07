@@ -11,6 +11,7 @@ import {
   modelUnavailableReason,
   modelRequestOverrides,
   type ModelProvider,
+  type HarnessId,
 } from "../model/pi-models.ts";
 import type { UserModelCredential } from "../model/user-model-credential-store.ts";
 
@@ -20,6 +21,16 @@ export type IndividualAuthRouting =
   | { kind: "oauth"; provider: "openai"; harness: "codex"; model: string }
   | { kind: "oauth"; provider: "openai"; harness: "pi"; model: string }
   | null;
+
+export function personalSubscriptionHarnesses(
+  anthropic: UserModelCredential | null,
+  openai: UserModelCredential | null,
+): HarnessId[] {
+  return [
+    ...(anthropic?.kind === "oauth" && anthropic.oauth ? ["claude" as const] : []),
+    ...(openai?.kind === "oauth" && openai.oauth ? ["pi" as const, "codex" as const] : []),
+  ];
+}
 
 export function resolveIndividualAuthRouting(
   anthCred: UserModelCredential | null,

@@ -24,6 +24,7 @@ import { getAdminMemory, listMemoryScopes, putAdminMemory } from "./admin/memory
 import { manageSandboxResources } from "./admin/sandbox.ts";
 import {
   createAdminGrant,
+  createPasswordUser,
   getUserDetail,
   inviteExternalUser,
   inviteTeammate,
@@ -52,7 +53,13 @@ import {
   managedSlackRequest,
 } from "./admin/slack-installation.ts";
 import { deleteModelProvider, getModelProviders, putModelProvider } from "./admin/model-providers.ts";
-import { sharedCodexStatus, sharedCodexStart, sharedCodexPoll, sharedCodexDisconnect, sharedCodexGrant } from "./admin/shared-codex.ts";
+import {
+  sharedCodexStatus,
+  sharedCodexStart,
+  sharedCodexPoll,
+  sharedCodexDisconnect,
+  sharedCodexGrant,
+} from "./admin/shared-codex.ts";
 import { deleteCustomProvider, getCustomProviders, putCustomProvider } from "./admin/custom-providers.ts";
 import { deleteMcpServer, getMcpServers, putMcpServer } from "./admin/mcp-servers.ts";
 import { listSecurityFlags, releaseSecurityTaint } from "./admin/security.ts";
@@ -169,6 +176,7 @@ const routes: ReadonlyArray<Route<ApiCtx>> = [
   { method: "DELETE", path: "/v1/admin/principal-links/:principalId", auth: "either", handle: deletePrincipalLink },
   { method: "POST", path: "/v1/admin/grants", auth: "either", handle: createAdminGrant },
   { method: "DELETE", path: "/v1/admin/grants/:principalId", auth: "either", handle: revokeAdminGrant },
+  { method: "POST", path: "/v1/admin/users/create", auth: "either", handle: createPasswordUser },
   { method: "POST", path: "/v1/admin/users/invite", auth: "either", handle: inviteTeammate },
   { method: "POST", path: "/v1/admin/external-users", auth: "either", handle: inviteExternalUser },
   { method: "DELETE", path: "/v1/admin/external-users/:email", auth: "either", handle: revokeExternalUser },

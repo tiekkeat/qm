@@ -1,3 +1,5 @@
+import { fakeSmtp } from "../plugins/chassis/test/fake-smtp.ts";
+import { readEmailSettings, type EmailSettings } from "../plugins/chassis/src/email.ts";
 import { randomUUID } from "node:crypto";
 import { signedHeaders, withSourceAuthNonce } from "../plugins/chassis/src/core-client.ts";
 import { mintSignedPayload, verifySignedPayload } from "../src/auth/signed-token.ts";
@@ -11,7 +13,12 @@ import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { createInsecureTestServer, createServer } from "../src/api/server.ts";
 import { buildApp } from "../src/wiring.ts";
-import { INVITE_EMAIL_NOT_CONFIGURED, renderInviteEmail, type InviteMailer } from "../src/admin/invite-email.ts";
+import {
+  INVITE_EMAIL_NOT_CONFIGURED,
+  createInviteMailer,
+  renderInviteEmail,
+  type InviteMailer,
+} from "../src/admin/invite-email.ts";
 import { adminStatusFromGrants } from "../src/admin/admin-service.ts";
 import { coreEmailAdmission, coreEmailAllowed } from "../plugins/chassis/src/external-members.ts";
 import { mintCapabilityToken, CAPABILITY_TTL_MS, CONTROL_PLANE_AUD } from "../src/auth/capability-token.ts";
@@ -42,14 +49,22 @@ function stubMailer(fail?: string): { sent: Sent[]; mailer: InviteMailer } {
 }
 
 function start(
-  opts: { mailer?: InviteMailer; signed?: boolean; emailAuthDomain?: string; emailAuthPrincipals?: string[] } = {},
+  opts: {
+    mailer?: InviteMailer;
+    emailDelivery?: EmailSettings;
+    signed?: boolean;
+    emailAuthDomain?: string;
+    emailAuthPrincipals?: string[];
+  } = {},
 ) {
   const built = buildApp(
     testConfig({
       dataDir: mkdtempSync(join(tmpdir(), "admin-external-users-")),
       ...(opts.signed ? { signingSecret: SECRET } : {}),
+      ...(opts.emailDelivery ? { emailDelivery: opts.emailDelivery } : {}),
     }),
   );
+  const mailer = opts.mailer ?? (opts.emailDelivery ? createInviteMailer(opts.emailDelivery) : null);
   const deps = {
     admin: built.admin,
     sessions: built.sessions,
@@ -61,7 +76,7 @@ function start(
     portalIdentitySecret: SECRET,
     replayDedupe: { durable: true, claim: built.replayDedupe!.claim.bind(built.replayDedupe!) },
     brandingDefault: { selfLabel: "Acme Bot" },
-    ...(opts.mailer ? { inviteMailer: opts.mailer } : {}),
+    ...(mailer ? { inviteMailer: mailer } : {}),
     ...(opts.emailAuthDomain ? { emailAuthDomain: opts.emailAuthDomain } : {}),
     ...(opts.emailAuthPrincipals ? { emailAuthPrincipals: opts.emailAuthPrincipals } : {}),
   };
@@ -806,5 +821,53 @@ test("teammate invites reject manual deactivation before changing access or send
     assert.equal(sent.length, 2);
   } finally {
     await s.close();
+  }
+});
+
+test("SMTP teammate invitations deliver the single-use link and retain copyable access after rejection", async (t) => {
+  for (const failure of [undefined, "auth", "recipient", "timeout"] as const) {
+    const smtp = await fakeSmtp({
+      rejectAuth: failure === "auth",
+      rejectRecipient: failure === "recipient",
+      stallGreeting: failure === "timeout",
+    });
+    const settings = readEmailSettings({
+      AUTH_EMAIL_TRANSPORT: "smtp",
+      AUTH_EMAIL_FROM: "Acme <sender@example.com>",
+      SMTP_HOST: "127.0.0.1",
+      SMTP_PORT: String(smtp.port),
+      SMTP_TLS: "none",
+      SMTP_USERNAME: "user",
+      SMTP_PASSWORD: "password",
+      RESEND_API_KEY: "unused_resend_key",
+    });
+    settings.smtp.timeoutMs = 100;
+    const s = start({ emailDelivery: settings });
+    t.after(async () => {
+      await s.close();
+      await smtp.close();
+    });
+    const response = await inviteTeammate(s.base, { email: "smtp@partner.example" });
+    assert.equal(response.status, 200);
+    const data = (await response.json()) as any;
+    assert.equal(data.emailSent, failure === undefined);
+    assert.equal(data.member.expiresAt, null);
+    assert.equal((await roster(s.base)).inviteEmail.configured, true);
+    if (failure) {
+      const expected = { auth: /SMTP AUTH rejected/, recipient: /SMTP RCPT rejected/, timeout: /SMTP timed out/ }[
+        failure
+      ];
+      assert.match(data.emailProblem, expected);
+      assert.match(data.signInUrl, /\/auth\/invite#token=/);
+      assert.equal(smtp.messages.length, 0);
+    } else {
+      assert.equal(smtp.messages.length, 1);
+      assert.ok(smtp.transcript.includes("MAIL FROM:<sender@example.com>"));
+      assert.ok(smtp.transcript.includes("RCPT TO:<smtp@partner.example>"));
+      const body = smtp.messages[0]!;
+      assert.match(body, /^From: Acme <sender@example.com>/);
+      const encoded = /text\/plain; charset=utf-8\nContent-Transfer-Encoding: base64\n\n([\s\S]*?)\n--/.exec(body)![1]!;
+      assert.match(Buffer.from(encoded.replace(/\s/g, ""), "base64").toString(), /\/auth\/invite#token=/);
+    }
   }
 });

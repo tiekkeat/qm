@@ -26,7 +26,17 @@ export function hostedServiceEnv(
   env: Partial<Record<DeclaredServiceName, Record<string, string>>>,
   host: string,
 ): Record<string, string> {
-  if (host === "core" || serviceHost(host) !== host) return { ...env[host as DeclaredServiceName] };
+  if (host === "core") {
+    const inherited: Record<string, string> = {};
+    if (services.includes("auth")) {
+      for (const key of ["AUTH_EMAIL_TRANSPORT", "SMTP_PORT", "SMTP_TLS"]) {
+        const value = env.auth?.[key];
+        if (value !== undefined) inherited[key] = value;
+      }
+    }
+    return { ...inherited, ...env.core };
+  }
+  if (serviceHost(host) !== host) return { ...env[host as DeclaredServiceName] };
   const out: Record<string, string> =
     host === "web-ui" ? { ADMIN_ENABLED: services.includes("admin") ? "1" : "0" } : {};
   for (const service of services.filter((name) => serviceHost(name) === host)) {

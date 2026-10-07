@@ -3,6 +3,7 @@ import type { RuntimeService } from "./runtime-types.ts";
 import type { App } from "../api/app.ts";
 import {
   runtimeConfigBody,
+  userRuntimeConfigBody,
   validateRuntimeChoice,
   webuiModelEnabled,
   type RuntimeDeps,
@@ -22,6 +23,7 @@ export function createRuntimeService(deps: RuntimeDeps, app: Pick<App, "authoriz
     cronFire = false,
     purpose,
     defaults,
+    modelAccount,
   ) => {
     if (!deps.config) return { ok: false, error: "runtime_unavailable" };
     const scope = parseScopeId(claims.scopeId);
@@ -33,13 +35,20 @@ export function createRuntimeService(deps: RuntimeDeps, app: Pick<App, "authoriz
       return { ok: false, error: "forbidden" };
     await deps.refreshModels?.();
     purpose ??= cronFire ? "cron" : undefined;
-    const snapshot = await runtimeConfigBody(
-      { deps },
-      claims.scopeId,
-      individualAuth ? authorizeChoice : undefined,
-      purpose,
-      defaults,
-    );
+    const personal = individualAuth && !!deps.userModelCredentials;
+    const snapshot = personal
+      ? await userRuntimeConfigBody({ deps }, claims.scopeId, claims.actorId, {
+          account: modelAccount,
+          purpose,
+          requested: defaults,
+        })
+      : await runtimeConfigBody(
+          { deps },
+          claims.scopeId,
+          individualAuth ? authorizeChoice : undefined,
+          purpose,
+          defaults,
+        );
     if (request.action === "get")
       return {
         ok: true,
@@ -57,7 +66,7 @@ export function createRuntimeService(deps: RuntimeDeps, app: Pick<App, "authoriz
       return { ok: false, error: "live_actor_required" };
     if (request.action === "inherit") {
       const purposeConfigured = purpose && (await deps.config.getPurposeRuntimeDurable(purpose));
-      const choice = lifetime === "scope" && !purposeConfigured ? snapshot.orgDefault : snapshot.effective;
+      const choice = lifetime === "scope" && !purposeConfigured && !personal ? snapshot.orgDefault : snapshot.effective;
       const error = validateRuntimeChoice(choice);
       if (error) return { ok: false, error };
       if (
@@ -65,7 +74,7 @@ export function createRuntimeService(deps: RuntimeDeps, app: Pick<App, "authoriz
         !snapshot.modelsByHarness[choice.harnessId]?.includes(choice.modelId)
       )
         return { ok: false, error: "runtime_unavailable" };
-      if (!(await webuiModelEnabled({ deps }, choice.modelId, purpose)))
+      if (!personal && !(await webuiModelEnabled({ deps }, choice.modelId, purpose)))
         return { ok: false, error: "model_not_enabled" };
       const authError = await authorizeChoice?.(choice);
       if (authError) return { ok: false, error: "account_runtime_unavailable", message: authError };
@@ -93,7 +102,8 @@ export function createRuntimeService(deps: RuntimeDeps, app: Pick<App, "authoriz
         };
       modelId = matches[0]!;
     }
-    if (!(await webuiModelEnabled({ deps }, modelId, purpose))) return { ok: false, error: "model_not_enabled" };
+    if (!personal && !(await webuiModelEnabled({ deps }, modelId, purpose)))
+      return { ok: false, error: "model_not_enabled" };
     const choice: RuntimeChoice = {
       harnessId,
       modelId,

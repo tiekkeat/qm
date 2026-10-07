@@ -1230,24 +1230,25 @@ async function putRuntimeConfig(ctx: ApiCtx): Promise<void> {
   } else {
     const harnessId = ctx.body.harnessId;
     const modelId = ctx.body.modelId;
+    const personal = (await config.getModelAccountDurable(target.actorId)) !== "company";
+    const available = personal ? await userRuntimeConfigBody(ctx, target.scope, target.actorId) : null;
     const fallback = runtimeFallback(ctx);
-    const approved = (await config.getApprovedHarnessesDurable()) ?? [fallback.harnessId];
+    const approved = available?.approvedHarnesses ??
+      (await config.getApprovedHarnessesDurable()) ?? [fallback.harnessId];
     if (!isHarnessId(harnessId) || !approved.includes(harnessId))
       return sendJson(ctx.res, 400, { error: "harness_not_approved" });
     if (typeof modelId !== "string" || !modelSupportedByHarness(modelId, harnessId))
       return sendJson(ctx.res, 400, { error: "model_not_supported" });
-    if (!(await webuiModelEnabled(ctx, modelId))) return sendJson(ctx.res, 400, { error: "model_not_enabled" });
+    if (available && !available.modelsByHarness[harnessId]?.includes(modelId))
+      return sendJson(ctx.res, 400, { error: "account_runtime_unavailable" });
+    if (!personal && !(await webuiModelEnabled(ctx, modelId)))
+      return sendJson(ctx.res, 400, { error: "model_not_enabled" });
     const effortLevel = ctx.body.effortLevel ?? "auto";
     if (typeof effortLevel !== "string" || !thinkingLevelsForHarness(harnessId, modelId).includes(effortLevel))
       return sendJson(ctx.res, 400, { error: "effort_not_supported" });
     const fastMode = ctx.body.fastMode ?? false;
     if (typeof fastMode !== "boolean") return sendJson(ctx.res, 400, { error: "fast_mode_invalid" });
     const choice = { harnessId, modelId, effortLevel, fastMode: fastMode && fastModeModelIds().includes(modelId) };
-    if ((await config.getModelAccountDurable(target.actorId)) !== "company") {
-      const available = await userRuntimeConfigBody(ctx, target.scope, target.actorId);
-      if (!available.modelsByHarness[harnessId]?.includes(modelId))
-        return sendJson(ctx.res, 400, { error: "account_runtime_unavailable" });
-    }
     await config.setRuntimeSelectionLatest(target.scope, choice);
   }
   audit(ctx.deps, {

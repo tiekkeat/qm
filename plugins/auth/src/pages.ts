@@ -126,6 +126,7 @@ export function signInPage(o: {
   email?: string;
   problem?: string;
   passwordProblem?: string;
+  passwordUrl?: string;
 }): string {
   const hidden = `<input type="hidden" name="request" value="${escapeHtml(o.requestToken)}">`;
   const trusted = o.trustedSignInLabel
@@ -152,13 +153,13 @@ export function signInPage(o: {
         <label for="password">Password</label>
         <input id="password" name="password" type="password" autocomplete="current-password" required maxlength="1024">
         <button class="btn${o.trustedSignInLabel ? " alternative" : ""}" type="submit">Sign in with password</button>
-        <p class="note">Password sign-in is meant for getting started. Once ${escapeHtml(o.brandName)} is set up, your administrator should switch to email links or an identity provider.</p>
+        ${o.passwordUrl ? `<p class="note"><a href="${escapeHtml(o.passwordUrl)}">Forgot password?</a></p>` : ""}
       </form>`
     : "";
   let msg = "Enter your work email and we'll send you a one-time sign-in link.";
   if (o.trustedSignInLabel) msg = `Use your ${o.trustedSignInLabel} account to continue.`;
   else if (o.password && o.emailLink) msg = "Sign in with your password, or have a one-time link emailed to you.";
-  else if (o.password) msg = "Enter the email address and password your administrator gave you.";
+  else if (o.password) msg = "Enter your email address and password.";
   return page({
     title: "Sign in",
     brandName: o.brandName,
@@ -230,5 +231,23 @@ export function problemPage(o: {
     msg: o.msg,
     ...(body ? { body } : {}),
     help: "If this keeps happening, contact your administrator.",
+  });
+}
+
+export function passwordChangePage(
+  action: string,
+  token: string,
+  request: string,
+  problem = "",
+  brandName = "QM",
+): string {
+  return page({
+    title: "Choose your password",
+    brandName,
+    icon: LOCK_ICON,
+    heading: "Choose your password",
+    msg: "Replace your temporary password to finish signing in. Use at least 12 characters.",
+    body: `${problem ? `<p role="alert" class="reason">${escapeHtml(problem)}</p>` : ""}<form method="post" action="${escapeHtml(action)}"><input type="hidden" name="token" value="${escapeHtml(token)}"><input type="hidden" name="request" value="${escapeHtml(request)}"><label for="password">New password</label><input id="password" type="password" name="password" autocomplete="new-password" minlength="12" maxlength="1024" required><label for="confirmation">Confirm password</label><input id="confirmation" type="password" name="confirmation" autocomplete="new-password" required><button class="btn">Save password and sign in</button></form>`,
+    help: "Your administrator cannot see the password you choose.",
   });
 }

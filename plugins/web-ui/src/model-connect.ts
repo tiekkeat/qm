@@ -170,9 +170,9 @@ function applyStatus(status: StatusResponse): void {
   s.loaded = true;
   if (appState.me) {
     appState.me.individualModelAuth = s.personal;
-    appState.me.modelAuthConnected = status.connections.some(
-      (c) => s.account === "personal" || s.account === c.provider,
-    ) || (s.account === "shared-openai" && s.sharedAvailable);
+    appState.me.modelAuthConnected =
+      status.connections.some((c) => s.account === "personal" || s.account === c.provider) ||
+      (s.account === "shared-openai" && s.sharedAvailable);
     window.dispatchEvent(new CustomEvent("model-account-changed", { detail: status }));
   }
 }
@@ -616,7 +616,10 @@ function providerRow(p: ProviderMeta): TemplateResult {
   `;
 }
 
-async function switchAccount(account: "personal" | "company" | "shared-openai", provider?: "anthropic" | "openai"): Promise<void> {
+async function switchAccount(
+  account: "personal" | "company" | "shared-openai",
+  provider?: "anthropic" | "openai",
+): Promise<void> {
   if (s.busy || (account === "company" && !s.personal) || (account === "personal" && provider === s.account)) return;
   resetFlow();
   s.open = null;
@@ -646,9 +649,9 @@ async function switchAccount(account: "personal" | "company" | "shared-openai", 
 }
 
 function view(): TemplateResult {
-  const anyConnected = PROVIDERS.some(
-    (p) => s.connections[p.key] && (s.account === "personal" || s.account === p.apiName),
-  ) || (s.account === "shared-openai" && s.sharedAvailable);
+  const anyConnected =
+    PROVIDERS.some((p) => s.connections[p.key] && (s.account === "personal" || s.account === p.apiName)) ||
+    (s.account === "shared-openai" && s.sharedAvailable);
   let cta: TemplateResult | typeof nothing = nothing;
   if (s.loaded && (s.mode === "manager" || anyConnected || !s.personal)) {
     cta =
@@ -660,7 +663,14 @@ function view(): TemplateResult {
   }
   let choices: TemplateResult;
   let accountHint = "Or use your own account. Connect a provider, then choose Use account.";
-  if (s.personal) accountHint = "Using a personal account. Choose a connected provider below.";
+  if (s.personal) {
+    const subscription = PROVIDERS.some(
+      (p) => s.connections[p.key] === "oauth" && (s.account === "personal" || s.account === p.apiName),
+    );
+    accountHint = subscription
+      ? "Models compatible with your subscription appear automatically in the model picker."
+      : "Using a personal account. Choose a connected provider below.";
+  }
   if (s.account === "shared-openai") accountHint = "Using shared Codex access.";
   if (!s.loaded) choices = html`<button type="button" class="btn" @click=${() => void load()}>Retry</button>`;
   else if (s.intent)
@@ -677,15 +687,17 @@ function view(): TemplateResult {
           if (!s.required) void switchAccount("company");
         },
       )}
-      ${s.sharedAvailable ? methodRow(
-        "Shared Codex access",
-        "Use the Codex account granted by your administrator.",
-        s.account === "shared-openai",
-        () => void switchAccount("shared-openai"),
-      ) : nothing}
-      <p class="mc-account-hint">
-        ${accountHint}
-      </p>
+      ${
+        s.sharedAvailable
+          ? methodRow(
+              "Shared Codex access",
+              "Use the Codex account granted by your administrator.",
+              s.account === "shared-openai",
+              () => void switchAccount("shared-openai"),
+            )
+          : nothing
+      }
+      <p class="mc-account-hint">${accountHint}</p>
       ${PROVIDERS.map((p) => providerRow(p))}
     </div>`;
   let title = s.mode === "gate" ? "Connect your AI account" : "AI accounts";

@@ -1,3 +1,9 @@
+import {
+  AccountRequestError,
+  type AccountClient,
+  type LoginPolicy,
+  type PasswordVerification,
+} from "../../chassis/src/accounts.ts";
 import { reportBackendError } from "../../chassis/src/error-reporting.ts";
 import { createHmac } from "node:crypto";
 import { coreRememberedSessions, type RememberedSessions, type RememberedSession } from "./sessions.ts";
@@ -12,7 +18,15 @@ import { coreEmailAllowed } from "../../chassis/src/external-members.ts";
 import { mintIdToken, pkceMatches, safeEqual, subjectFor, TokenSigner, type AuthRequest } from "./tokens.ts";
 import { ID_TOKEN_ALG, type SigningKey } from "./keys.ts";
 import { renderSignInEmail, type Mailer } from "./email.ts";
-import { confirmSignInPage, signInPage, linkSentPage, problemPage, CONFIRM_PAGE_CSP, PAGE_CSP } from "./pages.ts";
+import {
+  passwordChangePage,
+  confirmSignInPage,
+  signInPage,
+  linkSentPage,
+  problemPage,
+  CONFIRM_PAGE_CSP,
+  PAGE_CSP,
+} from "./pages.ts";
 
 const MAX_FORM_BYTES = 8 * 1024;
 const ID_TOKEN_TTL_S = 300;
@@ -24,6 +38,7 @@ export interface AuthDeps {
   signer: TokenSigner;
   claims: ClaimStore;
   sessions?: RememberedSessions;
+  accounts?: AccountClient;
   mailer: Mailer | null;
   brandName?: () => string;
   trustedSignInLabel?: string;
@@ -125,20 +140,32 @@ export function createAuthHandler(deps: AuthDeps): (req: IncomingMessage, res: S
   const now = deps.now ?? Date.now;
   const notify = deps.onBackgroundTask ?? ((task: Promise<void>) => void task.catch(() => undefined));
   const formAction = `${cfg.publicPath}/authorize`;
-  const passwords = passwordConfigured(cfg);
-  const signInForm = (
+  const passwords = passwordConfigured(cfg) || !!deps.accounts;
+  const policy = async (): Promise<LoginPolicy> =>
+    deps.accounts ? (await deps.accounts.request<{ policy: LoginPolicy }>("/policy")).policy : "both";
+  const sessionValid = async (email: string, version?: number): Promise<boolean> =>
+    !deps.accounts ||
+    (
+      await deps.accounts.request<{ valid: boolean }>(
+        `/session?email=${encodeURIComponent(email)}&version=${version ?? 0}`,
+      )
+    ).valid;
+  const signInForm = async (
     requestToken: string,
     extra: { email?: string; problem?: string; passwordProblem?: string } = {},
-  ): string =>
-    signInPage({
+  ): Promise<string> => {
+    const methods = await policy();
+    return signInPage({
       brandName: brandName(),
       trustedSignInLabel: deps.trustedSignInLabel,
       action: formAction,
       requestToken,
-      emailLink: mailer !== null,
-      password: passwords,
+      emailLink: mailer !== null && methods !== "password",
+      password: passwords && methods !== "email",
+      passwordUrl: methods === "email" ? undefined : "/auth/password/reset",
       ...extra,
     });
+  };
   const linkTtlMinutes = Math.max(1, Math.round(cfg.linkTtlS / 60));
   let inFlightSends = 0;
   const background = (task: () => Promise<void>): void => {
@@ -233,6 +260,7 @@ export function createAuthHandler(deps: AuthDeps): (req: IncomingMessage, res: S
     email: string,
     authTime: number,
     cookie: string,
+    credentialVersion?: number,
   ): Promise<void> {
     const code = await signer.sealCode(
       {
@@ -242,6 +270,7 @@ export function createAuthHandler(deps: AuthDeps): (req: IncomingMessage, res: S
         codeChallenge: request.codeChallenge,
         email,
         authTime,
+        credentialVersion,
       },
       cfg.codeTtlS,
       now(),
@@ -281,7 +310,14 @@ export function createAuthHandler(deps: AuthDeps): (req: IncomingMessage, res: S
         (parsed.maxAge === undefined || Math.floor(now() / 1000) - session.authTime <= parsed.maxAge) &&
         (await emailAllowed(session.email))
       )
-        return issueCode(res, parsed.request, session.email, session.authTime, sessionCookie(token, session));
+        return issueCode(
+          res,
+          parsed.request,
+          session.email,
+          session.authTime,
+          sessionCookie(token, session),
+          session.credentialVersion,
+        );
     }
     if (parsed.prompt.split(/\s+/).includes("none")) {
       const destination = new URL(parsed.request.redirectUri);
@@ -290,9 +326,10 @@ export function createAuthHandler(deps: AuthDeps): (req: IncomingMessage, res: S
       res.writeHead(302, noStore({ location: destination.toString() }));
       return void res.end();
     }
-    if (!mailer && !passwords) return emailUnavailable(res);
+    const methods = await policy();
+    if (!(mailer && methods !== "password") && !(passwords && methods !== "email")) return emailUnavailable(res);
     const sealed = await signer.sealRequest(parsed.request, cfg.requestTtlS, now());
-    return sendHtml(res, 200, signInForm(sealed.token));
+    return sendHtml(res, 200, await signInForm(sealed.token));
   }
 
   async function passwordSubmit(
@@ -301,12 +338,12 @@ export function createAuthHandler(deps: AuthDeps): (req: IncomingMessage, res: S
     request: AuthRequest,
     form: URLSearchParams,
   ): Promise<void> {
-    if (!passwords) return passwordUnavailable(res);
+    if (!passwords || (await policy()) === "email") return passwordUnavailable(res);
     const email = normalizeEmail(form.get("email") ?? "");
     const password = form.get("password") ?? "";
     const reject = async (status: number, passwordProblem: string): Promise<void> => {
       const sealed = await signer.sealRequest(request, cfg.requestTtlS, now());
-      sendHtml(res, status, signInForm(sealed.token, { email, passwordProblem }));
+      sendHtml(res, status, await signInForm(sealed.token, { email, passwordProblem }));
     };
     if (!validEmail(email) || !password) return reject(400, "Enter your email address and password.");
     const nowMs = now();
@@ -332,7 +369,27 @@ export function createAuthHandler(deps: AuthDeps): (req: IncomingMessage, res: S
         "The sign-in service cannot reach its backend. Try again in a minute.",
       );
     }
-    const matched = await verifyPassword(password, cfg.passwordUsers.get(email));
+    let verified: PasswordVerification | undefined;
+    if (deps.accounts) verified = await deps.accounts.request<PasswordVerification>("/verify", { email, password });
+    let matched = verified ? verified.matched : await verifyPassword(password, cfg.passwordUsers.get(email));
+    if (
+      verified &&
+      !verified.managed &&
+      cfg.passwordUsers.has(email) &&
+      (await verifyPassword(password, cfg.passwordUsers.get(email)))
+    ) {
+      await deps.accounts!.request("/import", { email, hash: cfg.passwordUsers.get(email) });
+      verified = await deps.accounts!.request<PasswordVerification>("/verify", { email, password });
+      matched = verified.matched;
+    }
+    if (matched && verified?.mustChangePassword && verified.token) {
+      const sealed = await signer.sealRequest(request, cfg.requestTtlS, now());
+      return sendHtml(
+        res,
+        200,
+        passwordChangePage(`${cfg.publicPath}/password`, verified.token, sealed.token, "", brandName()),
+      );
+    }
     if (!matched || !(await emailAllowed(email))) {
       console.warn(`[auth] password sign-in refused for ${email}`);
       return reject(401, "That email address or password is incorrect.");
@@ -349,7 +406,14 @@ export function createAuthHandler(deps: AuthDeps): (req: IncomingMessage, res: S
       );
     }
     console.log(`[auth] password sign-in for ${email}`);
-    return issueCode(res, request, email, session.authTime, sessionCookie(session.token, session));
+    return issueCode(
+      res,
+      request,
+      email,
+      session.authTime,
+      sessionCookie(session.token, session),
+      session.credentialVersion,
+    );
   }
 
   async function sendLink(request: AuthRequest, email: string, ip: string, sender: Mailer): Promise<void> {
@@ -391,7 +455,8 @@ export function createAuthHandler(deps: AuthDeps): (req: IncomingMessage, res: S
   }
 
   async function authorizeSubmit(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    if (!mailer && !passwords) return emailUnavailable(res);
+    const methods = await policy();
+    if (!(mailer && methods !== "password") && !(passwords && methods !== "email")) return emailUnavailable(res);
     let raw: string;
     try {
       raw = await readBody(req, MAX_FORM_BYTES);
@@ -411,11 +476,15 @@ export function createAuthHandler(deps: AuthDeps): (req: IncomingMessage, res: S
       );
     }
     if (form.get("method") === "password" || form.has("password")) return passwordSubmit(req, res, request, form);
-    if (!mailer) return emailUnavailable(res);
+    if (!mailer || (await policy()) === "password") return emailUnavailable(res);
     const email = normalizeEmail(form.get("email") ?? "");
     if (!validEmail(email)) {
       const sealed = await signer.sealRequest(request, cfg.requestTtlS, now());
-      return sendHtml(res, 400, signInForm(sealed.token, { problem: "That doesn't look like an email address." }));
+      return sendHtml(
+        res,
+        400,
+        await signInForm(sealed.token, { problem: "That doesn't look like an email address." }),
+      );
     }
     const ip = clientIpOf(req);
     sendHtml(
@@ -445,6 +514,7 @@ export function createAuthHandler(deps: AuthDeps): (req: IncomingMessage, res: S
   }
 
   async function verify(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if ((await policy()) === "password") return emailUnavailable(res);
     let raw: string;
     try {
       raw = await readBody(req, MAX_FORM_BYTES);
@@ -479,6 +549,17 @@ export function createAuthHandler(deps: AuthDeps): (req: IncomingMessage, res: S
     if (!(await emailAllowed(link.email))) {
       return problem(res, 403, "This address can't sign in", "Your administrator has not allowed this email address.");
     }
+    if (deps.accounts) {
+      const pending = await deps.accounts.request<{ token?: string }>("/begin", { email: link.email });
+      if (pending.token) {
+        const request = await signer.sealRequest(link, cfg.requestTtlS, now());
+        return sendHtml(
+          res,
+          200,
+          passwordChangePage(`${cfg.publicPath}/password`, pending.token, request.token, "", brandName()),
+        );
+      }
+    }
     let session: RememberedSession & { token: string };
     try {
       session = await sessions.create(link.email, cfg.sessionIdleS, cfg.sessionAbsoluteS);
@@ -490,7 +571,14 @@ export function createAuthHandler(deps: AuthDeps): (req: IncomingMessage, res: S
         "The sign-in service cannot remember this browser. Request a fresh link in a minute.",
       );
     }
-    return issueCode(res, link, link.email, session.authTime, sessionCookie(session.token, session));
+    return issueCode(
+      res,
+      link,
+      link.email,
+      session.authTime,
+      sessionCookie(session.token, session),
+      session.credentialVersion,
+    );
   }
 
   async function token(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -531,7 +619,8 @@ export function createAuthHandler(deps: AuthDeps): (req: IncomingMessage, res: S
     if (!codeClaimed) return sendJson(res, 400, { error: "invalid_grant" });
     if (!pkceMatches(form.get("code_verifier") ?? "", granted.codeChallenge))
       return sendJson(res, 400, { error: "invalid_grant" });
-    if (!(await emailAllowed(granted.email))) return sendJson(res, 400, { error: "invalid_grant" });
+    if (!(await emailAllowed(granted.email)) || !(await sessionValid(granted.email, granted.credentialVersion)))
+      return sendJson(res, 400, { error: "invalid_grant" });
 
     const nowMs = now();
     const sub = subjectFor(cfg.issuer, granted.email);
@@ -543,9 +632,14 @@ export function createAuthHandler(deps: AuthDeps): (req: IncomingMessage, res: S
       nonce: granted.nonce,
       ttlS: ID_TOKEN_TTL_S,
       authTime: granted.authTime,
+      credentialVersion: granted.credentialVersion,
       nowMs,
     });
-    const access = await signer.sealAccess({ sub, email: granted.email }, cfg.accessTtlS, nowMs);
+    const access = await signer.sealAccess(
+      { sub, email: granted.email, credentialVersion: granted.credentialVersion },
+      cfg.accessTtlS,
+      nowMs,
+    );
     return sendJson(res, 200, {
       access_token: access.token,
       token_type: "Bearer",
@@ -562,7 +656,7 @@ export function createAuthHandler(deps: AuthDeps): (req: IncomingMessage, res: S
       return void res.end(JSON.stringify({ error: "invalid_token" }));
     }
     const opened = await signer.openAccess(header.slice(7).trim(), now());
-    if (!opened) {
+    if (!opened || !(await sessionValid(opened.email, opened.credentialVersion))) {
       res.writeHead(
         401,
         noStore({ "content-type": "application/json", "www-authenticate": `Bearer error="invalid_token"` }),
@@ -615,6 +709,47 @@ export function createAuthHandler(deps: AuthDeps): (req: IncomingMessage, res: S
     if (method === "GET" && path === "/.well-known/openid-configuration") return discovery(res);
     if (method === "GET" && path === "/authorize") return authorizeForm(req, res, url.searchParams);
     if (method === "POST" && path === "/authorize") return authorizeSubmit(req, res);
+    if (method === "POST" && path === "/password") {
+      if (!deps.accounts) return passwordUnavailable(res);
+      const form = new URLSearchParams(await readBody(req, MAX_FORM_BYTES));
+      const request = await signer.openRequest(form.get("request") ?? "", now());
+      if (!request) return problem(res, 400, "Sign-in expired", "Start again from the sign-in page.");
+      const token = form.get("token") ?? "";
+      const password = form.get("password") ?? "";
+      if (password !== form.get("confirmation"))
+        return sendHtml(
+          res,
+          400,
+          passwordChangePage(
+            `${cfg.publicPath}/password`,
+            token,
+            form.get("request") ?? "",
+            "Passwords do not match.",
+            brandName(),
+          ),
+        );
+      let result: { email: string; version: number };
+      try {
+        result = await deps.accounts.request("/complete", { token, password });
+      } catch (e) {
+        if (e instanceof AccountRequestError && e.status < 500)
+          return sendHtml(
+            res,
+            e.status,
+            passwordChangePage(`${cfg.publicPath}/password`, token, form.get("request") ?? "", e.message, brandName()),
+          );
+        throw e;
+      }
+      const session = await sessions.create(result.email, cfg.sessionIdleS, cfg.sessionAbsoluteS);
+      return issueCode(
+        res,
+        request,
+        result.email,
+        session.authTime,
+        sessionCookie(session.token, session),
+        session.credentialVersion,
+      );
+    }
     if (method === "GET" && path === "/verify") return confirmVerify(res);
     if (method === "POST" && path === "/verify") return verify(req, res);
     if (method === "POST" && path === "/token") return token(req, res);

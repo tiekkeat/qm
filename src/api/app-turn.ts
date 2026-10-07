@@ -1,5 +1,6 @@
+import { resolveIndividualAuthRouting } from "../core/individual-auth-routing.ts";
 import { externalSlackRequestAllowed } from "../resolution/external-slack.ts";
-import { availableRuntimeError, runtimeConfigBody } from "./runtime-config.ts";
+import { availableRuntimeError, runtimeConfigBody, validateRuntimeChoice } from "./runtime-config.ts";
 import type { Run } from "../runs/run-store.ts";
 import { userRuntimeConfigBody } from "./runtime-config.ts";
 import { isSubagentThreadRef, stopSessionTree } from "../sessions/session-syscalls.ts";
@@ -204,9 +205,19 @@ export function createTurnMethods(
           : "company";
       const individualAuth = modelAccount !== "company";
       const runtimePurpose = turnRuntimePurpose(req, isSubagentThreadRef(req.conversation.threadRef));
+      let personalSubscription = false;
+      if (origin.kind !== "human" && individualAuth && modelAccount !== "shared-openai") {
+        const [anthropic, openai] = await Promise.all([
+          modelAccount === "openai" ? null : deps.userModelCredentials?.get(actor.id, "anthropic"),
+          modelAccount === "anthropic" ? null : deps.userModelCredentials?.get(actor.id, "openai"),
+        ]);
+        personalSubscription =
+          resolveIndividualAuthRouting(anthropic ?? null, openai ?? null, req.model, req.harness)?.kind !== "apikey";
+      }
+      const automatedPersonalAuth = personalSubscription || modelAccount === "shared-openai";
       if (req.triggered && (req.model || req.harness)) {
         const scope = conversationScope(req.conversation, actor.id);
-        const choices = modelAccount === "shared-openai"
+        const choices = automatedPersonalAuth
           ? await userRuntimeConfigBody({ deps }, scope, actor.id)
           : await runtimeConfigBody({ deps }, scope, undefined, runtimePurpose, {
               ...(req.harness && isHarnessId(req.harness) ? { harnessId: req.harness } : {}),
@@ -218,8 +229,15 @@ export function createTurnMethods(
         const model = req.model ?? choices.effective.modelId;
         let error: string | null;
         if (!isHarnessId(harness)) error = "harness_not_approved";
-        else if (modelAccount === "shared-openai")
-          error = choices.modelsByHarness[harness]?.includes(model) ? null : "shared Codex access cannot serve this runtime";
+        else if (automatedPersonalAuth)
+          error = choices.modelsByHarness[harness]?.includes(model)
+            ? validateRuntimeChoice({
+                harnessId: harness,
+                modelId: model,
+                effortLevel: req.thinkingLevel,
+                fastMode: req.fastMode,
+              })
+            : "Your connected AI account cannot serve this model on that harness.";
         else
           error = await availableRuntimeError(
             { deps },
@@ -376,7 +394,7 @@ export function createTurnMethods(
         actor,
         conversation,
         origin,
-        modelAccount: origin.kind === "human" || modelAccount === "shared-openai" ? modelAccount : ("company" as const),
+        modelAccount: origin.kind === "human" || automatedPersonalAuth ? modelAccount : ("company" as const),
         text: req.text,
         ...(req.gatewayContext ? { gatewayContext: req.gatewayContext } : {}),
         ...(req.proactiveOpener ? { proactiveOpener: true } : {}),
@@ -390,8 +408,12 @@ export function createTurnMethods(
         ...(req.detectOpener ? { detectOpener: req.detectOpener } : {}),
         ...(req.attachments?.length ? { attachments: req.attachments } : {}),
         ...(req.inboundNotes?.length ? { inboundNotes: req.inboundNotes } : {}),
-        ...((!individualAuth || req.surface === "web") && requestedHarness ? { harness: requestedHarness } : {}),
-        ...((!individualAuth || req.surface === "web") && requestedModel ? { model: requestedModel } : {}),
+        ...((!individualAuth || req.surface === "web" || personalSubscription) && requestedHarness
+          ? { harness: requestedHarness }
+          : {}),
+        ...((!individualAuth || req.surface === "web" || personalSubscription) && requestedModel
+          ? { model: requestedModel }
+          : {}),
         ...turnModelOptions(req),
         ...(req.readOnly ? { readOnly: true } : {}),
         ...(privateRequest

@@ -36,4 +36,5 @@ export type RuntimeService = (
   cronFire?: boolean,
   purpose?: import("../resolution/config-store.ts").RuntimePurpose,
   defaults?: Partial<RuntimeChoice>,
+  modelAccount?: import("../resolution/config-store.ts").ModelAccount,
 ) => Promise<RuntimeResult>;

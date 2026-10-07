@@ -1,4 +1,4 @@
-import { serviceHost, type DeclaredServiceName } from "./services.ts";
+import { hostedServiceEnv, serviceHost, type DeclaredServiceName } from "./services.ts";
 import { effectiveModelProvider, type ModelProvider, type QmConfig } from "./config.ts";
 import { TARGET_ENV_DEFAULTS } from "./target-env-defaults.ts";
 import { deploymentSecretValue } from "./util.ts";
@@ -502,7 +502,7 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
     service: "core",
     required: false,
     description:
-      "Lets core email invitations to external users, added from the admin Users tab or by chatting with QM, through Resend.",
+      "Resend API key for invitations when core selects the Resend email transport.",
   },
   {
     name: "SMTP_HOST",
@@ -511,7 +511,7 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
       when: { kind: "env-equals", service: "auth", name: "AUTH_EMAIL_TRANSPORT", value: "smtp" },
       optional: true,
     },
-    description: "SMTP relay hostname used to deliver sign-in links.",
+    description: "SMTP relay hostname used to deliver sign-in links and invitations.",
   },
   {
     name: "SMTP_USERNAME",
@@ -520,7 +520,7 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
       when: { kind: "env-equals", service: "auth", name: "AUTH_EMAIL_TRANSPORT", value: "smtp" },
       optional: true,
     },
-    description: "SMTP username for the sign-in-link relay.",
+    description: "SMTP username for sign-in links and invitations.",
   },
   {
     name: "SMTP_PASSWORD",
@@ -529,7 +529,34 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
       when: { kind: "env-equals", service: "auth", name: "AUTH_EMAIL_TRANSPORT", value: "smtp" },
       optional: true,
     },
-    description: "SMTP password for the sign-in-link relay.",
+    description: "SMTP password for sign-in links and invitations.",
+  },
+  {
+    name: "SMTP_HOST",
+    service: "core",
+    required: {
+      when: { kind: "env-equals", service: "core", name: "AUTH_EMAIL_TRANSPORT", value: "smtp" },
+      optional: true,
+    },
+    description: "SMTP relay hostname for invitations.",
+  },
+  {
+    name: "SMTP_USERNAME",
+    service: "core",
+    required: {
+      when: { kind: "env-equals", service: "core", name: "AUTH_EMAIL_TRANSPORT", value: "smtp" },
+      optional: true,
+    },
+    description: "SMTP username for invitations.",
+  },
+  {
+    name: "SMTP_PASSWORD",
+    service: "core",
+    required: {
+      when: { kind: "env-equals", service: "core", name: "AUTH_EMAIL_TRANSPORT", value: "smtp" },
+      optional: true,
+    },
+    description: "SMTP password for invitations.",
   },
 ];
 
@@ -555,7 +582,7 @@ function conditionMatches(config: QmConfig, condition: SecretCondition): boolean
   const configuredSandboxBackend =
     condition.service === "core" && condition.name === "SANDBOX_BACKEND" ? config.sandbox?.backend : undefined;
   const value = (
-    config.env[condition.service]?.[condition.name] ??
+    hostedServiceEnv(config.services, config.env, condition.service)[condition.name] ??
     configuredSandboxBackend ??
     targetEnvDefault(config, condition.service, condition.name)
   )?.trim();

@@ -19,6 +19,7 @@ export interface LinkClaims extends AuthRequest {
 
 export interface CodeClaims {
   authTime?: number;
+  credentialVersion?: number;
   clientId: string;
   redirectUri: string;
   nonce: string;
@@ -27,6 +28,7 @@ export interface CodeClaims {
 }
 
 export interface AccessClaims {
+  credentialVersion?: number;
   sub: string;
   email: string;
 }
@@ -142,6 +144,7 @@ export class TokenSigner {
         cc: claims.codeChallenge,
         em: claims.email,
         at: claims.authTime,
+        cv: claims.credentialVersion,
       },
       ttlS,
       nowMs,
@@ -164,6 +167,7 @@ export class TokenSigner {
         codeChallenge: cc as string,
         email: em as string,
         ...(typeof payload.at === "number" ? { authTime: payload.at } : {}),
+        ...(typeof payload.cv === "number" ? { credentialVersion: payload.cv } : {}),
       },
       jti: String(payload.jti),
       expiresAtMs: Number(payload.exp) * 1000,
@@ -171,13 +175,17 @@ export class TokenSigner {
   }
 
   async sealAccess(claims: AccessClaims, ttlS: number, nowMs?: number): Promise<SealedToken> {
-    return this.seal("access", { sub: claims.sub, em: claims.email }, ttlS, nowMs);
+    return this.seal("access", { sub: claims.sub, em: claims.email, cv: claims.credentialVersion }, ttlS, nowMs);
   }
 
   async openAccess(token: string, nowMs?: number): Promise<AccessClaims | null> {
     const payload = await this.open("access", token, nowMs);
     if (!payload || typeof payload.sub !== "string" || typeof payload.em !== "string") return null;
-    return { sub: payload.sub, email: payload.em };
+    return {
+      sub: payload.sub,
+      email: payload.em,
+      ...(typeof payload.cv === "number" ? { credentialVersion: payload.cv } : {}),
+    };
   }
 }
 
@@ -216,6 +224,7 @@ export async function mintIdToken(
     ttlS: number;
     nowMs?: number;
     authTime?: number;
+    credentialVersion?: number;
   },
 ): Promise<string> {
   const issuedAt = Math.floor((args.nowMs ?? Date.now()) / 1000);
@@ -225,6 +234,7 @@ export async function mintIdToken(
     email: args.email,
     email_verified: true,
     ...(args.authTime !== undefined ? { auth_time: args.authTime } : {}),
+    ...(args.credentialVersion !== undefined ? { qm_credential_version: args.credentialVersion } : {}),
   })
     .setProtectedHeader({ alg: ID_TOKEN_ALG, kid: key.kid, typ: "JWT" })
     .setIssuer(args.issuer)

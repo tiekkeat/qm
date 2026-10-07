@@ -854,6 +854,16 @@ export async function proxyDeploymentSubdomain(ctx: BaseCtx): Promise<boolean> {
   if (!session && sessionSecret && embedAncestors.length) {
     session = portalSessionFrom(req.headers.cookie, FRAME_SESSION_COOKIE, sessionSecret);
   }
+  if (session && deps.accounts) {
+    const account = await deps.accounts.get(session.sub);
+    const policy = await deps.accounts.policy();
+    if (
+      account &&
+      ((account.mustChangePassword && policy !== "email" && !session.passwordRecovery) ||
+        account.version !== (session.credentialVersion ?? 0))
+    )
+      session = null;
+  }
   const sub = session?.sub;
   if (embedAncestors.length) res.setHeader("content-security-policy", frameAncestorsDirective(embedAncestors));
   if (!isPublic && (!sessionSecret || !loginUrl)) {

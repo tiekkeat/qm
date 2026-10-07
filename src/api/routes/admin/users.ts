@@ -1,3 +1,4 @@
+import { hashPassword, passwordProblem } from "../../../../plugins/chassis/src/password.ts";
 import { randomUUID } from "node:crypto";
 import { mintSignedPayload } from "../../../auth/signed-token.ts";
 import { scopeId as makeScopeId } from "../../../types.ts";
@@ -53,6 +54,13 @@ export async function listUsers(ctx: ApiCtx): Promise<void> {
         admin: adminStatusFromGrants(grants, member.email),
       });
   }
+  const accounts = (await deps.accounts?.list()) ?? [];
+  const passwordInfo = accounts.map((a) => ({
+    email: a.email,
+    hasPassword: true,
+    mustChangePassword: a.mustChangePassword,
+  }));
+  const loginPolicy = (await deps.accounts?.policy()) ?? "both";
   const signInUrl = signInUrlOf(deps);
   const inviteEmail = {
     configured: deps.inviteMailer !== undefined,
@@ -65,6 +73,7 @@ export async function listUsers(ctx: ApiCtx): Promise<void> {
     grants,
     externalUsers,
     inviteEmail,
+    passwordAccounts: { enabled: !!deps.accounts, policy: loginPolicy, users: passwordInfo },
     access: {
       emailDomain: deps.emailAuthDomain ?? null,
       slackAllowFrom: deps.slackAllowFrom ?? null,
@@ -103,7 +112,11 @@ export async function inviteTeammate(ctx: ApiCtx): Promise<void> {
   return inviteUser(ctx, true);
 }
 
-async function inviteUser(ctx: ApiCtx, teammate: boolean): Promise<void> {
+export async function createPasswordUser(ctx: ApiCtx): Promise<void> {
+  return inviteUser(ctx, true, true);
+}
+
+async function inviteUser(ctx: ApiCtx, teammate: boolean, manual = false): Promise<void> {
   const { res, deps, body } = ctx;
   const scope = orgScope(deps);
   const actor = await authorizeAdmin(ctx, scope);
@@ -117,6 +130,21 @@ async function inviteUser(ctx: ApiCtx, teammate: boolean): Promise<void> {
     .trim()
     .toLowerCase();
   if (!validEmail(email)) return bad("a valid email address is required");
+  let passwordHash: string | undefined;
+  if (manual) {
+    if (!deps.accounts)
+      return sendJson(res, 503, { error: "not_configured", message: "Password accounts require Postgres." });
+    if ((await deps.accounts.policy()) === "email")
+      return bad("Enable password sign-in before creating password accounts.");
+    const problem = passwordProblem(String(b.password ?? ""));
+    if (problem) return bad(problem);
+    if ((await deps.accounts.get(email)) || deps.identity.externalMember(email))
+      return sendJson(res, 409, {
+        error: "account_exists",
+        message: "This account already exists. Use Reset password instead.",
+      });
+    passwordHash = await hashPassword(String(b.password));
+  }
   const role = b.role ?? "member";
   if (role !== "member" && role !== "org_admin") return bad("role must be member or org_admin");
   const expiry = normalizeInboundExpiresAt(endOfDayUtc(b.expiresAt));
@@ -146,6 +174,18 @@ async function inviteUser(ctx: ApiCtx, teammate: boolean): Promise<void> {
   }
   if (!teammate && role === "member" && holdsGrant && !ownsGrant)
     return sendJson(res, 409, { error: "conflict", message: HOLDS_OWN_GRANT });
+  if (
+    manual &&
+    (existing ||
+      (await deps.directory?.get(email)) ||
+      ((await deps.sessions?.listParticipants()) ?? []).some((p) => samePerson(p.principalId, email)))
+  )
+    return sendJson(res, 409, {
+      error: "account_exists",
+      message: "This user already exists. Use Reset password instead.",
+    });
+  if (manual && !(await deps.accounts!.create(email, passwordHash!, true)))
+    return sendJson(res, 409, { error: "account_exists", message: "This account already exists." });
   let grantChange: "grant.create" | "grant.revoke" | null = null;
   if (role === "org_admin" && !holdsGrant) grantChange = "grant.create";
   else if (!teammate && role === "member" && holdsGrant) grantChange = "grant.revoke";
@@ -154,6 +194,7 @@ async function inviteUser(ctx: ApiCtx, teammate: boolean): Promise<void> {
       await deps.admin!.createGrant(actor, { principalId: email, role: "org_admin", scopeId: scope });
     else if (grantChange === "grant.revoke") await deps.admin!.revokeGrant(actor, email, scope, "org_admin");
   } catch (e) {
+    if (manual) await deps.accounts!.removeIfVersion(email, 1);
     return grantError(res, "grant_failed", e);
   }
   if (grantChange)
@@ -170,6 +211,10 @@ async function inviteUser(ctx: ApiCtx, teammate: boolean): Promise<void> {
     updatedAt: now,
   };
   await deps.identity.putExternalMember(member);
+  if (manual) {
+    audit(deps, { principalId: actor.id, action: "user.create", resource: email, scopeLabel: scope });
+    return sendJson(res, 200, { ok: true, member, created: true, mustChangePassword: true });
+  }
   const action = created || readmitted ? "external_user.invite" : "external_user.update";
   audit(deps, {
     principalId: actor.id,

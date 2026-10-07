@@ -1,3 +1,4 @@
+import { coreAccounts } from "../../chassis/src/accounts.ts";
 import { reportBackendError } from "../../chassis/src/error-reporting.ts";
 import "./instrument.ts";
 import { coreRememberedSessions } from "./sessions.ts";
@@ -41,7 +42,9 @@ export async function startServer(
     const b = ((await r.json()) as { branding?: { selfLabel?: unknown } }).branding;
     return typeof b?.selfLabel === "string" ? { selfLabel: b.selfLabel } : {};
   });
+  const accounts = coreAccounts(CFG.coreApiUrl, CFG.coreSigningSecret);
   const handle = createAuthHandler({
+    accounts,
     cfg: CFG,
     trustedSignInLabel: options.trustedSignInLabel,
     signingKey,

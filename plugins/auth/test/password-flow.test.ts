@@ -95,7 +95,7 @@ test("the sign-in page offers only the configured methods", async (t) => {
   const bothHtml = (await signInPage(both, pkcePair().challenge)).html;
   assert.match(bothHtml, /type="password"/);
   assert.match(bothHtml, /Email me a sign-in link/);
-  assert.match(bothHtml, /meant for getting started/);
+  assert.match(bothHtml, /Forgot password/);
   assert.doesNotMatch(bothHtml, /scrypt\$/);
 
   const passwordOnly = await startHarness({ env: { AUTH_PASSWORD_USERS: USERS, RESEND_API_KEY: undefined } });
@@ -223,4 +223,75 @@ test("a remembered browser from a password sign-in silently reauthorizes like an
   });
   assert.equal(again.status, 302);
   assert.equal(new URL(again.headers.get("location")!).searchParams.get("state"), "again");
+});
+
+test("live organization policy controls rendered forms and rejects disabled submissions", async (t) => {
+  let policy = "password";
+  const accounts = {
+    async request<T>(path: string): Promise<T> {
+      return (path === "/policy" ? { policy } : { matched: false, managed: true }) as T;
+    },
+  };
+  const h = await startHarness({ accounts });
+  t.after(() => h.close());
+  const { html, request } = await signInPage(h, pkcePair().challenge);
+  assert.match(html, /Sign in with password/);
+  assert.doesNotMatch(html, /Email me a sign-in link/);
+  const disabledEmail = await fetch(
+    `${h.base}/authorize`,
+    form({ request, method: "email", email: "admin@example.com" }),
+  );
+  assert.equal(disabledEmail.status, 503);
+  assert.equal(h.mailer.sent.length, 0);
+  policy = "email";
+  const emailPage = await signInPage(h, pkcePair().challenge);
+  assert.doesNotMatch(emailPage.html, /Sign in with password/);
+  assert.match(emailPage.html, /Email me a sign-in link/);
+  const disabledPassword = await fetch(
+    `${h.base}/authorize`,
+    form({ request: emailPage.request, method: "password", email: "admin@example.com", password: PASSWORD }),
+  );
+  assert.equal(disabledPassword.status, 503);
+});
+test("a temporary password creates no remembered session until the replacement succeeds", async (t) => {
+  let completed = false;
+  const accounts = {
+    async request<T>(path: string, body?: any): Promise<T> {
+      if (path === "/policy") return { policy: "both" } as T;
+      if (path === "/verify")
+        return { matched: true, managed: true, mustChangePassword: true, token: "temporary-ticket" } as T;
+      if (path === "/complete") {
+        assert.equal(body.password, "replacement secure password");
+        completed = true;
+        return { email: "admin@example.com", version: 2 } as T;
+      }
+      throw new Error(path);
+    },
+  };
+  const h = await startHarness({ accounts });
+  t.after(() => h.close());
+  const signed = await submitPassword(h, { email: "admin@example.com", password: PASSWORD });
+  assert.equal(signed.response.status, 200);
+  assert.equal(h.remembered.size, 0);
+  assert.equal(signed.response.headers.get("set-cookie"), null);
+  const html = await signed.response.text();
+  const request = hiddenRequestToken(html);
+  const mismatch = await fetch(
+    `${h.base}/password`,
+    form({ token: "temporary-ticket", request, password: "replacement secure password", confirmation: "wrong" }),
+  );
+  assert.equal(mismatch.status, 400);
+  assert.equal(completed, false);
+  const replaced = await fetch(
+    `${h.base}/password`,
+    form({
+      token: "temporary-ticket",
+      request,
+      password: "replacement secure password",
+      confirmation: "replacement secure password",
+    }),
+  );
+  assert.equal(replaced.status, 302);
+  assert.equal(completed, true);
+  assert.equal(h.remembered.size, 1);
 });

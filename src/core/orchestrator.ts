@@ -3393,6 +3393,9 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           humanTurn &&
           (await deps.config?.getInteractiveFastModeDurable());
         const effectiveFastMode = resolveTurnFastMode(input.fastMode, humanTurn, wantsOrgFastMode === true);
+        const modelAccount = external
+          ? "company"
+          : (input.modelAccount ?? (await deps.config?.getModelAccountDurable(actor.id)) ?? "company");
         const loadRuntimeAuth = async (runtime: Partial<RuntimeChoice>) => {
           let userProviderKeys: ProviderKeys | undefined;
           let userModelOverride: string | undefined;
@@ -3400,13 +3403,13 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           let claudeOauthToken: string | undefined;
           let codexTurnAuth: CodexTurnAuth | undefined;
           const userCredStore = external ? undefined : deps.userModelCredentials;
-          const account = external
-            ? "company"
-            : (input.modelAccount ?? (await deps.config?.getModelAccountDurable(actor.id)) ?? "company");
+          const account = modelAccount;
           if (userCredStore && account === "shared-openai") {
             const derived = await userCredStore.sharedOAuth(actor.id);
             if (!derived?.idToken)
-              throw new NonRetryableTurnError("Shared Codex access is unavailable. Ask an administrator to restore your grant or reconnect the account.");
+              throw new NonRetryableTurnError(
+                "Shared Codex access is unavailable. Ask an administrator to restore your grant or reconnect the account.",
+              );
             const routing = resolveIndividualAuthRouting(
               null,
               { provider: "openai", kind: "oauth", oauth: {}, updatedAt: 0 },
@@ -3433,7 +3436,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
             });
             return { userProviderKeys, userModelOverride, userHarnessOverride, claudeOauthToken, codexTurnAuth };
           }
-          if (userCredStore && humanTurn && account !== "company") {
+          if (userCredStore && account !== "company") {
             const [anthCred, oaiCred] = await Promise.all([
               account === "openai" ? null : userCredStore.get(actor.id, "anthropic"),
               account === "anthropic" ? null : userCredStore.get(actor.id, "openai"),
@@ -3448,12 +3451,8 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
             const routing = resolveIndividualAuthRouting(
               anthCred ?? null,
               oaiCred ?? null,
-              account === "personal" || input.surface === "web"
-                ? (runtime.modelId ?? input.model ?? purposeDefault?.modelId)
-                : (runtime.modelId ?? purposeDefault?.modelId),
-              account === "personal" || input.surface === "web"
-                ? preferredHarness
-                : (runtime.harnessId ?? purposeDefault?.harnessId),
+              runtime.modelId ?? input.model ?? purposeDefault?.modelId,
+              preferredHarness,
             );
             if (routing?.kind === "apikey") {
               userHarnessOverride = "pi";
@@ -3501,13 +3500,16 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         };
         let { userProviderKeys, userModelOverride, userHarnessOverride, claudeOauthToken, codexTurnAuth } =
           await loadRuntimeAuth({});
+        const usingPersonalSubscription = () =>
+          modelAccount !== "shared-openai" &&
+          Boolean(claudeOauthToken || codexTurnAuth || userProviderKeys?.[CODEX_SUBSCRIPTION_PROVIDER]);
+        const expectedModel = input.model ?? (usingPersonalSubscription() ? undefined : purposeDefault?.modelId);
+        const expectedHarness = input.harness ?? (usingPersonalSubscription() ? undefined : purposeDefault?.harnessId);
         if (
-          (input.surface === "web" || purposeDefault) &&
+          (input.surface === "web" || purposeDefault || usingPersonalSubscription()) &&
           userHarnessOverride &&
-          (((input.model ?? purposeDefault?.modelId) &&
-            (input.model ?? purposeDefault?.modelId) !== userModelOverride) ||
-            ((input.harness ?? purposeDefault?.harnessId) &&
-              (input.harness ?? purposeDefault?.harnessId) !== userHarnessOverride))
+          ((expectedModel && expectedModel !== userModelOverride) ||
+            (expectedHarness && expectedHarness !== userHarnessOverride))
         )
           throw new NonRetryableTurnError("Your connected AI account cannot serve this model on that harness.");
         const effectiveModel = userModelOverride ?? input.model;
@@ -3571,6 +3573,8 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
               fastMode: input.fastMode,
             },
             runtimePurpose,
+            actor.id,
+            modelAccount,
           );
           if (error) throw new NonRetryableTurnError(error);
         }
@@ -3772,7 +3776,8 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
             },
             ...(userProviderKeys ? { providerKeys: userProviderKeys } : {}),
             ...(claudeOauthToken ? { claudeOauthToken } : {}),
-            ...(userHarnessOverride && !purposeDefault && !restoredRuntime && runtimeHandoffs === 0
+            ...(userHarnessOverride &&
+            (usingPersonalSubscription() || (!purposeDefault && !restoredRuntime && runtimeHandoffs === 0))
               ? { runtimePinned: true }
               : {}),
             runtimeActorId: actor.id,
@@ -3794,6 +3799,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                       automatedTurn && input.surface === "cron",
                       runtimePurpose,
                       runtimeDefaults,
+                      modelAccount,
                     ),
                 }
               : {}),

@@ -94,7 +94,13 @@ async function brokerSession(ctx: ApiCtx): Promise<void> {
   if (ctx.pathname.endsWith("/use")) {
     if (typeof b.token !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(b.token))
       return sendJson(res, 400, { error: "invalid_token" });
-    return sendJson(res, 200, { session: await deps.brokerSessions.use(b.token) });
+    const session = await deps.brokerSessions.use(b.token);
+    const account = session ? await deps.accounts?.get(session.email) : null;
+    const policy = await deps.accounts?.policy();
+    const valid =
+      !account ||
+      ((policy === "email" || !account.mustChangePassword) && account.version === (session?.credentialVersion ?? 0));
+    return sendJson(res, 200, { session: valid ? session : null });
   }
   if (typeof b.email !== "string" || b.email.length > 254 || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(b.email))
     return sendJson(res, 400, { error: "invalid_email" });
@@ -122,7 +128,10 @@ async function brokerSession(ctx: ApiCtx): Promise<void> {
     absoluteS > 90 * 86400
   )
     return sendJson(res, 400, { error: "invalid_lifetime" });
-  return sendJson(res, 200, await deps.brokerSessions.create(email, idleS, absoluteS));
+  const account = await deps.accounts?.get(email);
+  if (account?.mustChangePassword && (await deps.accounts?.policy()) !== "email")
+    return sendJson(res, 403, { error: "password_change_required" });
+  return sendJson(res, 200, await deps.brokerSessions.create(email, idleS, absoluteS, account?.version ?? 0));
 }
 
 async function trustedAdmin(ctx: ApiCtx): Promise<void> {
@@ -215,7 +224,27 @@ async function redeemInvitation(ctx: ApiCtx): Promise<void> {
     resource: claims.email,
     scopeLabel: orgScope(deps),
   });
-  return sendJson(res, 200, { email: claims.email });
+  const account = await deps.accounts?.get(claims.email);
+  const policy = (await deps.accounts?.policy()) ?? "email";
+  if (deps.accounts && policy !== "email" && account?.mustChangePassword) {
+    const token = await deps.accounts.issue({
+      email: claims.email,
+      kind: "change",
+      version: account.version,
+      inviteId: member.inviteId,
+    });
+    return sendJson(res, 200, { email: claims.email, token, passwordSetup: true, optional: false });
+  }
+  if (deps.accounts && policy !== "email" && !account) {
+    const token = await deps.accounts.issue({
+      email: claims.email,
+      kind: "setup",
+      version: 0,
+      inviteId: member.inviteId,
+    });
+    return sendJson(res, 200, { email: claims.email, token, passwordSetup: true, optional: policy === "both" });
+  }
+  return sendJson(res, 200, { email: claims.email, ...(deps.accounts ? { version: account?.version ?? 0 } : {}) });
 }
 
 export const authBrokerRoutes: ReadonlyArray<Route<ApiCtx>> = [

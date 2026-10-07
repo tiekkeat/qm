@@ -5871,7 +5871,12 @@
         }
       }
 
+      #view-data .users-layout .list-root {
+        grid-template-columns: minmax(0, 1fr);
+        min-width: 0;
+      }
       #view-data .users-layout section.card {
+        min-width: 0;
         margin: 0;
         padding: 24px 0;
         border: 0;
@@ -5912,7 +5917,10 @@
       #view-data .users-layout .users-roster > .head p {
         grid-column: 1;
       }
-      #view-data .users-layout .users-roster > .head button {
+      #view-data .users-layout .users-roster > .head .users-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
         grid-column: 2;
         grid-row: 1 / 3;
         align-self: start;

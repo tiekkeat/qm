@@ -185,6 +185,8 @@ export interface OrchestratorDeps {
     scope: import("../../types.ts").ScopeId,
     choice: import("../../harness/harness.ts").RuntimeChoice,
     purpose?: import("../../resolution/config-store.ts").RuntimePurpose,
+    actorId?: string,
+    account?: ModelAccount,
   ) => Promise<string | null>;
   livenessCache?: LivenessCache;
   connectorTokens?: ConnectorTokenStore;

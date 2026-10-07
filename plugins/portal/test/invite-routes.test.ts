@@ -27,10 +27,14 @@ const upstream = createServer((req, res) => {
     });
     const { token } = JSON.parse(body);
     if (token === "disconnected") return req.socket.destroy();
-    const statusByToken: Record<string, number> = { valid: 200, revoked: 403, unavailable: 503 };
+    const statusByToken: Record<string, number> = { valid: 200, onboarding: 200, revoked: 403, unavailable: 503 };
     res.statusCode = statusByToken[token] ?? 400;
     res.setHeader("content-type", "application/json");
-    res.end(JSON.stringify(token === "valid" ? { email: "teammate@example.test" } : { error: token }));
+    const payloads: Record<string, unknown> = {
+      valid: { email: "teammate@example.test" },
+      onboarding: { email: "teammate@example.test", passwordSetup: true, token: "setup-ticket", optional: true },
+    };
+    res.end(JSON.stringify(payloads[token] ?? { error: token }));
   })().catch((error) => {
     res.statusCode = 500;
     res.end(String(error));
@@ -163,4 +167,15 @@ test("invalid, revoked, and unavailable invitations fail without creating sessio
       status === 503 ? /temporarily unavailable/ : /expired, revoked, or already used/,
     );
   }
+});
+
+test("accepting a new invitation offers optional password setup without granting a session", async () => {
+  const response = await redeem("onboarding");
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("set-cookie"), null);
+  const html = await response.text();
+  assert.match(html, /Choose your password/);
+  assert.match(html, /Continue with email links/);
+  assert.match(html, /name="token" value="setup-ticket"/);
+  assert.match(html, /autocomplete="new-password"/);
 });

@@ -32,6 +32,8 @@ export interface SessionClaims {
   org: string;
   name?: string;
   auth?: number;
+  credentialVersion?: number;
+  passwordRecovery?: boolean;
   anon?: boolean;
   appOnly?: boolean;
   iat: number;

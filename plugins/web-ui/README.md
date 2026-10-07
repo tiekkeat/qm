@@ -352,7 +352,15 @@ Open **Settings → AI access**, or use the account label beside the model picke
 Choose Company, Claude, or ChatGPT / Codex. Sign in with your subscription
 or use the secondary API-key option; connecting automatically selects that account. **Company access** switches back without disconnecting
 personal credentials. The choice is durable per person and applies to their human
-chat turns on the web and in Slack; background tasks retain company access.
+chat turns on the web and in Slack. Personal subscription choices also follow queued
+and scheduled work; background work using personal API keys retains company access.
+
+Personal Claude Code and Codex subscriptions automatically expose compatible models
+from QM's supported catalog, independent of the organization's model picker and
+approved harnesses. Company accounts, shared Codex access, and personal API keys
+retain organization controls. Connecting or switching accounts refreshes the picker;
+an incompatible saved choice uses the selected subscription's default. Provider
+subscription entitlement errors are still reported when executing a model.
 
 A submitted turn keeps its account choice, so switching affects new turns. Personal
 access failures do not retry on company credentials. Messages using a different

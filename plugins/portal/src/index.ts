@@ -1,3 +1,6 @@
+import { AccountRequestError, coreAccounts, type LoginPolicy } from "../../chassis/src/accounts.ts";
+import { PASSWORD_SETUP_SCRIPT, PASSWORD_SETUP_SCRIPT_HASH } from "./password-setup.ts";
+import { validEmail } from "../../chassis/src/email.ts";
 import {
   DESKTOP_LAUNCH_SCRIPT,
   DESKTOP_LAUNCH_SCRIPT_HASH,
@@ -183,6 +186,7 @@ const BROKER_PUBLIC_ROUTES: ReadonlyArray<{ method: string; path: string }> = [
   { method: "POST", path: "/authorize" },
   { method: "GET", path: "/verify" },
   { method: "POST", path: "/verify" },
+  { method: "POST", path: "/password" },
 ];
 
 export function brokerRouteFor(method: string, pathname: string): string | null {
@@ -1035,6 +1039,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   if (pathname === "/auth/callback" && method === "GET") return authCallback(req, res, url);
   if (pathname.startsWith("/auth/trusted/") && method === "GET") return trustedAuth(req, res, url);
   if (pathname === "/auth/desktop" || pathname === "/auth/desktop/redeem") return desktopLogin(req, res, url);
+  if (pathname.startsWith("/auth/password")) return passwordPage(req, res, url);
   if (pathname === "/auth/invite") return inviteLogin(req, res);
   if (pathname === "/auth/admin-login") return adminLogin(req, res);
   if (pathname === "/auth/signed-out" && method === "GET") {
@@ -1128,6 +1133,22 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   }
 
   let session = renewSessionCookie(req, res) ?? currentSession(req);
+  if (session && validEmail(session.sub) && AUTH_BROKER_UPSTREAM) {
+    try {
+      const valid = await coreAccounts(CORE, CORE_SIGNING_SECRET).request<{ valid: boolean }>(
+        `/session?email=${encodeURIComponent(session.sub)}&version=${session.credentialVersion ?? 0}${session.passwordRecovery ? "&recovery=1" : ""}`,
+      );
+      if (!valid.valid) {
+        session = null;
+        setSession(res, [
+          clearCookie("portal_session", "/", SECURE_COOKIES, COOKIE_DOMAIN),
+          clearCookie("portal_session_x", "/", SECURE_COOKIES, COOKIE_DOMAIN),
+        ]);
+      }
+    } catch {
+      return identityUnavailable(req, res);
+    }
+  }
   const authenticatedPrincipal = session?.sub;
   if (session && !session.anon && (!pathname.startsWith("/auth/") || pathname.startsWith("/auth/impersonate"))) {
     const canonical = await canonicalPrincipal(session.sub);
@@ -1496,6 +1517,150 @@ async function desktopLogin(req: IncomingMessage, res: ServerResponse, url: URL)
   );
 }
 
+function sendPasswordPage(
+  res: ServerResponse,
+  o: {
+    token?: string;
+    email?: string;
+    optional?: boolean;
+    self?: boolean;
+    hasPassword?: boolean;
+    problem?: string;
+    status?: number;
+  },
+): void {
+  const fields = `<input type="hidden" name="optional" value="${o.optional ? "1" : "0"}"><input type="hidden" id="password-token" name="token" value="${escapeHtml(o.token ?? "")}">${o.self && o.hasPassword ? '<label for="current-password">Current password</label><input id="current-password" name="currentPassword" type="password" autocomplete="current-password" required>' : ""}<label for="new-password">New password</label><input id="new-password" name="password" type="password" minlength="12" maxlength="1024" autocomplete="new-password" required><label for="confirm-password">Confirm password</label><input id="confirm-password" name="confirmation" type="password" autocomplete="new-password" required>`;
+  const form = `<form method="post" action="${o.self ? "/auth/password" : "/auth/password/setup"}">${fields}<button class="btn primary" type="submit">Save password${o.self ? "" : " and continue"}</button>${o.optional ? '<button class="btn" name="skip" value="1" formnovalidate>Continue with email links</button>' : ""}</form>`;
+  const css =
+    "<style>label{display:block;margin:18px 0 8px;text-align:left}input[type=password],input[type=email]{box-sizing:border-box;width:100%;padding:12px;font:inherit;border:1px solid var(--border);border-radius:8px;background:var(--surface);color:var(--text)}form button{margin-top:20px;width:100%}</style>";
+  sendHtml(
+    res,
+    o.status ?? 200,
+    cardPage({
+      title: "Your password",
+      heading: o.self ? "Your password" : "Choose your password",
+      icon: LOCK_ICON,
+      msg:
+        o.problem ??
+        (o.email
+          ? `Set a password for ${o.email}. Use at least 12 characters.`
+          : "Use at least 12 characters. Your link works once and expires after 15 minutes."),
+      actions:
+        css + form + (o.self ? '<p><a href="/">Back to QM</a></p>' : `<script>${PASSWORD_SETUP_SCRIPT}</script>`),
+      help: "",
+    }),
+    o.self ? PAGE_CSP : `${PAGE_CSP}; script-src '${PASSWORD_SETUP_SCRIPT_HASH}'`,
+  );
+}
+async function passwordPage(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  if (!CORE_SIGNING_SECRET || !SESSION_SECRET) return json(res, 503, { error: "not_configured" });
+  const client = coreAccounts(CORE, CORE_SIGNING_SECRET);
+  const setup = url.pathname === "/auth/password/setup";
+  const reset = url.pathname === "/auth/password/reset";
+  if (!setup && !reset && url.pathname !== "/auth/password") return json(res, 404, { error: "not_found" });
+  if (req.method !== "GET" && req.method !== "POST") return json(res, 405, { error: "method_not_allowed" });
+  if (req.method === "POST" && !sameOriginRequest(req)) return json(res, 403, { error: "forbidden" });
+  if (reset) {
+    if (req.method === "GET")
+      return sendHtml(
+        res,
+        200,
+        cardPage({
+          title: "Reset password",
+          heading: "Forgot your password?",
+          icon: LOCK_ICON,
+          msg: "Enter your email address to request a password-reset link.",
+          actions:
+            '<form method="post" action="/auth/password/reset"><label for="email">Email address</label><input id="email" name="email" type="email" autocomplete="email" required><button class="btn primary">Send reset link</button></form>',
+          help: "",
+        }),
+      );
+    const form = new URLSearchParams(await readBody(req, 8192));
+    const email = String(form.get("email") ?? "")
+      .trim()
+      .toLowerCase();
+    if (!validEmail(email)) return sendHtml(res, 400, signInErrorHtml("Enter a valid email address."));
+    const claims = coreClaimStore(CORE, CORE_SIGNING_SECRET, "portal");
+    const nowMs = Date.now();
+    for (const [kind, value, limit] of [
+      ["password-reset-ip", clientIpOf(req), 20],
+      ["password-reset-email", email, 5],
+    ] as const) {
+      if (!(await withinRateLimit(claims, { secret: SESSION_SECRET, kind, value, limit, windowS: 900, nowMs })))
+        return sendHtml(res, 429, signInErrorHtml("Too many requests. Try again later."));
+    }
+    await client.request("/reset", { email });
+    return sendHtml(
+      res,
+      200,
+      cardPage({
+        title: "Check your email",
+        heading: "Check your email",
+        icon: LOCK_ICON,
+        msg: "If your account can reset passwords, you will receive a single-use link. If it does not arrive, contact your administrator.",
+        actions: '<a class="btn" href="/auth/login">Back to sign in</a>',
+        help: "",
+      }),
+    );
+  }
+  if (setup && req.method === "GET") return sendPasswordPage(res, {});
+  const session = setup ? null : currentSession(req);
+  if (!setup && (!session || !validEmail(session.sub)))
+    return sendHtml(res, 401, signInErrorHtml("Sign in with your email account to manage its password."));
+  const headers: Record<string, string> = {};
+  if (session) {
+    const valid = await client.request<{ valid: boolean }>(
+      `/session?email=${encodeURIComponent(session.sub)}&version=${session.credentialVersion ?? 0}${session.passwordRecovery ? "&recovery=1" : ""}`,
+    );
+    if (!valid.valid) return sendHtml(res, 401, signInErrorHtml("Your session expired. Sign in again."));
+    headers[PORTAL_IDENTITY_HEADER] = mintPortalIdentity(
+      { p: session.sub, exp: Date.now() + 60_000 },
+      PORTAL_IDENTITY_SECRET!,
+    );
+  }
+  const info = session
+    ? await client.request<{ email: string; hasPassword: boolean; policy: LoginPolicy }>("/self", undefined, headers)
+    : null;
+  if (info?.policy === "email")
+    return sendHtml(res, 403, signInErrorHtml("Password sign-in is disabled by your administrator."));
+  if (req.method === "GET")
+    return sendPasswordPage(res, { self: true, email: session!.sub, hasPassword: info!.hasPassword });
+  const form = new URLSearchParams(await readBody(req, 8192));
+  const token = form.get("token") ?? "";
+  const skip = form.get("skip") === "1";
+  const password = form.get("password") ?? "";
+  if (!skip && password !== form.get("confirmation"))
+    return sendPasswordPage(res, {
+      self: !setup,
+      optional: form.get("optional") === "1",
+      hasPassword: info?.hasPassword,
+      token,
+      status: 400,
+      problem: "Passwords do not match.",
+    });
+  try {
+    const result = await client.request<{ email: string; version: number }>(
+      setup ? "/complete" : "/self",
+      { token, password, skip, currentPassword: form.get("currentPassword") ?? "" },
+      headers,
+    );
+    setAuthenticatedSession(res, result.email, "", false, result.version);
+    res.writeHead(303, { location: "/", "cache-control": "no-store" });
+    return void res.end();
+  } catch (e) {
+    if (e instanceof AccountRequestError && e.status < 500)
+      return sendPasswordPage(res, {
+        self: !setup,
+        optional: form.get("optional") === "1",
+        hasPassword: info?.hasPassword,
+        token,
+        status: e.status,
+        problem: e.message,
+      });
+    throw e;
+  }
+}
+
 async function inviteLogin(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (!SESSION_SECRET || !CORE_SIGNING_SECRET) return json(res, 503, { error: "not_configured" });
   if (req.method === "GET")
@@ -1542,8 +1707,16 @@ async function inviteLogin(req: IncomingMessage, res: ServerResponse): Promise<v
             : "This invitation is expired, revoked, or already used. Ask your administrator for a new one.",
         ),
       );
-    const data = (await r.json()) as { email: string };
-    setAuthenticatedSession(res, data.email);
+    const data = (await r.json()) as {
+      email: string;
+      version?: number;
+      passwordSetup?: boolean;
+      token?: string;
+      optional?: boolean;
+    };
+    if (data.passwordSetup && data.token)
+      return sendPasswordPage(res, { token: data.token, email: data.email, optional: data.optional });
+    setAuthenticatedSession(res, data.email, "", false, data.version);
     res.writeHead(303, { location: "/", "cache-control": "no-store" });
     res.end();
   } catch {
@@ -1601,7 +1774,18 @@ async function adminLogin(req: IncomingMessage, res: ServerResponse): Promise<vo
     }
     throw error;
   }
-  setAuthenticatedSession(res, claims.email);
+  let version = 0;
+  if (AUTH_BROKER_UPSTREAM) {
+    try {
+      const result = await coreAccounts(CORE, CORE_SIGNING_SECRET).request<{ version: number }>(
+        `/session?email=${encodeURIComponent(claims.email)}&recovery=1`,
+      );
+      version = result.version;
+    } catch {
+      return sendHtml(res, 503, signInErrorHtml("Admin access could not be checked. Please try again."));
+    }
+  }
+  setAuthenticatedSession(res, claims.email, "", false, version, true);
   res.writeHead(303, { location: "/admin/", "cache-control": "no-store" });
   res.end();
 }
@@ -1661,13 +1845,22 @@ async function trustedAuth(req: IncomingMessage, res: ServerResponse, url: URL):
   }
 }
 
-function setAuthenticatedSession(res: ServerResponse, sub: string, name = "", appOnly = false): void {
+function setAuthenticatedSession(
+  res: ServerResponse,
+  sub: string,
+  name = "",
+  appOnly = false,
+  credentialVersion = 0,
+  passwordRecovery = false,
+): void {
   const now = Math.floor(Date.now() / 1000);
   const session: SessionClaims = {
     k: "session",
     sub,
     org: ORG,
     auth: now,
+    credentialVersion,
+    ...(passwordRecovery ? { passwordRecovery: true } : {}),
     iat: now,
     exp: now + SESSION_TTL_S,
     ...(name ? { name } : {}),
@@ -1737,9 +1930,11 @@ async function authCallback(req: IncomingMessage, res: ServerResponse, url: URL)
 
   let principal: { sub: string; appOnly?: true };
   let name = "";
+  let credentialVersion: number;
   try {
     const { accessToken, idToken } = await exchangeCode(OIDC, { code, codeVerifier: tmp.pkceVerifier });
     const claims = await verifyIdToken(OIDC, idToken, tmp.nonce);
+    credentialVersion = Number(claims.qm_credential_version ?? 0);
     if (OIDC.expectedTeamId) {
       const team = claims["https://slack.com/team_id"];
       if (team !== OIDC.expectedTeamId) throw new Error("workspace not permitted");
@@ -1757,7 +1952,7 @@ async function authCallback(req: IncomingMessage, res: ServerResponse, url: URL)
     return fail(errMessage(e, "sign-in failed"));
   }
 
-  setAuthenticatedSession(res, principal.sub, name, principal.appOnly);
+  setAuthenticatedSession(res, principal.sub, name, principal.appOnly, credentialVersion);
   res.writeHead(302, {
     location: sanitizeReturnTo(tmp.returnTo, PUBLIC_URL, APPS_DOMAIN),
     "cache-control": "no-store",

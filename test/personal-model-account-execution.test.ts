@@ -2,6 +2,8 @@ import "./support/auto-fake-sprites.ts";
 import assert from "node:assert/strict";
 import { mock, test } from "node:test";
 import * as piHarness from "../src/harness/pi-harness.ts";
+import * as claudeHarness from "../src/harness/claude-harness.ts";
+import * as codexHarness from "../src/harness/codex-harness.ts";
 import * as mockHarness from "../src/harness/mock-harness.ts";
 import type { HarnessTurnInput } from "../src/harness/harness.ts";
 import { resolveModel } from "../src/model/pi-models.ts";
@@ -23,6 +25,12 @@ mock.module("../src/harness/pi-harness.ts", {
 });
 mock.module("../src/harness/mock-harness.ts", {
   namedExports: { ...mockHarness, createMockHarness: observedHarness },
+});
+mock.module("../src/harness/claude-harness.ts", {
+  namedExports: { ...claudeHarness, createClaudeHarness: observedHarness },
+});
+mock.module("../src/harness/codex-harness.ts", {
+  namedExports: { ...codexHarness, createCodexHarness: observedHarness },
 });
 const { buildApp } = await import("../src/wiring.ts");
 
@@ -262,3 +270,63 @@ test("partial personal web choices queue the complete validated scoped runtime",
   assert.equal(oauth?.request.harness, "codex");
   assert.equal(oauth?.request.model, "gpt-5.6-terra");
 });
+
+for (const provider of ["anthropic", "openai"] as const) {
+  for (const scheduled of [false, true]) {
+    test(`personal ${provider} subscription executes ${scheduled ? "scheduled" : "web"} work despite organization restrictions`, async () => {
+      turns.length = 0;
+      const built = buildApp(testConfig());
+      built.config.setApprovedHarnesses(["pi"]);
+      built.config.setWebuiModels("org:default-org", [provider === "anthropic" ? "gpt-6-sol" : "claude-opus-5"]);
+      await built.config.flushScope("org:default-org");
+      if (scheduled)
+        await built.config.setPurposeRuntime("cron", {
+          harnessId: "pi",
+          modelId: provider === "anthropic" ? "gpt-6-sol" : "claude-opus-5",
+          effortLevel: "low",
+          fastMode: false,
+        });
+      const jwtPart = (v: unknown) => Buffer.from(JSON.stringify(v)).toString("base64url");
+      await built.userModelCredentials.setOAuth("U1", provider, {
+        accessToken: "personal-subscription-access",
+        refreshToken: "personal-subscription-refresh",
+        expiresAt: Date.now() + 3_600_000,
+        idToken: `${jwtPart({ alg: "RS256" })}.${jwtPart({ "https://api.openai.com/auth": { chatgpt_account_id: "personal-test" } })}.sig`,
+      });
+      await built.config.setPersonalModelAuth("U1", true, provider);
+      const harness = provider === "anthropic" ? "claude" : "codex";
+      const model = provider === "anthropic" ? "claude-sonnet-5" : "gpt-6-sol";
+      const submitted = await built.app.turn({
+        surface: scheduled ? "cron" : "web",
+        actor: { externalId: "U1" },
+        conversation: { kind: "dm", threadRef: `${scheduled ? "cron" : "web:U1"}:independent-${provider}` },
+        text: "hello",
+        liveActor: !scheduled,
+        triggered: scheduled,
+        async: true,
+        harness,
+        model,
+        thinkingLevel: "high",
+        fastMode: false,
+      });
+      assert.ok(submitted.runId, JSON.stringify(submitted));
+      const queued = await built.runs.get(submitted.runId!);
+      assert.equal(queued?.request.modelAccount, provider);
+      assert.equal(queued?.request.model, model);
+      assert.equal(queued?.request.harness, harness);
+      await built.config.setPersonalModelAuth("U1", false);
+      built.runtime.start();
+      try {
+        const finished = await built.runs.waitFor(submitted.runId!, 5000);
+        assert.equal(finished.status, "done", JSON.stringify(finished.result));
+        assert.equal(turns.length, 1);
+        assert.equal(turns[0]!.runtime!.harnessId, harness);
+        assert.equal(turns[0]!.runtime!.modelId, model);
+        if (provider === "anthropic") assert.equal(turns[0]!.claudeOauthToken, "personal-subscription-access");
+        else assert.equal(turns[0]!.codexAuth?.accessToken, "personal-subscription-access");
+      } finally {
+        await built.runtime.stop();
+      }
+    });
+  }
+}

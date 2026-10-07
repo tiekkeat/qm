@@ -3,6 +3,7 @@ import { signedHeaders, withSourceAuthNonce } from "../../chassis/src/core-clien
 export interface RememberedSession {
   email: string;
   authTime: number;
+  credentialVersion?: number;
   expiresAtMs: number;
 }
 

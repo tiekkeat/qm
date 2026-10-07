@@ -14,6 +14,7 @@ import { scopeId } from "../src/types.ts";
 import { isUnclassifiedWrite } from "../src/api/user-scoped-routes.ts";
 import { signedHeaders } from "../plugins/chassis/src/core-client.ts";
 import { authBrokerRoutes } from "../src/api/routes/auth-broker.ts";
+import { accountRoutes } from "../src/api/routes/accounts.ts";
 
 const SOURCE = "shared-source-auth-secret-for-tests-0001";
 const CAP = "core-only-capability-secret-for-tests-01";
@@ -396,7 +397,7 @@ describe("user-scoped routes require a portal-verified actor when enforcement is
 
 describe("service-to-service writes are classified", () => {
   it("every auth:source write route is classified, so production gating cannot demand a portal identity from a plugin", () => {
-    const unclassified = authBrokerRoutes
+    const unclassified = [...authBrokerRoutes, ...accountRoutes]
       .filter((route) => "path" in route && route.auth === "source")
       .map((route) => route as { method: string; path: string })
       .filter((route) => isUnclassifiedWrite(route.method, route.path))

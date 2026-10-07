@@ -339,9 +339,9 @@ function acceptAiStatus(status: StatusResponse): void {
   aiStatus = status;
   if (appState.me) {
     appState.me.individualModelAuth = status.individualModelAuth;
-    appState.me.modelAuthConnected = status.connections.some(
-      (c) => status.account === "personal" || status.account === c.provider,
-    ) || (status.account === "shared-openai" && status.sharedAvailable === true);
+    appState.me.modelAuthConnected =
+      status.connections.some((c) => status.account === "personal" || status.account === c.provider) ||
+      (status.account === "shared-openai" && status.sharedAvailable === true);
   }
   drawSettings();
 }
@@ -378,7 +378,11 @@ async function chooseAiAccount(account: "company" | "anthropic" | "openai" | "sh
     (account === "company" || account === "shared-openai" || aiStatus.connections.some((c) => c.provider === account))
   )
     return;
-  if (account !== "company" && account !== "shared-openai" && !aiStatus?.connections.some((c) => c.provider === account)) {
+  if (
+    account !== "company" &&
+    account !== "shared-openai" &&
+    !aiStatus?.connections.some((c) => c.provider === account)
+  ) {
     openModelConnectManager(account);
     return;
   }
@@ -407,7 +411,9 @@ function aiAccountsRow(): TemplateResult {
     <div class="settings-row">
       <div class="settings-row-copy">
         <div class="settings-row-title">AI access</div>
-        <div class="settings-row-note">Use company access, a granted shared Codex account, or your own subscription.</div>
+        <div class="settings-row-note">
+          Use company access, a granted shared Codex account, or your own subscription.
+        </div>
         ${aiError ? html`<div class="settings-row-error" role="alert">${aiError} <button class="settings-theme-link" ?disabled=${aiSaving} @click=${loadAiStatus}>Retry</button></div>` : nothing}
       </div>
       <div class="settings-ai-controls">
@@ -415,7 +421,7 @@ function aiAccountsRow(): TemplateResult {
           ${(
             [
               ["company", "Company"],
-              ...(aiStatus?.sharedAvailable ? [["shared-openai", "Shared Codex"]] as const : []),
+              ...(aiStatus?.sharedAvailable ? ([["shared-openai", "Shared Codex"]] as const) : []),
               ["anthropic", "Claude"],
               ["openai", "ChatGPT / Codex"],
             ] as const
@@ -477,6 +483,7 @@ function accountRow(): TemplateResult {
           ${me?.displayName?.trim() || me?.user || "Not signed in"}${me?.org ? ` · ${me.org}` : ""}
         </div>
       </div>
+      <a class="btn settings-row-action" href="/auth/password">Password</a>
       <button class="btn settings-row-action" type="button" @click=${() => void signOut()}>
         ${icon(LogOut, 15)}<span>Sign out</span>
       </button>

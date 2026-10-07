@@ -1,3 +1,4 @@
+import type { AccountStore } from "../auth/accounts.ts";
 import type { ExternalSlackPolicies } from "../resolution/external-slack.ts";
 import type { ProviderKeys } from "../harness/pi-harness.ts";
 import type { ModelGatewayTransportConfig } from "../model/provider-endpoints.ts";
@@ -100,6 +101,7 @@ export interface ServerDeps {
   replayDedupe?: ReplayDedupe;
   deploymentLiveSmoke?: () => Promise<void>;
   brokerSessions?: BrokerSessionStore;
+  accounts?: AccountStore;
   connectorTokens?: ConnectorTokenStore;
   managedSlack?: ManagedSlack;
   slackInstallation?: SlackInstallationStore;

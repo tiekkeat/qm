@@ -5,6 +5,8 @@ export const FRAME_SESSION_COOKIE = "portal_session_x";
 export interface PortalViewerSession {
   sub: string;
   appOnly: boolean;
+  credentialVersion?: number;
+  passwordRecovery?: boolean;
 }
 
 export function portalSession(
@@ -48,7 +50,12 @@ function verifySessionToken(token: string, secret: string, now: number): PortalV
   if (typeof claims.sub !== "string" || !claims.sub) return null;
   if (typeof claims.exp !== "number" || now >= claims.exp * 1000) return null;
   if (claims.appOnly !== undefined && typeof claims.appOnly !== "boolean") return null;
-  return { sub: claims.sub, appOnly: claims.appOnly === true };
+  return {
+    sub: claims.sub,
+    appOnly: claims.appOnly === true,
+    ...(claims.passwordRecovery === true ? { passwordRecovery: true } : {}),
+    ...(typeof claims.credentialVersion === "number" ? { credentialVersion: claims.credentialVersion } : {}),
+  };
 }
 
 function readCookies(header: string | undefined, name: string): string[] {

@@ -1,5 +1,6 @@
+import { createPostgresAccounts, type AccountStore } from "./auth/accounts.ts";
 import type { SlackSessionStatusState } from "./slack/session-status.ts";
-import { availableRuntimeError } from "./api/runtime-config.ts";
+import { userRuntimeConfigBody, availableRuntimeError } from "./api/runtime-config.ts";
 import { createApprovalStore } from "./core/approval-store.ts";
 import { createKeychainApprovals, type KeychainApprovals } from "./credentials/keychain-approval.ts";
 import { asObject } from "./harness/codex-auth-file.ts";
@@ -78,7 +79,7 @@ import {
 import type { SlackAccountLink, ComposioReturn } from "./api/routes/composio.ts";
 import { installPrincipalLinks } from "./directory/person.ts";
 import type { ExternalMember } from "./identity/external-members.ts";
-import { createResendMailer } from "./admin/invite-email.ts";
+import { createInviteMailer } from "./admin/invite-email.ts";
 import {
   createMemoryConfigStore,
   type ScopedConfigStore,
@@ -545,6 +546,7 @@ export interface BuiltApp {
   featureFlags: FeatureFlagStore;
   replayDedupe?: ReplayDedupe;
   brokerSessions?: BrokerSessionStore;
+  accounts?: AccountStore;
   directory: DirectoryStore;
   projects: ProjectStore;
   environments: EnvironmentStore;
@@ -1570,6 +1572,7 @@ export function buildApp(
     processes = config.databaseUrl ? createPostgresProcessRegistry(config.databaseUrl) : createMemoryProcessRegistry();
   }
 
+  const accounts = config.databaseUrl ? createPostgresAccounts(config.databaseUrl, config.orgId) : undefined;
   const brokerSessions = config.databaseUrl ? createPostgresBrokerSessions(config.databaseUrl) : undefined;
   const replayDedupe = config.databaseUrl ? createPostgresReplayDedupe(config.databaseUrl) : createMemoryReplayDedupe();
   const metrics = config.databaseUrl ? createPostgresMetricsSink(config.databaseUrl) : createMetricsSink();
@@ -1893,7 +1896,41 @@ export function buildApp(
       list: (actorId) => app.listSessions(actorId),
       start: (actorId, input) => startSession(app, sessions, actorId, input),
     },
-    async validateRuntime(input, scope) {
+    async validateRuntime(input, scope, actorId, account) {
+      const modelAccount = account ?? (await configStore.getModelAccountDurable(actorId));
+      if (modelAccount !== "company") {
+        const ctx = {
+          deps: {
+            config: configStore,
+            userModelCredentials,
+            providerKeys: providerKeysPresent(config),
+            modelCredentials,
+            harnessId: fallbackHarness,
+            baseModelDefault: fallback.modelId,
+          },
+        };
+        const snapshot = await userRuntimeConfigBody(ctx, scope, actorId, {
+          account: modelAccount,
+          purpose: "subagent",
+        });
+        const error = await availableRuntimeError(
+          ctx,
+          scope,
+          {
+            ...snapshot.effective,
+            ...(input.harness ? { harnessId: input.harness as HarnessId } : {}),
+            ...(input.model ? { modelId: input.model } : {}),
+            ...(input.thinkingLevel ? { effortLevel: input.thinkingLevel } : {}),
+            ...(typeof input.fastMode === "boolean" ? { fastMode: input.fastMode } : {}),
+          },
+          "subagent",
+          actorId,
+          modelAccount,
+        );
+        if (error) throw new Error(error);
+        return;
+      }
+
       await resolveRuntimeChoiceDurable(
         configStore,
         runtimeOrgScope,
@@ -1910,6 +1947,7 @@ export function buildApp(
       );
     },
   });
+  const inviteMailer = createInviteMailer(config.emailDelivery);
   const orchestratorDeps: OrchestratorDeps = {
     externalSlackPolicies: config.externalSlackPolicies,
     sessionSyscalls,
@@ -1955,9 +1993,7 @@ export function buildApp(
     ...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
     ...(config.publicWebUrl ? { publicWebUrl: config.publicWebUrl } : {}),
     ...(config.deployAppsDomain ? { deployAppsDomain: config.deployAppsDomain } : {}),
-    ...(config.resendApiKey && config.emailFrom
-      ? { inviteMailer: createResendMailer(config.resendApiKey, config.emailFrom) }
-      : {}),
+    ...(inviteMailer ? { inviteMailer } : {}),
     ...(config.publicUrl ? { webhookPublicUrl: config.publicUrl } : {}),
     memoryPolicy: { recall: config.memoryRecall, capture: config.memoryCapture },
     memoryStrategy,
@@ -2495,7 +2531,7 @@ export function buildApp(
   );
   cronChanged.notify = (id) => scheduler.notifyChanged(id);
   orchestratorDeps.control = createControlService(app, scheduler, admin);
-  orchestratorDeps.validateScheduledRuntime = (scope, choice, purpose) =>
+  orchestratorDeps.validateScheduledRuntime = (scope, choice, purpose, actorId, account) =>
     availableRuntimeError(
       {
         deps: {
@@ -2506,11 +2542,14 @@ export function buildApp(
           modelCredentials,
           modelCredentialFetch: overrides.modelCredentialFetch,
           refreshModels,
+          userModelCredentials,
         },
       },
       scope,
       choice,
       purpose,
+      actorId,
+      account,
     );
   orchestratorDeps.runtime = createRuntimeService(
     {
@@ -2523,6 +2562,7 @@ export function buildApp(
       modelCredentials,
       modelCredentialFetch: overrides.modelCredentialFetch,
       refreshModels,
+      userModelCredentials,
     },
     app,
   );
@@ -2867,6 +2907,7 @@ export function buildApp(
     featureFlags,
     ...(replayDedupe ? { replayDedupe } : {}),
     ...(brokerSessions ? { brokerSessions } : {}),
+    ...(accounts ? { accounts } : {}),
     directory,
     projects,
     environments,
@@ -2905,6 +2946,7 @@ export function serverDeps(
 ): Omit<ServerDeps, "control"> {
   const configuredModel = configuredModelForHarness(config, config.harness);
   const carriedModelAuth = harnessCarriedModelAuth(config);
+  const inviteMailer = createInviteMailer(config.emailDelivery);
   return {
     externalSlackPolicies: config.externalSlackPolicies,
     browserModelGateway: built.browserModelGateway,
@@ -2926,6 +2968,7 @@ export function serverDeps(
     ...(config.requireSignedPortalIdentity ? { requireSignedPortalIdentity: true } : {}),
     ...(built.replayDedupe ? { replayDedupe: built.replayDedupe } : {}),
     ...(built.brokerSessions ? { brokerSessions: built.brokerSessions } : {}),
+    ...(built.accounts ? { accounts: built.accounts } : {}),
     config: built.config,
     ...(built.screenSecurity ? { screenSecurity: built.screenSecurity } : {}),
     ...(configuredModel ? { baseModelDefault: configuredModel } : {}),
@@ -2960,9 +3003,7 @@ export function serverDeps(
     ...(config.emailAuthPrincipals ? { emailAuthPrincipals: config.emailAuthPrincipals } : {}),
     ...(config.emailAuthDomain ? { emailAuthDomain: config.emailAuthDomain } : {}),
     ...(config.slack ? { slackAllowFrom: config.slack.allowFrom ?? [] } : {}),
-    ...(config.resendApiKey && config.emailFrom
-      ? { inviteMailer: createResendMailer(config.resendApiKey, config.emailFrom) }
-      : {}),
+    ...(inviteMailer ? { inviteMailer } : {}),
     rateLimiter: built.rateLimiter,
     acl: built.acl,
     credentialUsage: built.credentialUsage,

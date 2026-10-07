@@ -20,7 +20,7 @@ expiration date. Teammates appear in Users before their
 first session. Addresses already admitted through the domain or allow-list may receive a
 sign-in invitation too. Re-inviting an admin never removes their admin role.
 Invitations are durable and listed with their access status. Revoke ends access immediately.
-Invitation email uses Resend when configured. Teammate invitations contain a single-use sign-in link valid for 24 hours. If delivery is unavailable or fails, Admin shows the same link with a copy control after the invitation is created. Redemption checks current membership and claims the token through durable storage; revocation or a new invitation invalidates earlier links. Company access displays the web email domain and the local Slack allow-list; these are deployment settings, not editable Admin policy.
+Invitation email uses the selected Resend or SMTP transport when configured. Teammate invitations contain a single-use sign-in link valid for 24 hours. If delivery is unavailable or fails, Admin shows the same link with a copy control after the invitation is created. Redemption checks current membership and claims the token through durable storage; revocation or a new invitation invalidates earlier links. Company access displays the web email domain and the local Slack allow-list; these are deployment settings, not editable Admin policy.
 The existing external-user API still requires an expiry and rejects org members.
 Teammate invitations and revocations are restricted to the Admin surface.
 (`org_admin` is the only supported role for now; `team_admin` was removed — team-scoped admin
@@ -92,3 +92,32 @@ Hosted Add to Slack is shown only when core reports `installAvailable`, enabled 
 without that service lead with the preconfigured Slack app manifest and token form.
 Connected hosted apps offer Re-add to Slack; custom apps must be disconnected before
 switching to the hosted app. Both paths retain the custom app setup instructions.
+
+## Invitation email configuration
+
+Core reads `AUTH_EMAIL_TRANSPORT` (`resend` by default, or `smtp`) and `AUTH_EMAIL_FROM`.
+Resend needs `RESEND_API_KEY`; SMTP needs `SMTP_HOST`, `SMTP_USERNAME`, and `SMTP_PASSWORD`.
+`SMTP_PORT` defaults to 587 with STARTTLS; port 465 defaults to implicit TLS.
+Deployments inherit the auth service's transport, port, and TLS settings unless core overrides them.
+Both services may have credentials, but only the selected transport sends invitations.
+Missing credentials or a failed send leave the invitation active and show a copyable link.
+There is no automatic retry through another provider.
+
+For Gmail, use `smtp.gmail.com`, your full Gmail address as the username and sender,
+and a Google app password as the SMTP password. Keep credentials in the deployment's ignored `.env`.
+
+## Password accounts
+
+In **Users**, org admins can **Create user** with an email, role and temporary
+password, or **Reset password** for an existing teammate. The teammate replaces
+the temporary password before receiving a normal login session. Creating a user
+manually does not send email; share the temporary credential separately.
+
+**Sign-in methods** chooses Both (the default), Password only, or Email link only.
+Password only requires your own permanent password first; use **Manage my password**.
+Invitations require password setup with Password only, allow it to be skipped with
+Both, and sign in directly with Email link only. Forgot-password emails use the same
+SMTP or Resend configuration as invitations; without delivery, use an admin reset.
+Passwords and policy are stored in Postgres, survive restarts, and are enforced by
+core. Only password status is returned to this UI. Changing or resetting a password
+revokes existing sessions.

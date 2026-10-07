@@ -1,6 +1,6 @@
-import type { RuntimePurpose } from "../resolution/config-store.ts";
+import type { ModelAccount, RuntimePurpose } from "../resolution/config-store.ts";
 import { resolveRuntimeChoiceDurable } from "../harness/harness-router.ts";
-import { resolveIndividualAuthRouting } from "../core/individual-auth-routing.ts";
+import { personalSubscriptionHarnesses, resolveIndividualAuthRouting } from "../core/individual-auth-routing.ts";
 import { gatewayModelCatalog } from "../model/gateway-models.ts";
 import type { AppDeps } from "./app-types.ts";
 import type { ScopeId } from "../types.ts";
@@ -48,20 +48,32 @@ export function runtimeFallback(ctx: { deps: RuntimeDeps }): { harnessId: Harnes
   return { harnessId, modelId: ctx.deps.baseModelDefault ?? defaultModelForHarness(harnessId, undefined, providers) };
 }
 
-export async function userRuntimeConfigBody(ctx: { deps: RuntimeDeps }, scope: ScopeId, actorId: string) {
-  const account = await ctx.deps.config?.getModelAccountDurable(actorId);
+export async function userRuntimeConfigBody(
+  ctx: { deps: RuntimeDeps },
+  scope: ScopeId,
+  actorId: string,
+  options: { account?: ModelAccount; purpose?: RuntimePurpose; requested?: Partial<RuntimeChoice> } = {},
+) {
+  const account = options.account ?? (await ctx.deps.config?.getModelAccountDurable(actorId));
   const store = ctx.deps.userModelCredentials;
-  if (!store || !account || account === "company") return runtimeConfigBody(ctx, scope);
+  if (!store || !account || account === "company")
+    return runtimeConfigBody(ctx, scope, undefined, options.purpose, options.requested);
   if (account === "shared-openai") {
     const shared = await store.sharedStatus();
     const available = (await store.hasSharedGrant(actorId)) && shared.connected && !shared.needsReconnect;
-    const credential = available
-      ? ({ provider: "openai", kind: "oauth", oauth: {}, updatedAt: 0 } as const)
-      : null;
-    const snapshot = await runtimeConfigBody(ctx, scope, async (choice) => {
-      const route = resolveIndividualAuthRouting(null, credential, choice.modelId, "codex");
-      return route?.harness === choice.harnessId && route.model === choice.modelId ? null : "account_runtime_unavailable";
-    });
+    const credential = available ? ({ provider: "openai", kind: "oauth", oauth: {}, updatedAt: 0 } as const) : null;
+    const snapshot = await runtimeConfigBody(
+      ctx,
+      scope,
+      async (choice) => {
+        const route = resolveIndividualAuthRouting(null, credential, choice.modelId, "codex");
+        return route?.harness === choice.harnessId && route.model === choice.modelId
+          ? null
+          : "account_runtime_unavailable";
+      },
+      options.purpose,
+      options.requested,
+    );
     const route = resolveIndividualAuthRouting(null, credential, snapshot.effective.modelId, "codex");
     return route?.model && snapshot.modelsByHarness[route.harness]?.includes(route.model)
       ? { ...snapshot, effective: { ...snapshot.effective, harnessId: route.harness, modelId: route.model } }
@@ -71,10 +83,26 @@ export async function userRuntimeConfigBody(ctx: { deps: RuntimeDeps }, scope: S
     account === "openai" ? null : store.get(actorId, "anthropic"),
     account === "anthropic" ? null : store.get(actorId, "openai"),
   ]);
-  const snapshot = await runtimeConfigBody(ctx, scope, async (choice) => {
-    const route = resolveIndividualAuthRouting(anthropic, openai, choice.modelId, choice.harnessId);
-    return route?.harness === choice.harnessId && route.model === choice.modelId ? null : "account_runtime_unavailable";
-  });
+  const subscriptionHarnesses = personalSubscriptionHarnesses(anthropic, openai);
+  const approved = (await ctx.deps.config!.getApprovedHarnessesDurable()) ?? [runtimeFallback(ctx).harnessId];
+  const snapshot = await runtimeConfigBody(
+    ctx,
+    scope,
+    async (choice) => {
+      const route = resolveIndividualAuthRouting(anthropic, openai, choice.modelId, choice.harnessId);
+      if (route?.harness !== choice.harnessId || route.model !== choice.modelId) return "account_runtime_unavailable";
+      if (
+        route.kind === "apikey" &&
+        subscriptionHarnesses.length > 0 &&
+        (!approved.includes(choice.harnessId) || !(await webuiModelEnabled(ctx, choice.modelId)))
+      )
+        return "account_runtime_unavailable";
+      return null;
+    },
+    options.purpose,
+    options.requested,
+    subscriptionHarnesses,
+  );
   const route = resolveIndividualAuthRouting(
     anthropic,
     openai,
@@ -108,6 +136,7 @@ export async function runtimeConfigBody(
   authorizeChoice?: (choice: RuntimeChoice) => Promise<string | null>,
   purpose?: RuntimePurpose,
   requested?: Partial<RuntimeChoice>,
+  subscriptionHarnesses: readonly HarnessId[] = [],
 ) {
   if (authorizeChoice)
     ctx = { deps: { ...ctx.deps, providerKeys: ALL_PROVIDERS_AVAILABLE, modelCredentials: undefined } };
@@ -116,7 +145,12 @@ export async function runtimeConfigBody(
   const managedKeys = ctx.deps.modelCredentials ? await ctx.deps.modelCredentials.availability() : configuredKeys;
   const fallback = runtimeFallback(ctx);
   const org = orgScope();
-  const approvedHarnesses = ((await config.getApprovedHarnessesDurable()) ?? [fallback.harnessId]).filter(isHarnessId);
+  const approvedHarnesses = [
+    ...new Set([
+      ...((await config.getApprovedHarnessesDurable()) ?? [fallback.harnessId]).filter(isHarnessId),
+      ...subscriptionHarnesses,
+    ]),
+  ];
   const providersFor = (harnessId: string) => modelProviderAvailabilityFor(harnessId, configuredKeys, managedKeys);
   const catalog =
     ctx.deps.modelCredentials && managedKeys.openrouter
@@ -162,28 +196,34 @@ export async function runtimeConfigBody(
   } else if (legacyModel) {
     scopeOverride = { harnessId: fallback.harnessId, modelId: legacyModel, orgRevision: 0 };
   }
-  const effective = purpose
-    ? await resolveRuntimeChoiceDurable(config, org, scope, fallback, requested, undefined, purpose)
-    : (scopeOverride ?? orgDefault);
   const purposeDefault = purpose ? await config.getPurposeRuntimeDurable(purpose) : undefined;
+  const inherited =
+    purposeDefault && isHarnessId(purposeDefault.harnessId)
+      ? { ...purposeDefault, harnessId: purposeDefault.harnessId }
+      : (scopeOverride ?? orgDefault);
+  const effective: RuntimeChoice =
+    purpose && !subscriptionHarnesses.length
+      ? await resolveRuntimeChoiceDurable(config, org, scope, fallback, requested, undefined, purpose)
+      : { ...inherited, ...requested };
   const selected = [orgDefault, scopeOverride, effective, purposeDefault].filter((choice) => choice != null);
   const allowlist = await config.getWebuiModelsDurable(org);
   const modelsByHarness = Object.fromEntries(
     approvedHarnesses.map((harnessId) => {
+      const harnessAllowlist = subscriptionHarnesses.includes(harnessId) ? null : allowlist;
       const ids =
-        allowlist != null
-          ? allowlist.filter((id) => modelSupportedByHarness(id, harnessId))
+        harnessAllowlist != null
+          ? harnessAllowlist.filter((id) => modelSupportedByHarness(id, harnessId))
           : selectableCatalogForHarness(catalog, harnessId)
               .filter((model) => modelOfferedInWebui(model.id))
               .map((model) => model.id);
       for (const choice of selected) {
         if (
-          allowlist?.length !== 0 &&
+          harnessAllowlist?.length !== 0 &&
           (!authorizeChoice ||
-            !allowlist ||
+            !harnessAllowlist ||
             choice.modelId === orgDefault.modelId ||
             choice.modelId === purposeDefault?.modelId ||
-            allowlist.includes(codexProviderModelId(choice.modelId))) &&
+            harnessAllowlist.includes(codexProviderModelId(choice.modelId))) &&
           choice.harnessId === harnessId &&
           modelSupportedByHarness(choice.modelId, harnessId) &&
           !ids.includes(choice.modelId)
@@ -276,12 +316,17 @@ export async function availableRuntimeError(
   scope: ScopeId,
   choice: RuntimeChoice,
   purpose?: RuntimePurpose,
+  actorId?: string,
+  account?: ModelAccount,
 ): Promise<string | null> {
   await ctx.deps.refreshModels?.();
-  const choices = await runtimeConfigBody(ctx, scope, undefined, purpose, choice);
+  const personal = actorId && (account ?? (await ctx.deps.config?.getModelAccountDurable(actorId))) !== "company";
+  const choices = personal
+    ? await userRuntimeConfigBody(ctx, scope, actorId, { account, purpose, requested: choice })
+    : await runtimeConfigBody(ctx, scope, undefined, purpose, choice);
   if (
     !choices.modelsByHarness[choice.harnessId]?.includes(choice.modelId) ||
-    !(await webuiModelEnabled(ctx, choice.modelId, purpose))
+    (!personal && !(await webuiModelEnabled(ctx, choice.modelId, purpose)))
   )
     return "runtime is no longer available or enabled on this deployment";
   return validateRuntimeChoice({

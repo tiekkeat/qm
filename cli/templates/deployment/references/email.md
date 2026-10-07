@@ -6,7 +6,11 @@ credentials unset, then run `qm admin-login` after deployment. It prints a priva
 single-use login link valid for five minutes. The selected account must already
 have `org_admin` access. Other users need email or an external identity provider.
 
-A deployment can also start with password sign-in: hash a password with
+Admins can manage users and temporary passwords in Admin → Users and choose Both,
+Password only, or Email link only. Invited users can set their own password after
+confirming their invitation. Password recovery uses the selected email transport.
+
+A deployment can also bootstrap its first password sign-in: hash a password with
 `node plugins/auth/src/hash-password.ts admin@example.com` and store the result
 with `qm secrets set AUTH_PASSWORD_USERS ...`. The address must also be allowed
 to sign in. Treat this as an onboarding aid and move to email links or an
@@ -114,9 +118,11 @@ recipient.
 ## Invitation emails for external users
 
 Admins invite people outside the organization from the admin Users tab or by
-chatting with QM. Core emails those invitations through Resend, so the CLI
-delivers `RESEND_API_KEY` and `AUTH_EMAIL_FROM` to core as well as to the
-broker. Both are optional on core: without them the invitation is still created
+chatting with QM. Core emails invitations through the selected Resend or SMTP
+transport. The CLI delivers the selected transport credentials and `AUTH_EMAIL_FROM`
+to core as well as to the broker. Core inherits the broker transport, SMTP port,
+and TLS settings unless its own environment overrides them. Email delivery is
+optional on core: without it the invitation is still created
 and the admin shares the sign-in link by hand. Core also receives
 `AUTH_ALLOWED_EMAIL_DOMAIN`, so an address in the organization's own domain is
 refused as an external user; those people sign in directly.

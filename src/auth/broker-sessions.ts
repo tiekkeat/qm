@@ -4,11 +4,12 @@ import { createPgPool } from "../persistence/pg-pool.ts";
 interface BrokerSession {
   email: string;
   authTime: number;
+  credentialVersion?: number;
   expiresAtMs: number;
 }
 
 export interface BrokerSessionStore {
-  create(email: string, idleS: number, absoluteS: number): Promise<BrokerSession & { token: string }>;
+  create(email: string, idleS: number, absoluteS: number, version?: number): Promise<BrokerSession & { token: string }>;
   use(token: string): Promise<BrokerSession | null>;
   revoke(email: string): Promise<void>;
 }
@@ -28,21 +29,30 @@ const SCHEMA = [
 ];
 
 export function createPostgresBrokerSessions(connectionString: string): BrokerSessionStore {
-  const pg = createPgPool(connectionString, "auth/broker-sessions/0001", SCHEMA);
+  const pg = createPgPool(connectionString, [
+    { id: "auth/broker-sessions/0001", statements: SCHEMA },
+    {
+      id: "auth/broker-sessions/0002",
+      statements: [
+        "ALTER TABLE auth_broker_sessions ADD COLUMN IF NOT EXISTS credential_version INTEGER NOT NULL DEFAULT 0",
+      ],
+    },
+  ]);
   const session = (row: Record<string, unknown>): BrokerSession => ({
     email: String(row.email),
+    credentialVersion: Number(row.credential_version ?? 0),
     authTime: Math.floor(new Date(String(row.authenticated_at)).getTime() / 1000),
     expiresAtMs: new Date(String(row.expires_at)).getTime(),
   });
   return {
-    async create(email, idleS, absoluteS) {
+    async create(email, idleS, absoluteS, version = 0) {
       const token = randomBytes(32).toString("base64url");
       await pg.query("DELETE FROM auth_broker_sessions WHERE expires_at <= now()");
       const result = await pg.query(
-        `INSERT INTO auth_broker_sessions (token_hash, email, expires_at, absolute_expires_at, idle_seconds)
-         VALUES ($1, $2, now() + $3 * interval '1 second', now() + $4 * interval '1 second', $3)
-         RETURNING email, authenticated_at, expires_at`,
-        [hash(token), email, Math.min(idleS, absoluteS), absoluteS],
+        `INSERT INTO auth_broker_sessions (token_hash, email, expires_at, absolute_expires_at, idle_seconds, credential_version)
+         VALUES ($1, $2, now() + $3 * interval '1 second', now() + $4 * interval '1 second', $3, $5)
+         RETURNING email, authenticated_at, expires_at, credential_version`,
+        [hash(token), email, Math.min(idleS, absoluteS), absoluteS, version],
       );
       return { ...session(result.rows[0]!), token };
     },
@@ -51,7 +61,7 @@ export function createPostgresBrokerSessions(connectionString: string): BrokerSe
         `UPDATE auth_broker_sessions
          SET expires_at = LEAST(absolute_expires_at, now() + idle_seconds * interval '1 second')
          WHERE token_hash = $1 AND expires_at > now() AND absolute_expires_at > now()
-         RETURNING email, authenticated_at, expires_at`,
+         RETURNING email, authenticated_at, expires_at, credential_version`,
         [hash(token)],
       );
       return result.rows[0] ? session(result.rows[0]) : null;

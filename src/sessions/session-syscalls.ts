@@ -200,6 +200,7 @@ interface SessionSyscallBinding {
     | "timezone"
     | "readOnly"
     | "scopeVersion"
+    | "modelAccount"
     | "sessionParticipantIds"
     | "slackSource"
     | "externalSlack"
@@ -246,7 +247,12 @@ export interface SessionSyscallDeps {
   advisoryLock?: AdvisoryLock;
   prepareRequest?: (request: OrchestratorInput) => Promise<OrchestratorInput>;
   authorize?: (session: Session, actorId: string) => Promise<boolean>;
-  validateRuntime?: (input: SessionOpenInput, scopeId: ScopeId) => Promise<void>;
+  validateRuntime?: (
+    input: SessionOpenInput,
+    scopeId: ScopeId,
+    actorId: string,
+    account?: OrchestratorInput["modelAccount"],
+  ) => Promise<void>;
   conversations?: {
     list(actorId: string): Promise<Session[]>;
     start(
@@ -644,7 +650,12 @@ export function createSessionSyscalls(deps: SessionSyscallDeps): SessionSyscalls
               const task = input.task?.trim();
               if (!task)
                 return { ok: false, message: "open requires a task: the full instruction the subagent works from." };
-              await deps.validateRuntime?.(input, binding.scopeId);
+              await deps.validateRuntime?.(
+                input,
+                binding.scopeId,
+                binding.request.actor.id,
+                binding.request.modelAccount,
+              );
               const threadRef = `${SUBAGENT_THREAD_PREFIX}${
                 input.requestId
                   ? hashId([binding.session.id, binding.request.runId ?? "", input.requestId], 40)

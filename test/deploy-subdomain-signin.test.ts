@@ -17,6 +17,7 @@ import { createMemorySessionStore } from "../src/sessions/memory-session-store.t
 import { PORTAL_IDENTITY_HEADER } from "../src/auth/portal-identity.ts";
 import { portalSession } from "../src/deploy/viewer-session.ts";
 import { scopeId } from "../src/types.ts";
+import type { AccountStore } from "../src/auth/accounts.ts";
 import type { FeatureFlagStore } from "../src/feature-flags.ts";
 
 let externalSharing = true;
@@ -26,7 +27,13 @@ const auditLog = { record() {}, events: async () => [], tail: async () => [] };
 const SESSION_SECRET = "portal-session-secret";
 const LOGIN_URL = "https://portal.example.com";
 
-function mintPortalSession(sub: string, expInSeconds = 3600, secret = SESSION_SECRET, appOnly?: true): string {
+function mintPortalSession(
+  sub: string,
+  expInSeconds = 3600,
+  secret = SESSION_SECRET,
+  appOnly?: true,
+  credentialVersion = 0,
+): string {
   const key = createHmac("sha256", secret).update("portal.session.v1").digest();
   const now = Math.floor(Date.now() / 1000);
   const body = Buffer.from(
@@ -37,6 +44,7 @@ function mintPortalSession(sub: string, expInSeconds = 3600, secret = SESSION_SE
       iat: now,
       exp: now + expInSeconds,
       ...(appOnly ? { appOnly } : {}),
+      credentialVersion,
     }),
   ).toString("base64url");
   const sig = createHmac("sha256", key).update(body).digest("base64url");
@@ -48,15 +56,17 @@ test("portalSession: verifies, and rejects tampering, expiry, wrong kind, wrong 
   assert.deepEqual(portalSession(`portal_session=${good}`, SESSION_SECRET), {
     sub: "alice@example.com",
     appOnly: false,
+    credentialVersion: 0,
   });
   assert.deepEqual(portalSession(`other=1; portal_session=${good}; x=2`, SESSION_SECRET), {
     sub: "alice@example.com",
     appOnly: false,
+    credentialVersion: 0,
   });
   assert.deepEqual(portalSession(`portal_session=${good}x`, SESSION_SECRET), null, "tampered signature");
   assert.deepEqual(
     portalSession(`portal_session=junk; portal_session=${good}`, SESSION_SECRET),
-    { sub: "alice@example.com", appOnly: false },
+    { sub: "alice@example.com", appOnly: false, credentialVersion: 0 },
     "an app's junk same-named cookie cannot shadow the real session",
   );
   assert.deepEqual(portalSession(`portal_session=${good}`, "other-secret"), null, "wrong secret");
@@ -202,7 +212,17 @@ test("subdomain ingress: portal sign-in admits the owner, denies strangers, boun
   (app as unknown as Record<string, unknown>).enqueueDelivery = async (input: (typeof deliveries)[number]) => {
     deliveries.push(input);
   };
+  let passwordVersion = 0;
+  let temporaryPassword = false;
+  const accounts = {
+    policy: async () => "both",
+    get: async (email: string) =>
+      email === "alice@example.com"
+        ? { email, passwordHash: "private", mustChangePassword: temporaryPassword, version: passwordVersion }
+        : null,
+  } as AccountStore;
   const server = createInsecureTestServer(app, {
+    accounts,
     featureFlags: externalSharingOn,
     deployAppsDomain: "apps.example.com",
     deployGateSecret: "gate-secret",
@@ -267,6 +287,25 @@ test("subdomain ingress: portal sign-in admits the owner, denies strangers, boun
     assert.equal(backFromLogin.status, 302, "landing back from sign-in redirects to the clean URL");
     assert.equal(backFromLogin.headers.location, "/consultants?x=1", "the dpl_signin marker leaves the address bar");
 
+    passwordVersion = 1;
+    const stale = await httpGet(port, "/api/data", {
+      Host: host,
+      Cookie: `portal_session=${mintPortalSession("alice@example.com")}`,
+    });
+    assert.equal(stale.status, 401, "a password change invalidates the app session");
+    const renewed = await httpGet(port, "/api/data", {
+      Host: host,
+      Cookie: `portal_session=${mintPortalSession("alice@example.com", 3600, SESSION_SECRET, undefined, 1)}`,
+    });
+    assert.equal(renewed.status, 200, "a session with the new credential version reaches the app");
+    temporaryPassword = true;
+    const pending = await httpGet(port, "/api/data", {
+      Host: host,
+      Cookie: `portal_session=${mintPortalSession("alice@example.com", 3600, SESSION_SECRET, undefined, 1)}`,
+    });
+    assert.equal(pending.status, 401, "temporary passwords cannot open an app before replacement");
+    passwordVersion = 0;
+    temporaryPassword = false;
     const owner = await httpGet(port, "/consultants?x=1", {
       Host: host,
       Accept: "text/html",

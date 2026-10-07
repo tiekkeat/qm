@@ -95,3 +95,85 @@ test("roster refresh updates shell counts while retaining search focus and invit
   assert.equal(bar.textContent, "Another view");
   f.dom.window.close();
 });
+
+test("invitation feedback preserves a copyable link without prescribing a provider", async () => {
+  for (const configured of [false, true]) {
+    const view = model();
+    view.data = { inviteEmail: { configured } };
+    view.services = {
+      api: async (method: string) =>
+        method === "POST"
+          ? {
+              ok: true,
+              data: {
+                member: { email: "first@example.com" },
+                emailSent: false,
+                emailProblem: configured ? "SMTP authentication failed" : "not configured",
+                signInUrl: "https://qm.test/auth/invite#token=abc",
+              },
+            }
+          : { ok: true, data: { inviteEmail: { configured } } },
+      clearCache: () => {},
+      fmtTime: () => "",
+      labelRole: () => "",
+    };
+    await view.invite();
+    assert.equal(view.inviteLink, "https://qm.test/auth/invite#token=abc");
+    assert.match(view.inviteWarning, configured ? /email couldn.t be sent/ : /delivery isn.t configured/);
+    assert.ok(!view.inviteWarning.includes("RESEND_API_KEY"));
+    assert.equal(view.copyLabel, "Copy invite link");
+  }
+});
+
+test("manual account creation and temporary-password reset clear password drafts after success", async () => {
+  const view = model();
+  const requests: any[] = [];
+  view.services = {
+    api: async (method: string, path: string, body?: any) => {
+      requests.push({ method, path, body });
+      return { ok: true, data: {} };
+    },
+    clearCache: () => {},
+  };
+  Object.assign(view, {
+    createEmail: "new@example.test",
+    createRole: "member",
+    createPassword: "temporary secure password",
+    createConfirmation: "temporary secure password",
+    createOpen: true,
+  });
+  await view.createUser();
+  assert.equal(requests[0].path, "/api/users/create");
+  assert.equal(requests[0].body.email, "new@example.test");
+  assert.equal(view.createPassword, "");
+  assert.equal(view.createConfirmation, "");
+  assert.equal(view.createOpen, false);
+  Object.assign(view, {
+    resetEmail: "new@example.test",
+    resetPassword: "replacement temporary password",
+    resetConfirmation: "replacement temporary password",
+  });
+  await view.saveTemporaryPassword();
+  assert.ok(requests.some((r) => r.path === "/api/users/password"));
+  assert.equal(view.resetPassword, "");
+  assert.equal(view.resetEmail, "");
+});
+test("mismatched password drafts never send an account mutation", async () => {
+  const view = model();
+  let sent = false;
+  view.services = {
+    api: async () => {
+      sent = true;
+      return { ok: true, data: {} };
+    },
+  };
+  Object.assign(view, {
+    createRole: "member",
+    createEmail: "new@example.test",
+    createPassword: "one secure password",
+    createConfirmation: "other secure password",
+  });
+  await view.createUser();
+  assert.equal(sent, false);
+  assert.match(view.externalMessage, /do not match/);
+});

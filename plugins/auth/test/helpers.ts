@@ -1,3 +1,4 @@
+import type { AccountClient } from "../../chassis/src/accounts.ts";
 import type { RememberedSessions, RememberedSession } from "../src/sessions.ts";
 import { createServer, type Server } from "node:http";
 import { createHash, generateKeyPairSync, randomBytes } from "node:crypto";
@@ -101,6 +102,7 @@ export async function startHarness(
     trustedSignInLabel?: string;
     emailAllowed?: (email: string) => Promise<boolean>;
     sessions?: RememberedSessions;
+    accounts?: AccountClient;
   } = {},
 ): Promise<Harness> {
   const cfg = readConfig(testEnv(options.env));
@@ -136,6 +138,7 @@ export async function startHarness(
     signer: new TokenSigner(cfg.tokenSecret, cfg.issuer),
     claims,
     sessions,
+    accounts: options.accounts,
     mailer: emailConfigured(cfg) ? mailer : null,
     ...(options.brandName ? { brandName: options.brandName } : {}),
     emailAllowed: options.emailAllowed ?? (async () => false),

@@ -58,7 +58,7 @@ Fully supplied email configuration is validated at boot.
 The signing key is single, not a set: rotating it means redeploying, and links
 minted by the previous key stop verifying at that moment.
 
-## Password sign-in for getting started
+## Password accounts and sign-in methods
 
 A fresh deployment can reach its first sign-in without Resend, SMTP, or an
 identity provider. Set `AUTH_PASSWORD_USERS` to comma-separated `<email>:<hash>`
@@ -85,9 +85,25 @@ qm secrets set AUTH_PASSWORD_USERS 'admin@example.com:scrypt$15$8$1$...'
 Only scrypt hashes are stored; a plaintext password in the list refuses boot.
 Passwords are compared in constant time, and attempts are rate limited per
 account and per client address through the same durable claims as link sends,
-so a core outage fails closed. Password sign-in is meant for onboarding. Once
-the deployment is running, configure an email transport or an external identity
-provider and unset `AUTH_PASSWORD_USERS`; the page says as much.
+so a core outage fails closed. A successful legacy sign-in imports its hash into
+Postgres once; an existing managed password always takes precedence over the
+legacy setting. After that account has migrated, `AUTH_PASSWORD_USERS` can be removed.
+
+Org administrators manage durable accounts in Admin → Users. **Create user** grants
+membership with a temporary password that must be replaced at the first sign-in.
+**Reset password** issues a new temporary password and revokes existing sessions.
+Invited teammates choose a password after confirming their invitation; with the
+default **Both** policy they may skip this and continue with email links.
+
+The **Sign-in methods** setting selects **Both**, **Password only**, or **Email link
+only** for the organization. Password only requires the acting administrator to
+have a permanent password. Forgotten-password emails remain available with Password
+only and use the configured SMTP or Resend transport. Without email delivery,
+an administrator can issue a temporary password. The account menu's **Manage password**
+link lets a signed-in teammate set or change their own password. Passwords require
+at least 12 characters; setup/reset links expire after 15 minutes and work once.
+Password changes invalidate old browser, remembered, and application sessions.
+Trusted SSO and CLI emergency admin sign-in remain independent of this setting.
 
 ## Invited external users
 
