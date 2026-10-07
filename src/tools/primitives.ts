@@ -82,6 +82,9 @@ import type { VisibleCron } from "../api/app.ts";
 import { createPlaygroundArtifact, type PlaygroundArtifact } from "../playgrounds/playground.ts";
 
 export interface PublishInput {
+  title?: string;
+  description?: string;
+  commitMessage?: string;
   dir?: string;
   entrypoint?: string;
   name?: string;
@@ -104,6 +107,8 @@ export interface PublishAudienceDescriptor {
 }
 
 interface PublishResult {
+  viewVersionUrl?: string;
+  commit?: string;
   id: string;
   name?: string;
   version: number;
@@ -1090,6 +1095,9 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
           createdBy: deps.createdBy,
           createdInScope,
           files,
+          title: input.title,
+          description: input.description,
+          commitMessage: input.commitMessage,
           ...(input.entrypoint ? { entrypoint: input.entrypoint } : {}),
           ...(input.name !== undefined ? { name: input.name } : {}),
           ...(input.renameFrom !== undefined ? { renameFrom: input.renameFrom } : {}),
@@ -1128,6 +1136,8 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
           id: d.id,
           ...(d.name ? { name: d.name } : {}),
           version: d.currentVersion,
+          viewVersionUrl: `${urlBase}/apps/${encodeURIComponent(d.id)}?version=${d.currentVersion}`,
+          commit: d.versions.find((v) => v.version === d.currentVersion)?.commit,
           url,
           audience,
           ...(dataDir ? { dataDir } : {}),

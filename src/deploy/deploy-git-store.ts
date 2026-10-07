@@ -36,7 +36,12 @@ export interface DeployGitStore {
     files: DeployGitInputFile[];
     parent?: string;
     message?: string;
+    author?: string;
   }): Promise<string>;
+  metadata(
+    deploymentId: string,
+    commitSha: string,
+  ): Promise<{ title: string; description: string; commitMessage: string; publisher: string; createdAt: number }>;
   treeOf(deploymentId: string, commitSha: string): Promise<DeployGitTreeFile[]>;
   filesOf(deploymentId: string, commitSha: string, paths?: string[]): Promise<DeployGitInputFile[]>;
   diff(deploymentId: string, fromCommit: string | undefined, toCommit: string): Promise<DeployGitDiff>;
@@ -260,10 +265,16 @@ export function createDeployGitStore(opts: DeployGitStoreOptions = {}): DeployGi
         await git(["add", "-A", "--force"], { cwd: workdir });
         const diff = await gitResult(["diff", "--cached", "--quiet"], { cwd: workdir, okExitCodes: [0, 1] });
         const changed = diff.code === 1;
-        if (!changed && input.parent) return input.parent;
         await git(
           [
-            ...GIT_AUTHOR,
+            ...(input.author
+              ? [
+                  "-c",
+                  `user.name=${input.author}`,
+                  "-c",
+                  `user.email=${input.author.includes("@") ? input.author : "publisher@qm.local"}`,
+                ]
+              : GIT_AUTHOR),
             "commit",
             "--quiet",
             ...(changed ? [] : ["--allow-empty"]),
@@ -281,6 +292,21 @@ export function createDeployGitStore(opts: DeployGitStoreOptions = {}): DeployGi
       } finally {
         await rm(workdir, { recursive: true, force: true });
       }
+    },
+    async metadata(deploymentId, commitSha) {
+      const repo = await ensureRepo(deploymentId);
+      const raw = (await git(["--git-dir", repo, "show", "-s", "--format=%an%x00%at%x00%B", commitSha])).toString(
+        "utf8",
+      );
+      const [publisher, timestamp, message] = raw.split("\0");
+      const commitMessage = message?.trim() ?? "";
+      return {
+        publisher: publisher ?? "unknown",
+        createdAt: Number(timestamp) * 1000,
+        commitMessage,
+        title: commitMessage.split("\n")[0] ?? "",
+        description: commitMessage.split("\n").slice(1).join("\n").trim(),
+      };
     },
     treeOf,
     async filesOf(deploymentId, commitSha, paths) {

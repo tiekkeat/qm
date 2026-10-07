@@ -12,7 +12,27 @@ import {
   type DeployGitTreeFile,
 } from "./deploy-git-store.ts";
 
-export interface DeploymentVersion {
+export interface ReleaseMetadata {
+  operationId?: string;
+  title?: string;
+  description?: string;
+  publisher?: string;
+  commitMessage?: string;
+  sourceSha?: string;
+}
+
+export interface DeploymentEvent {
+  id: string;
+  actor: string;
+  fromVersion?: number;
+  toVersion: number;
+  at: number;
+  kind: "publish" | "rollback";
+  outcome: "started" | "succeeded" | "failed";
+}
+
+export interface DeploymentVersion extends ReleaseMetadata {
+  alwaysOn?: boolean;
   version: number;
   createdAt: number;
   entrypoint: string;
@@ -74,13 +94,15 @@ export interface Deployment {
   appliedVersion?: number;
   deployFailure?: { version: number; at: number };
   versions: DeploymentVersion[];
+  events?: DeploymentEvent[];
 }
 
 export function currentVersionOf(d: Deployment | null): DeploymentVersion | undefined {
   return d?.versions.find((v) => v.version === d.currentVersion);
 }
 
-interface VersionInput {
+interface VersionInput extends ReleaseMetadata {
+  alwaysOn?: boolean;
   entrypoint: string;
   snapshotDir: string;
   homeDir?: string;
@@ -91,6 +113,7 @@ interface VersionInput {
 export interface DeployStore {
   create(
     input: {
+      id?: string;
       ownerScopeId: ScopeId;
       createdBy: string;
       name?: string;
@@ -99,7 +122,9 @@ export interface DeployStore {
     } & VersionInput,
   ): Promise<Deployment>;
   addVersion(id: string, input: VersionInput): Promise<DeploymentVersion>;
-  addVersionFromCommit(id: string, commit: string): Promise<DeploymentVersion | null>;
+  addVersionFromCommit(id: string, commit: string, publisher?: string): Promise<DeploymentVersion | null>;
+  editRelease(id: string, version: number, text: { title: string; description: string }): Promise<void>;
+  recordEvent(id: string, event: DeploymentEvent): Promise<void>;
   get(id: string): Promise<Deployment | null>;
   getByName(name: string): Promise<Deployment | null>;
   list(): Promise<Deployment[]>;
@@ -267,6 +292,26 @@ export function createDeployStore(backing?: DurableMap<Deployment> | DeployStore
     return at == null ? d : { ...d, lastAccessAt: at };
   }
 
+  async function recoverMetadata(d: Deployment): Promise<Deployment> {
+    const versions = await Promise.all(
+      d.versions.map(async (v) => {
+        if (!v.commit || v.commitMessage !== undefined) return v;
+        try {
+          const metadata = await git.metadata(d.id, v.commit);
+          return {
+            ...v,
+            title: metadata.title,
+            description: metadata.description,
+            commitMessage: metadata.commitMessage,
+            ...(metadata.publisher !== "QM" ? { publisher: metadata.publisher } : {}),
+          };
+        } catch {
+          return v;
+        }
+      }),
+    );
+    return { ...d, versions };
+  }
   async function putNamed(d: Deployment): Promise<void> {
     try {
       await backingMap.put(d.id, d);
@@ -288,10 +333,18 @@ export function createDeployStore(backing?: DurableMap<Deployment> | DeployStore
           version,
           files: input.files,
           ...(parentCommit ? { parent: parentCommit } : {}),
-          message: `deploy v${version}`,
+          message: input.commitMessage ?? input.title ?? `Publish version ${version}`,
+          ...(input.publisher ? { author: input.publisher } : {}),
         })
       : undefined;
     return {
+      ...(input.alwaysOn !== undefined ? { alwaysOn: input.alwaysOn } : {}),
+      ...(input.operationId ? { operationId: input.operationId } : {}),
+      title: input.title ?? `Version ${version}`,
+      description: input.description ?? "",
+      ...(input.publisher ? { publisher: input.publisher } : {}),
+      commitMessage: input.commitMessage ?? input.title ?? `Publish version ${version}`,
+      ...(input.sourceSha ? { sourceSha: input.sourceSha } : {}),
       version,
       createdAt: Date.now(),
       entrypoint: input.entrypoint,
@@ -316,8 +369,9 @@ export function createDeployStore(backing?: DurableMap<Deployment> | DeployStore
 
   return {
     async create(input) {
-      const id = randomUUID();
-      const v = await makeVersion(id, 1, input);
+      const id = input.id ?? randomUUID();
+      if (await backingMap.get(id)) throw new Error(`deployment already exists: ${id}`);
+      const v = await makeVersion(id, 1, { ...input, publisher: input.publisher ?? input.createdBy });
       const d: Deployment = {
         id,
         ownerScopeId: input.ownerScopeId,
@@ -346,13 +400,16 @@ export function createDeployStore(backing?: DurableMap<Deployment> | DeployStore
       await updateVersionRef(id, v);
       return v;
     },
-    async addVersionFromCommit(id, commit) {
+    async addVersionFromCommit(id, commit, publisher) {
       const d = await backingMap.get(id);
       if (!d) throw new Error(`unknown deployment: ${id}`);
       const current = currentVersionOf(d);
       if (current?.commit === commit) return null;
       const version = d.versions.length + 1;
+      const metadata = await git.metadata(id, commit);
       const v: DeploymentVersion = {
+        ...metadata,
+        ...(publisher ? { publisher } : {}),
         version,
         createdAt: Date.now(),
         entrypoint: current?.entrypoint ?? "",
@@ -368,19 +425,33 @@ export function createDeployStore(backing?: DurableMap<Deployment> | DeployStore
       await updateVersionRef(id, v);
       return v;
     },
+    async editRelease(id, version, text) {
+      const d = await backingMap.get(id);
+      const v = d?.versions.find((v) => v.version === version);
+      if (!d || !v) throw new Error("unknown release");
+      v.title = text.title;
+      v.description = text.description;
+      await backingMap.put(id, d);
+    },
+    async recordEvent(id, event) {
+      const d = await backingMap.get(id);
+      if (!d) throw new Error("unknown deployment");
+      d.events = [...(d.events ?? []).filter((e) => e.id !== event.id), event];
+      await backingMap.put(id, d);
+    },
     async get(id) {
       const d = await backingMap.get(id);
-      return d ? withAccess(d, await access.readOne(id)) : null;
+      return d ? withAccess(await recoverMetadata(d), await access.readOne(id)) : null;
     },
     async getByName(name) {
       const d = access.findByName
         ? await access.findByName(name)
         : ((await backingMap.all()).find((x) => x.name === name) ?? null);
-      return d ? withAccess(d, await access.readOne(d.id)) : null;
+      return d ? withAccess(await recoverMetadata(d), await access.readOne(d.id)) : null;
     },
     async list() {
       const [ds, accessAt] = await Promise.all([backingMap.all(), access.readAll()]);
-      return ds.map((d) => withAccess(d, accessAt.get(d.id)));
+      return Promise.all(ds.map(async (d) => withAccess(await recoverMetadata(d), accessAt.get(d.id))));
     },
     async setCurrentVersion(id, version) {
       const d = await backingMap.get(id);

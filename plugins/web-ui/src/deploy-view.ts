@@ -1,4 +1,9 @@
 interface DeploymentVersionView {
+  title?: string;
+  description?: string;
+  publisher?: string;
+  commitMessage?: string;
+  sourceSha?: string;
   version: number;
   createdAt: number;
   commit?: string;

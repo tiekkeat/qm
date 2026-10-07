@@ -1,3 +1,4 @@
+import { appCollaborationRoutes } from "./app-collaboration.ts";
 import { accountRoutes } from "./accounts.ts";
 import { browserModelRoutes } from "./browser-model.ts";
 import { deploymentLiveSmokeRoutes } from "./deployment-live-smoke.ts";
@@ -113,6 +114,7 @@ export const apiRoutes: ReadonlyArray<Route<ApiCtx>> = [
   ...inboxRoutes,
   ...loopItemRoutes,
   ...deploymentRoutes,
+  ...appCollaborationRoutes,
   ...egressAuditRoutes,
   ...authBrokerRoutes,
   ...accountRoutes,

@@ -1,3 +1,4 @@
+import { collaborationPanel, refreshCollaboration, viewRelease } from "./app-collaboration";
 import { openDeploymentPermissions } from "./deploy-permissions";
 import { html, nothing, render, type TemplateResult } from "lit";
 import { live } from "lit/directives/live.js";
@@ -233,9 +234,11 @@ function drawDeploysPage(): void {
 }
 
 let pendingDeployId: string | null = null;
+let pendingDeployVersion: number | undefined;
 
-export function openDeployById(id: string): void {
+export function openDeployById(id: string, version?: number): void {
   pendingDeployId = id;
+  pendingDeployVersion = version;
 }
 
 async function openDeploy(d: DeploymentView): Promise<void> {
@@ -244,13 +247,29 @@ async function openDeploy(d: DeploymentView): Promise<void> {
   deployDraft = "";
   deployNotices = withoutDeploymentDetailNotice(deployNotices);
   activeDeploy = d;
-  history.replaceState(null, "", deepLinkPath(UI_BASE, "deploys", null, null, d.id));
+  const requestedVersion = pendingDeployVersion ?? Number(new URLSearchParams(window.location.search).get("version"));
+  pendingDeployVersion = undefined;
+  const releaseQuery = Number.isSafeInteger(requestedVersion) && requestedVersion > 0 ? String(requestedVersion) : null;
+  history.replaceState(
+    null,
+    "",
+    `${deepLinkPath(UI_BASE, "deploys", null, null, d.id)}${releaseQuery ? `?version=${encodeURIComponent(releaseQuery)}` : ""}`,
+  );
   drawDeployDetail(d, true);
   try {
     const response = await api<{ deployment?: DeploymentView }>(`/api/deployments/${encodeURIComponent(d.id)}`);
     if (appState.currentView !== "deploys" || activeDeploy?.id !== d.id) return;
     activeDeploy = response.deployment ?? d;
     drawDeployDetail(activeDeploy);
+    const release = activeDeploy.versions?.find((v) => v.version === requestedVersion);
+    if (release)
+      await viewRelease(activeDeploy, release, () => {
+        if (activeDeploy?.id === d.id) drawDeployDetail(activeDeploy);
+      });
+    if (appState.currentView !== "deploys" || activeDeploy?.id !== d.id) return;
+    await refreshCollaboration(activeDeploy, () => {
+      if (activeDeploy?.id === d.id) drawDeployDetail(activeDeploy);
+    });
   } catch (error) {
     if (activeDeploy?.id !== d.id) return;
     deployNotices = withDeploymentDetailNotice(deployNotices, d.id, errMessage(error, "Could not load app details."));
@@ -260,6 +279,7 @@ async function openDeploy(d: DeploymentView): Promise<void> {
 
 function drawDeployDetail(d: DeploymentView, loading = false): void {
   if (appState.currentView !== "deploys" || !appState.mainEl || activeDeploy?.id !== d.id) return;
+  d = activeDeploy;
   const host = appState.mainEl.querySelector<HTMLElement>(".deploy-detail-pane") ?? document.createElement("div");
   host.className = "resource-pane deploy-detail-pane";
   const versions = [...(d.versions ?? [])].sort((a, b) => b.version - a.version);
@@ -290,7 +310,7 @@ function drawDeployDetail(d: DeploymentView, loading = false): void {
 
         <div class="deploy-summary">
           <span>Live v${d.appliedVersion ?? d.currentVersion ?? "—"}</span>
-          ${d.currentVersion !== undefined && d.appliedVersion !== undefined && d.currentVersion !== d.appliedVersion ? html`<span>Latest v${d.currentVersion}</span>` : nothing}
+          ${d.currentVersion !== undefined && d.appliedVersion !== undefined && d.currentVersion !== d.appliedVersion ? html`<span>Selected for deployment v${d.currentVersion}</span>` : nothing}
           ${deploymentLatestAt(d) ? html`<span ${tip(new Date(deploymentLatestAt(d)).toLocaleString())}>Updated ${relTime(deploymentLatestAt(d))}</span>` : nothing}
         </div>
         ${d.deployFailure?.version === d.currentVersion ? html`<div class="status">Version ${d.currentVersion} failed to deploy. The recorded live version is ${d.appliedVersion ?? "none"}. Check the publish error and app logs before retrying.</div>` : nothing}
@@ -365,10 +385,18 @@ function drawDeployDetail(d: DeploymentView, loading = false): void {
                       <div class="deploy-version-row">
                         <div>
                           <strong>v${version.version}</strong
-                          >${version.version === d.appliedVersion ? html`<span class="badge ok">Live</span>` : nothing}${version.version === d.currentVersion && version.version !== d.appliedVersion ? html`<span class="badge">Latest</span>` : nothing}
+                          >${version.version === d.appliedVersion ? html`<span class="badge ok">Live</span>` : nothing}${version.version === d.currentVersion ? html`<span class="badge">Selected for deployment</span>` : nothing}
                         </div>
                         <div>
-                          <span>${new Date(version.createdAt).toLocaleString()}</span>
+                          <span
+                            >${version.title || "Release title unavailable"} ·
+                            ${version.publisher || "Unknown publisher"} ·
+                            ${new Date(version.createdAt).toLocaleString()}</span
+                          >
+                          ${version.version === versions[0]?.version ? html`<span class="badge">Newest release</span>` : nothing}
+                          <button class="btn" @click=${() => void viewRelease(d, version, () => drawDeployDetail(d))}>
+                            View version
+                          </button>
                         </div>
                       </div>
                     `,
@@ -391,6 +419,17 @@ function drawDeployDetail(d: DeploymentView, loading = false): void {
               : nothing
           }
         </section>
+        ${collaborationPanel(
+          d,
+          () => drawDeployDetail(d),
+          async () => {
+            const response = await api<{ deployment: DeploymentView }>(`/api/deployments/${encodeURIComponent(d.id)}`);
+            if (activeDeploy?.id === d.id) {
+              activeDeploy = response.deployment;
+              drawDeployDetail(activeDeploy);
+            }
+          },
+        )}
       </div>
       ${archiveCandidate ? archiveDialog(archiveCandidate) : nothing} ${deployToast ? undoToast(deployToast) : nothing}
     `,

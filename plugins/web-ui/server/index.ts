@@ -1411,7 +1411,8 @@ const apiRoutes: readonly WebRoute[] = [
           (parsed.account === "shared-openai" && parsed.sharedAvailable === true) ||
           (parsed.connections?.some(
             (c) => !parsed.account || parsed.account === "personal" || parsed.account === c.provider,
-          ) ?? false),
+          ) ??
+            false),
         impersonatedBy: resolveIdentity(req)?.impersonator ?? null,
         displayName: resolveIdentity(req)?.name ?? null,
         ...(welcomeCohort ? { welcomeCohort } : {}),
@@ -2192,10 +2193,16 @@ const apiRoutes: readonly WebRoute[] = [
     method: "POST",
     path: "/api/connectors/:provider/start",
     handle: async (c) => {
-      const { res, user } = c;
+      const { req, res, user } = c;
+      const body = await readJson<{ returnTo?: string }>(req, res, true);
+      if (!body) return;
       const provider = c.params.provider!;
       const callback = `${PUBLIC_URL}/v1/connectors/oauth/${encodeURIComponent(provider)}/callback`;
-      const params = new URLSearchParams({ principalId: user, redirectUri: callback, returnTo: "/keychain" });
+      const params = new URLSearchParams({
+        principalId: user,
+        redirectUri: callback,
+        returnTo: body.returnTo?.startsWith("/apps/") && !body.returnTo.includes("\\") ? body.returnTo : "/keychain",
+      });
       const corePath = `/v1/connectors/oauth/${encodeURIComponent(provider)}/start?${params.toString()}`;
       return relayCore(res, "GET", corePath);
     },
@@ -2324,6 +2331,59 @@ const apiRoutes: readonly WebRoute[] = [
       } catch {
         return json(res, 502, { error: "bad_core_response" });
       }
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/deployments/:id/collaboration",
+    handle: async ({ res, params }) =>
+      relayCap(res, "GET", `/v1/deployments/${encodeURIComponent(params.id!)}/collaboration`),
+  },
+  {
+    method: "POST",
+    path: "/api/deployments/:id/collaboration/:action",
+    handle: async ({ req, res, params }) => {
+      const body = await readJson<Record<string, unknown>>(req, res, false);
+      if (!body) return;
+      return relayCap(
+        res,
+        "POST",
+        `/v1/deployments/${encodeURIComponent(params.id!)}/collaboration/${encodeURIComponent(params.action!)}`,
+        JSON.stringify(body),
+      );
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/deployments/:id/versions/:version",
+    handle: async ({ res, params, url }) =>
+      relayCap(
+        res,
+        "GET",
+        `/v1/deployments/${encodeURIComponent(params.id!)}/versions/${encodeURIComponent(params.version!)}${url.search}`,
+      ),
+  },
+  {
+    method: "PATCH",
+    path: "/api/deployments/:id/versions/:version",
+    handle: async ({ req, res, params }) => {
+      const body = await readJson<Record<string, unknown>>(req, res, false);
+      if (!body) return;
+      return relayCap(
+        res,
+        "PATCH",
+        `/v1/deployments/${encodeURIComponent(params.id!)}/versions/${encodeURIComponent(params.version!)}`,
+        JSON.stringify(body),
+      );
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/deployments/:id/rollback",
+    handle: async ({ req, res, params }) => {
+      const body = await readJson<Record<string, unknown>>(req, res, false);
+      if (!body) return;
+      return relayCap(res, "POST", `/v1/deployments/${encodeURIComponent(params.id!)}/rollback`, JSON.stringify(body));
     },
   },
   {

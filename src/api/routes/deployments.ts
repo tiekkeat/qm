@@ -1232,26 +1232,30 @@ async function serveDeploymentGit(ctx: BaseCtx): Promise<void> {
         body,
       });
     const result = isPush
-      ? await ctx.app.runDeploymentGitPush(parts.id, async () => {
-          if (
-            access?.principalId &&
-            !(await ctx.app.authorizesDeploymentGitAccess(parts.id, access.principalId, "write"))
-          ) {
-            const body = Buffer.from(
-              JSON.stringify({ error: "forbidden", message: "deployment git write access has been revoked" }),
-            );
-            return {
-              result: {
-                status: 403,
-                headers: { "content-type": "application/json", "content-length": String(body.length) },
-                body,
-              },
-              ok: false,
-            };
-          }
-          const r = await runBackend();
-          return { result: r, ok: r.status >= 200 && r.status < 300 };
-        })
+      ? await ctx.app.runDeploymentGitPush(
+          parts.id,
+          async () => {
+            if (
+              access?.principalId &&
+              !(await ctx.app.authorizesDeploymentGitAccess(parts.id, access.principalId, "write"))
+            ) {
+              const body = Buffer.from(
+                JSON.stringify({ error: "forbidden", message: "deployment git write access has been revoked" }),
+              );
+              return {
+                result: {
+                  status: 403,
+                  headers: { "content-type": "application/json", "content-length": String(body.length) },
+                  body,
+                },
+                ok: false,
+              };
+            }
+            const r = await runBackend();
+            return { result: r, ok: r.status >= 200 && r.status < 300 };
+          },
+          access?.principalId,
+        )
       : await runBackend();
     ctx.res.writeHead(result.status, result.headers);
     ctx.res.end(result.body);
@@ -1405,11 +1409,20 @@ async function rollbackDeployment(ctx: ApiCtx): Promise<void> {
   const id = await deploymentId(app, params.id!);
   if (!id) return sendJson(res, 404, { error: "not_found" });
   if (!(await callerMayManageDeployment(ctx, id))) return sendJson(res, 403, { error: "forbidden" });
-  const b = body as { version?: unknown };
-  if (typeof b.version !== "number")
+  const b = body as { version?: unknown; operationId?: unknown };
+  if (
+    typeof b.version !== "number" ||
+    !Number.isInteger(b.version) ||
+    (b.operationId !== undefined && (typeof b.operationId !== "string" || !/^[a-zA-Z0-9-]{8,100}$/.test(b.operationId)))
+  )
     return sendJson(res, 400, { error: "bad_request", message: "version (number) required" });
   try {
-    await app.rollbackDeployment(id, b.version);
+    await app.rollbackDeployment(
+      id,
+      b.version,
+      ctx.capability?.actorId ?? ctx.actor?.p,
+      typeof b.operationId === "string" ? b.operationId : undefined,
+    );
     return sendJson(res, 200, { ok: true });
   } catch (e) {
     return sendJson(res, 400, { error: "rollback_failed", message: errMessage(e) });
@@ -1429,7 +1442,14 @@ async function redeployDeployment(ctx: ApiCtx): Promise<void> {
     });
   }
   try {
-    return sendJson(res, 200, { deployment: deploymentView(await app.redeploy(id, body)) });
+    return sendJson(res, 200, {
+      deployment: deploymentView(
+        await app.redeploy(id, {
+          ...body,
+          ...((ctx.capability?.actorId ?? ctx.actor?.p) ? { publisher: ctx.capability?.actorId ?? ctx.actor?.p } : {}),
+        }),
+      ),
+    });
   } catch (e) {
     return sendJson(res, 400, { error: "deploy_failed", message: errMessage(e) });
   }
@@ -1700,7 +1720,7 @@ export const deploymentRoutes: ReadonlyArray<Route<ApiCtx>> = [
   { method: "GET", path: "/v1/deployments/:id/git-url", auth: "either", handle: deploymentGitUrl },
   { method: "GET", path: "/v1/deployments/:id/share", auth: "either", handle: getDeploymentShares },
   { method: "POST", path: "/v1/deployments/:id/share", auth: "either", handle: shareDeployment },
-  { method: "POST", path: "/v1/deployments/:id/rollback", auth: "source", handle: rollbackDeployment },
+  { method: "POST", path: "/v1/deployments/:id/rollback", auth: "either", handle: rollbackDeployment },
   { method: "POST", path: "/v1/deployments/:id/redeploy", auth: "source", handle: redeployDeployment },
   { method: "POST", path: "/v1/deployments/:id/archive", auth: "either", handle: archiveDeployment },
   { method: "POST", path: "/v1/deployments/:id/restore", auth: "either", handle: restoreDeployment },

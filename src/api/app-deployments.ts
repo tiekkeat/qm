@@ -133,8 +133,8 @@ export function createDeploymentMethods(
       const deployment = (await deps.deploy.listDeployments()).find((d) => d.id === idOrName || d.name === idOrName);
       return deployment ? principalGitPermission(deployment, principalId) : null;
     },
-    rollbackDeployment(id, version) {
-      return deps.deploy.rollbackDeployment(id, version);
+    rollbackDeployment(id, version, actorId, operationId) {
+      return deps.deploy.rollbackDeployment(id, version, { actorId, operationId });
     },
     canManageDeployment(idOrName, callerId, actingScopeId) {
       return deps.deploy.canManageDeployment(idOrName, callerId, actingScopeId);
@@ -183,8 +183,8 @@ export function createDeploymentMethods(
     deploymentGitRepoPath(id) {
       return deps.deploy.gitRepoPath(id);
     },
-    runDeploymentGitPush(id, runReceivePack) {
-      return deps.deploy.pushGit(id, runReceivePack);
+    runDeploymentGitPush(id, runReceivePack, actorId) {
+      return deps.deploy.pushGit(id, runReceivePack, actorId);
     },
     async deploymentGitUrlFor(idOrName, principalId, opts) {
       const d = await deps.deploy.getDeployment(idOrName);

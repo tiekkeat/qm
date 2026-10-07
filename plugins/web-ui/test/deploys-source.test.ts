@@ -113,6 +113,7 @@ function renderHarness(requestedId: string | null = null) {
   const context = createContext({
     appState: { currentView: "deploys", viewRenderSeq: 1 },
     pendingDeployId: requestedId,
+    pendingDeployVersion: undefined,
     archiveCandidate: null,
     restoreArchiveFocus: false,
     scopedSession: { active: null },
@@ -135,6 +136,10 @@ function renderHarness(requestedId: string | null = null) {
     deepLinkPath,
     UI_BASE: "",
     history: { replaceState() {} },
+    URLSearchParams,
+    window: { location: { search: "" } },
+    refreshCollaboration: async () => {},
+    viewRelease: async () => {},
     errMessage: (error: Error) => error.message,
     drawDeploysPage() {
       frames.push({ view: "list" });
@@ -267,11 +272,11 @@ for (const count of [0, 7, 23, 150]) {
       );
       assert.equal(rendered.includes("No version history available."), count === 0);
       assert.equal(rendered.includes('class="badge ok">Live'), count > 0 && shown >= count);
-      assert.equal(rendered.includes('class="badge">Latest'), count > 1);
+      assert.equal(rendered.includes('class="badge">Newest release'), count > 0);
       assert.equal(rendered.includes("Show older versions"), shown < count);
-      assert.equal(handlers.length, shown < count ? 1 : 0);
+      assert.equal(handlers.length, Math.min(shown, count) + (shown < count ? 1 : 0));
       if (shown >= count) break;
-      handlers[0]!();
+      handlers.at(-1)!();
       assert.equal(redraws.at(-1), deployment);
       shown += 10;
     }
@@ -314,6 +319,7 @@ test("detail redraws reuse the scroll container and retain focus", () => {
       ownerLabel: () => "",
       permissionBadge: () => "",
       canManage: () => false,
+      collaborationPanel: () => "",
     });
     runInContext(stripTypeScriptTypes(bodyOf("drawDeployDetail")), context);
     runInContext("drawDeployDetail(d)", context);

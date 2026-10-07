@@ -1171,6 +1171,9 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
       "(an iframe) unless `embedAncestors` names that site; set it when someone asks for the app in " +
       "a panel or extension, and `[]` to turn it back off.",
     parameters: Type.Object({
+      title: Type.Optional(Type.String({ description: "Descriptive release title summarizing the change." })),
+      description: Type.Optional(Type.String({ description: "What changed and why; honor user overrides." })),
+      commitMessage: Type.Optional(Type.String({ description: "Meaningful immutable source commit message." })),
       audience: Type.Optional(
         Type.Array(
           Type.Object({
@@ -1259,11 +1262,13 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
             name: r.name,
             version: r.version,
             url: r.url,
+            viewVersionUrl: r.viewVersionUrl,
+            commit: r.commit,
             ...(r.audience ? { audience: r.audience } : {}),
             ...(r.dataDir ? { dataDir: r.dataDir } : {}),
           },
           text(
-            `Published ${r.name ?? r.id} (v${r.version}) → ${r.url}\n${reach}${publicNote}${alwaysOnNote}${embedNote}${dataNote}`,
+            `Published ${r.name ?? r.id} (v${r.version}) → ${r.url}\n${reach}${publicNote}${alwaysOnNote}${embedNote}${dataNote}${r.viewVersionUrl ? `\n[View version](${r.viewVersionUrl}) · [Connect to GitHub](${r.viewVersionUrl}) (Create private repository, Link existing repository, or Skip for now)` : ""}`,
           ),
         );
       } catch (e) {

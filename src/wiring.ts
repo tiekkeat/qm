@@ -1,3 +1,11 @@
+import {
+  createAppGitHubService,
+  type AppGitHubService,
+  type AppRepositoryLink,
+  type AppGitHubOperation,
+} from "./deploy/app-github.ts";
+import type { GitHubIdentity } from "./deploy/github-client.ts";
+import type { DeployStore } from "./deploy/deploy-store.ts";
 import { createPostgresAccounts, type AccountStore } from "./auth/accounts.ts";
 import type { SlackSessionStatusState } from "./slack/session-status.ts";
 import { userRuntimeConfigBody, availableRuntimeError } from "./api/runtime-config.ts";
@@ -400,7 +408,12 @@ import {
 import { createAdminService, bootAdminGrantSeed, type AdminService } from "./admin/admin-service.ts";
 import { createAdminGrantStore, createMapAdminGrantPersistence, type AdminGrant } from "./admin/admin-grant-store.ts";
 import { createPostgresAdminGrantStore } from "./admin/postgres-admin-grant-store.ts";
-import { createProjectStore, type Project, type ProjectStore } from "./projects/project-store.ts";
+import {
+  projectIdFromGroupRef,
+  createProjectStore,
+  type Project,
+  type ProjectStore,
+} from "./projects/project-store.ts";
 import { withErrorReporting, createErrorLog, type ErrorLog } from "./admin/error-log.ts";
 import { createMemoryReplayDedupe, createPostgresReplayDedupe, type ReplayDedupe } from "./auth/replay-dedupe.ts";
 import {
@@ -468,6 +481,8 @@ export function stopWithBackstop(
 }
 
 export interface BuiltApp {
+  appGitHub: AppGitHubService;
+  deployStore: DeployStore;
   checkReadiness: (signal: AbortSignal) => Promise<void>;
   backgroundOwnership?: BackgroundOwnershipControl;
   suggestedActivityMaintenance: Sweeper;
@@ -2850,6 +2865,31 @@ export function buildApp(
     surfaceCache,
     runtime,
     config: configStore,
+    deployStore,
+    appGitHub: createAppGitHubService({
+      store: deployStore,
+      deploy: deployService,
+      tokens: connectorTokens,
+      lock: advisoryLock,
+      links: artifactMap<AppRepositoryLink>("app_repository_links"),
+      operations: artifactMap<AppGitHubOperation>("app_github_operations"),
+      identities: artifactMap<GitHubIdentity & { verifiedAt: number }>("app_github_identities"),
+      oauthConfigured: async () => {
+        try {
+          await resolveClient("github", { accountType: "default" });
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      canRead: async (d, actor) => (await app.deploymentGitPermissionFor(d.id, actor)) !== null,
+      canConfigure: async (d, actor) => {
+        const scope = d.createdInScope ?? d.ownerScopeId;
+        const projectId = projectIdFromGroupRef(scope.startsWith("group:") ? scope.slice(6) : "");
+        if (projectId) return (await projects.get(projectId))?.ownerId === actor;
+        return d.ownerScopeId === `personal:${actor}`;
+      },
+    }),
     connectorTokens,
     slackInstallation,
     resolveClient,
@@ -2987,6 +3027,8 @@ export function serverDeps(
     ...(carriedModelAuth ? { harnessCarriedModelAuth: carriedModelAuth } : {}),
     harnessId: config.harness,
     connectorTokens: built.connectorTokens,
+    appGitHub: built.appGitHub,
+    deployStore: built.deployStore,
     slackInstallation: built.slackInstallation,
     slackEnvironmentState,
     ...(config.slackEventsPort ? { slackEventsPort: config.slackEventsPort } : {}),

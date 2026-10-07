@@ -115,6 +115,11 @@ import { type Project, type ProjectStore } from "../projects/project-store.ts";
 import type { SearchHit } from "../search/core-search.ts";
 
 interface DeploymentVersionView {
+  title?: string;
+  description?: string;
+  publisher?: string;
+  commitMessage?: string;
+  sourceSha?: string;
   version: number;
   createdAt: number;
   commit?: string;
@@ -146,12 +151,19 @@ export interface ViewerDeployment extends DeploymentView {
 }
 
 export function deploymentView(d: Deployment): DeploymentView {
-  const versions = d.versions.map(({ version, createdAt, commit, parentCommit }) => ({
-    version,
-    createdAt,
-    ...(commit ? { commit } : {}),
-    ...(parentCommit ? { parentCommit } : {}),
-  }));
+  const versions = d.versions.map(
+    ({ version, createdAt, commit, parentCommit, title, description, publisher, commitMessage, sourceSha }) => ({
+      ...(title !== undefined ? { title } : {}),
+      ...(description !== undefined ? { description } : {}),
+      ...(publisher !== undefined ? { publisher } : {}),
+      ...(commitMessage !== undefined ? { commitMessage } : {}),
+      ...(sourceSha !== undefined ? { sourceSha } : {}),
+      version,
+      createdAt,
+      ...(commit ? { commit } : {}),
+      ...(parentCommit ? { parentCommit } : {}),
+    }),
+  );
   return {
     id: d.id,
     ownerScopeId: d.ownerScopeId,
@@ -571,7 +583,7 @@ export interface App {
     id: string;
     liveActor?: boolean;
   }): Promise<"missing" | "forbidden" | "trigger_blocked" | "deleted">;
-  rollbackDeployment(id: string, version: number): Promise<void>;
+  rollbackDeployment(id: string, version: number, actorId?: string, operationId?: string): Promise<void>;
   archiveDeployment(id: string): Promise<void>;
   restoreDeployment(id: string, actorId?: string): Promise<Deployment>;
   canManageDeployment(idOrName: string, callerId: string, actingScopeId?: ScopeId): Promise<boolean>;
@@ -603,7 +615,11 @@ export interface App {
   }>;
   deploymentGrantees(idOrName: string): Promise<DeploymentGrantee[]>;
   deploymentGitRepoPath(id: string): Promise<string | null>;
-  runDeploymentGitPush<T>(id: string, runReceivePack: () => Promise<{ result: T; ok: boolean }>): Promise<T>;
+  runDeploymentGitPush<T>(
+    id: string,
+    runReceivePack: () => Promise<{ result: T; ok: boolean }>,
+    actorId?: string,
+  ): Promise<T>;
   deploymentGitUrlFor(
     idOrName: string,
     principalId: string,

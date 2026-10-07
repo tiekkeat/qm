@@ -1184,7 +1184,7 @@ export async function boot(): Promise<void> {
         params.get("scope") ?? (wantedItem ? resolveProjectScope(await ensureContexts(), wantedItem) : null);
       if (scope) contextsState.selected = scope;
     }
-    if (wanted === "deploys" && wantedItem) openDeployById(wantedItem);
+    if (wanted === "deploys" && wantedItem) openDeployById(wantedItem, Number(params.get("version")) || undefined);
     if (wanted === "crons" && wantedItem) openCronById(wantedItem);
     if (wanted === "webhooks" && wantedItem) openWebhookById(wantedItem);
     if (wanted === "skills" && wantedItem) openSkillById(wantedItem);

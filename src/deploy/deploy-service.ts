@@ -20,6 +20,8 @@ import {
   type Deployment,
   type DeployEndpoint,
   type DeploymentVersion,
+  type ReleaseMetadata,
+  type DeploymentEvent,
 } from "./deploy-store.ts";
 import type { DeployProfile, DeployProvider } from "./deploy-provider.ts";
 import { createNoopLeaderLease, type LeaderLease } from "../persistence/leader-lease.ts";
@@ -33,7 +35,9 @@ export interface DeployFile {
   mode?: number;
 }
 
-export interface RedeployInput {
+export interface RedeployInput extends ReleaseMetadata {
+  expectedVersion?: number;
+  operationId?: string;
   entrypoint: string;
   files: DeployFile[];
   homeFiles?: DeployFile[];
@@ -52,7 +56,7 @@ export interface DeployInput extends RedeployInput {
 export type Reach =
   { status: "ok"; id: string; endpoint: DeployEndpoint } | { status: "denied" } | { status: "not_found" };
 
-export interface DeployOrUpdateInput {
+export interface DeployOrUpdateInput extends ReleaseMetadata {
   ownerScopeId: ScopeId;
   createdBy: string;
   name?: string;
@@ -81,7 +85,11 @@ export interface DeployService {
   redeploy(id: string, input: RedeployInput): Promise<Deployment>;
   getDeployment(idOrName: string): Promise<Deployment | null>;
   listDeployments(): Promise<Deployment[]>;
-  rollbackDeployment(id: string, version: number, options?: { alwaysOn?: boolean }): Promise<void>;
+  rollbackDeployment(
+    id: string,
+    version: number,
+    options?: { alwaysOn?: boolean; actorId?: string; operationId?: string },
+  ): Promise<void>;
   archiveDeployment(id: string): Promise<void>;
   restoreDeployment(id: string, actorId?: string): Promise<Deployment>;
   renameDeployment(id: string, name: string): Promise<Deployment>;
@@ -95,7 +103,7 @@ export interface DeployService {
   /** Recent app output (entrypoint stdout+stderr) for a deployment, newest last; null when the provider keeps none. */
   deploymentLogs(idOrName: string, opts: { tailLines: number }): Promise<string | null>;
   gitRepoPath(idOrName: string): Promise<string | null>;
-  pushGit<T>(id: string, runReceivePack: () => Promise<{ result: T; ok: boolean }>): Promise<T>;
+  pushGit<T>(id: string, runReceivePack: () => Promise<{ result: T; ok: boolean }>, actorId?: string): Promise<T>;
   reapIdleDeployments(ttlMs: number, now?: number): Promise<number>;
   deployOrUpdate(input: DeployOrUpdateInput): Promise<Deployment>;
   deploymentGrantees(idOrName: string): Promise<DeploymentGrantee[]>;
@@ -232,12 +240,25 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
     version: DeploymentVersion,
     fromVersion?: number,
     alwaysOn?: boolean,
+    eventKind: "publish" | "rollback" = "publish",
   ): Promise<DeployEndpoint> => {
+    const event: DeploymentEvent = {
+      id: randomUUID(),
+      actor: version.publisher ?? "unknown",
+      fromVersion,
+      toVersion: version.version,
+      at: Date.now(),
+      kind: eventKind,
+      outcome: "started",
+    };
+    if (eventKind === "publish") await deps.deployStore.recordEvent(id, event);
     try {
       const endpoint = await applyVersion(id, version, fromVersion, alwaysOn);
       await markVersionRunning(id, version.version, endpoint);
+      if (eventKind === "publish") await deps.deployStore.recordEvent(id, { ...event, outcome: "succeeded" });
       return endpoint;
     } catch (error) {
+      if (eventKind === "publish") await deps.deployStore.recordEvent(id, { ...event, outcome: "failed" });
       await deps.deployStore
         .setDeployFailure(id, version.version)
         .catch((storeError) => swallow("deploy failure status", storeError));
@@ -403,41 +424,61 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
     assertShareAllowed,
 
     async deploy(input) {
-      if (input.name !== undefined) {
-        validateName(input.name);
-        if (await deps.deployStore.getByName(input.name)) throw new Error(`deployment name taken: ${input.name}`);
-      }
-      const snapshotDir = await snapshotFiles(deps.deployDir, input.files);
-      const homeDir = input.homeFiles?.length ? await snapshotFiles(deps.deployDir, input.homeFiles) : undefined;
-      const env = input.stampEnv ? { ...input.env, ...input.stampEnv } : input.env;
-      const d = await deps.deployStore.create({
-        ownerScopeId: input.ownerScopeId,
-        createdBy: input.createdBy,
-        entrypoint: input.entrypoint,
-        snapshotDir,
-        files: input.files,
-        ...(homeDir ? { homeDir } : {}),
-        ...(input.name !== undefined ? { name: input.name } : {}),
-        ...(input.createdInScope !== undefined ? { createdInScope: input.createdInScope } : {}),
-        ...(env ? { env } : {}),
-        ...(input.alwaysOn !== undefined ? { alwaysOn: input.alwaysOn } : {}),
+      const id = randomUUID();
+      return withDeployLock(id, async () => {
+        if (input.name !== undefined) {
+          validateName(input.name);
+          if (await deps.deployStore.getByName(input.name)) throw new Error(`deployment name taken: ${input.name}`);
+        }
+        const snapshotDir = await snapshotFiles(deps.deployDir, input.files);
+        const homeDir = input.homeFiles?.length ? await snapshotFiles(deps.deployDir, input.homeFiles) : undefined;
+        const env = input.stampEnv ? { ...input.env, ...input.stampEnv } : input.env;
+        const d = await deps.deployStore.create({
+          id,
+          ownerScopeId: input.ownerScopeId,
+          createdBy: input.createdBy,
+          entrypoint: input.entrypoint,
+          snapshotDir,
+          files: input.files,
+          title: input.title ?? `Launch ${input.name ?? "app"}`,
+          description: input.description ?? `Initial release with ${input.files.length} source files.`,
+          commitMessage: input.commitMessage,
+          sourceSha: input.sourceSha,
+          publisher: input.publisher ?? input.createdBy,
+          ...(homeDir ? { homeDir } : {}),
+          ...(input.name !== undefined ? { name: input.name } : {}),
+          ...(input.createdInScope !== undefined ? { createdInScope: input.createdInScope } : {}),
+          ...(env ? { env } : {}),
+          alwaysOn: input.alwaysOn ?? false,
+        });
+        await applyAndMarkVersion(d.id, d.versions[0]!);
+        void deps.appPublished?.(input.createdBy, d.id, d.versions[0]!.version).catch(() => {});
+        deps.auditLog.record({
+          at: Date.now(),
+          principalId: input.createdBy,
+          action: "deploy",
+          resource: d.id,
+          scopeLabel: input.ownerScopeId,
+        });
+        return (await deps.deployStore.get(d.id))!;
       });
-      await applyAndMarkVersion(d.id, d.versions[0]!);
-      void deps.appPublished?.(input.createdBy, d.id, d.versions[0]!.version).catch(() => {});
-      deps.auditLog.record({
-        at: Date.now(),
-        principalId: input.createdBy,
-        action: "deploy",
-        resource: d.id,
-        scopeLabel: input.ownerScopeId,
-      });
-      return (await deps.deployStore.get(d.id))!;
     },
 
     async redeploy(id, input) {
       return withDeployLock(id, async () => {
         const before = await deps.deployStore.get(id);
         if (!before) throw new Error(`unknown deployment: ${id}`);
+        const prior = input.operationId ? before.versions.find((v) => v.operationId === input.operationId) : undefined;
+        if (prior) {
+          if (before.appliedVersion !== prior.version) {
+            if (before.currentVersion !== prior.version)
+              throw new Error("QM changed after this import. Review the newer release before retrying.");
+            await applyAndMarkVersion(id, prior, before.appliedVersion);
+          }
+          return (await deps.deployStore.get(id))!;
+        }
+        if (input.expectedVersion !== undefined && input.expectedVersion !== before.currentVersion)
+          throw new Error("QM changed concurrently. Refresh and review before importing.");
         const current = currentVersionOf(before);
         const snapshotDir = await snapshotFiles(deps.deployDir, input.files);
         let homeDir = input.homeFiles === undefined ? current?.homeDir : undefined;
@@ -448,14 +489,21 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
           entrypoint: input.entrypoint,
           snapshotDir,
           files: input.files,
+          title: input.title ?? `Update ${before.displayName ?? before.name ?? "app"}`,
+          description: input.description ?? `Published ${input.files.length} source files.`,
+          commitMessage: input.commitMessage,
+          sourceSha: input.sourceSha,
+          publisher: input.publisher,
+          operationId: input.operationId,
+          alwaysOn: input.alwaysOn ?? before.alwaysOn,
           ...(homeDir ? { homeDir } : {}),
           ...(env ? { env } : {}),
         });
         await applyAndMarkVersion(id, v, before.appliedVersion ?? before.currentVersion, input.alwaysOn);
-        void deps.appPublished?.(before.createdBy, id, v.version).catch(() => {});
+        void deps.appPublished?.(v.publisher ?? before.createdBy, id, v.version).catch(() => {});
         deps.auditLog.record({
           at: Date.now(),
-          principalId: before.createdBy,
+          principalId: v.publisher ?? before.createdBy,
           action: "deploy_version",
           resource: `${id}@v${v.version}`,
           scopeLabel: before.ownerScopeId,
@@ -475,14 +523,43 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
     async rollbackDeployment(id, version, options) {
       return withDeployLock(id, async () => {
         const before = await deps.deployStore.get(id);
+        if (!before || !Number.isInteger(version)) throw new Error("unknown deployment or invalid version");
+        if (!(await deps.deployStore.versionOf(id, version))) throw new Error(`no such version ${version}`);
+        const eventId = options?.operationId ? `rollback:${options.operationId}` : randomUUID();
+        const previous = before.events?.find((e) => e.id === eventId);
+        if (previous && (previous.actor !== (options?.actorId ?? "unknown") || previous.toVersion !== version))
+          throw new Error("Rollback operation ID was already used.");
+        if (previous?.outcome === "succeeded") return;
+        const event: DeploymentEvent = {
+          id: eventId,
+          actor: options?.actorId ?? "unknown",
+          fromVersion: before.appliedVersion,
+          toVersion: version,
+          at: Date.now(),
+          kind: "rollback",
+          outcome: "started",
+        };
+        await deps.deployStore.recordEvent(id, event);
         await deps.deployStore.setCurrentVersion(id, version);
         const v = await deps.deployStore.versionOf(id, version);
         const d = await deps.deployStore.get(id);
         if (!d || !v) return;
-        await applyAndMarkVersion(id, v, before?.appliedVersion ?? before?.currentVersion, options?.alwaysOn);
+        try {
+          await applyAndMarkVersion(
+            id,
+            v,
+            before.appliedVersion ?? before.currentVersion,
+            options?.alwaysOn ?? v.alwaysOn,
+            "rollback",
+          );
+          await deps.deployStore.recordEvent(id, { ...event, outcome: "succeeded" });
+        } catch (error) {
+          await deps.deployStore.recordEvent(id, { ...event, outcome: "failed" });
+          throw error;
+        }
         deps.auditLog.record({
           at: Date.now(),
-          principalId: d.createdBy,
+          principalId: options?.actorId ?? "unknown",
           action: "deploy_rollback",
           resource: `${id}@v${version}`,
           scopeLabel: d.ownerScopeId,
@@ -662,7 +739,7 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
       return d ? await deps.deployStore.repoUrl(d.id) : null;
     },
 
-    async pushGit(id, runReceivePack) {
+    async pushGit(id, runReceivePack, actorId) {
       return withDeployLock(id, async () => {
         const { result, ok } = await runReceivePack();
         if (!ok) return result;
@@ -673,13 +750,13 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
           ownerScopeId = before.ownerScopeId;
           const pushed = await deps.deployStore.refOf(id, deployCurrentGitRef);
           if (!pushed) return result;
-          const v = await deps.deployStore.addVersionFromCommit(id, pushed);
+          const v = await deps.deployStore.addVersionFromCommit(id, pushed, actorId);
           if (!v) return result;
           await applyAndMarkVersion(id, v, before.appliedVersion ?? before.currentVersion);
-          void deps.appPublished?.(before.createdBy, id, v.version).catch(() => {});
+          void deps.appPublished?.(v.publisher ?? before.createdBy, id, v.version).catch(() => {});
           deps.auditLog.record({
             at: Date.now(),
-            principalId: before.createdBy,
+            principalId: v.publisher ?? before.createdBy,
             action: "deploy_git_push",
             resource: `${id}@v${v.version}`,
             scopeLabel: before.ownerScopeId,
@@ -755,6 +832,8 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
         if (input.files?.length) {
           const entrypoint = requiredEntrypoint(input.entrypoint, existing);
           await this.redeploy(existing.id, {
+            ...input,
+            publisher: createdBy,
             entrypoint,
             files: input.files,
             ...(input.alwaysOn !== undefined ? { alwaysOn: input.alwaysOn } : {}),
@@ -783,11 +862,7 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
         if (!existing) throw new Error(`no deployment named: ${input.name}`);
         if (!(await canManage(existing, ownerScopeId, createdBy, input.createdInScope)))
           throw new Error(`not authorized to manage deployment: ${input.name}`);
-        await this.rollbackDeployment(
-          existing.id,
-          input.rollbackTo,
-          input.alwaysOn !== undefined ? { alwaysOn: input.alwaysOn } : undefined,
-        );
+        await this.rollbackDeployment(existing.id, input.rollbackTo, { alwaysOn: input.alwaysOn, actorId: createdBy });
         if (input.embedAncestors !== undefined)
           await this.setDeploymentEmbedAncestors(existing.id, input.embedAncestors);
         if (input.public !== undefined) await this.setDeploymentPublic(existing.id, input.public, { createdBy });
@@ -808,6 +883,8 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
         }
         const entrypoint = requiredEntrypoint(input.entrypoint, existing);
         d = await this.redeploy(existing.id, {
+          ...input,
+          publisher: createdBy,
           entrypoint,
           files,
           ...(input.alwaysOn !== undefined ? { alwaysOn: input.alwaysOn } : {}),
@@ -819,8 +896,10 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
       } else {
         const entrypoint = requiredEntrypoint(input.entrypoint, existing);
         d = await this.deploy({
+          ...input,
           ownerScopeId,
           createdBy,
+          publisher: createdBy,
           entrypoint,
           files,
           ...(input.homeFiles ? { homeFiles: input.homeFiles } : {}),

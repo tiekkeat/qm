@@ -1,3 +1,5 @@
+import type { AppGitHubService } from "../deploy/app-github.ts";
+import type { DeployStore } from "../deploy/deploy-store.ts";
 import type { AccountStore } from "../auth/accounts.ts";
 import type { ExternalSlackPolicies } from "../resolution/external-slack.ts";
 import type { ProviderKeys } from "../harness/pi-harness.ts";
@@ -82,6 +84,8 @@ import type { SlackInstallationStore, SlackSocketAppIdReader } from "../surfaces
 import type { SlackAccountLink, ComposioReturn } from "./routes/composio.ts";
 
 export interface ServerDeps {
+  appGitHub?: AppGitHubService;
+  deployStore?: DeployStore;
   externalSlackPolicies?: ExternalSlackPolicies;
   checkReadiness?: (signal: AbortSignal) => Promise<void>;
   browserModelGateway?: ModelGatewayTransportConfig;

@@ -95,14 +95,14 @@ test("withDeployLock: redeploy/rollback/archive each acquire the advisory mutex 
     entrypoint: "x",
     files: [],
   });
-  assert.deepEqual(keys, [], "the initial create takes no deploy lock");
+  assert.deepEqual(keys, [`deploy:${d.id}`], "initial publication locks before making the app visible");
 
   await deploy.redeploy(d.id, { entrypoint: "y", files: [] });
   await deploy.rollbackDeployment(d.id, 1);
   await deploy.archiveDeployment(d.id);
 
   const want = `deploy:${d.id}`;
-  assert.deepEqual(keys, [want, want, want], "redeploy, rollback, archive each lock deploy:<id>");
+  assert.deepEqual(keys, [want, want, want, want], "create, redeploy, rollback, archive each lock deploy:<id>");
 });
 
 test("withDeployLock: same-instance lifecycle ops still serialize (no overlap)", async () => {
@@ -138,4 +138,50 @@ test("withDeployLock: same-instance lifecycle ops still serialize (no overlap)",
     deploy.redeploy(d.id, { entrypoint: "b", files: [] }),
   ]);
   assert.equal(maxActive, 1, "two redeploys on one deployment never ran apply() concurrently");
+});
+
+test("first publication and an update discovered while it deploys serialize across service instances", async () => {
+  const store = createDeployStore();
+  const lock = (await import("../src/persistence/advisory-lock.ts")).createMemoryAdvisoryLock();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const applied: number[] = [];
+  const provider: DeployProvider = {
+    profile: { managedScaleToZero: false },
+    destroy: async () => {},
+    apply: async (_d, version) => {
+      if (version.version === 1) {
+        entered.resolve();
+        await release.promise;
+      }
+      applied.push(version.version);
+      return { host: "localhost", port: 5000 };
+    },
+  };
+  const deps = {
+    deployStore: store,
+    provider,
+    advisoryLock: lock,
+    acl: createAclStore(),
+    auditLog: { record() {}, events: async () => [], tail: async () => [] },
+    deployDir: mkdtempSync(join(tmpdir(), "initial-publish-lock-")),
+  };
+  const first = createDeployService(deps);
+  const second = createDeployService(deps);
+  const initial = first.deploy({
+    ownerScopeId: scopeId("personal", "owner"),
+    createdBy: "owner",
+    name: "initial-app",
+    entrypoint: "node app.js",
+    files: [{ path: "app.js", data: "first" }],
+  });
+  await entered.promise;
+  const app = (await store.getByName("initial-app"))!;
+  const updating = second.redeploy(app.id, { entrypoint: "node app.js", files: [{ path: "app.js", data: "second" }] });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(applied, []);
+  release.resolve();
+  await Promise.all([initial, updating]);
+  assert.deepEqual(applied, [1, 2]);
+  assert.equal((await store.get(app.id))!.appliedVersion, 2);
 });
