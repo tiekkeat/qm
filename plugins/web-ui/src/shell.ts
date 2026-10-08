@@ -92,7 +92,8 @@ import { openChatSearch } from "./search";
 import { closeBrowse, openBrowse } from "./browse";
 import { attachTooltip, hideTooltip, tip } from "./tooltip";
 import { clearConnectorNotice, noteConnectorResult, renderConnectors, resetKeychainState } from "./connectors";
-import { openDeployById, renderDeploys } from "./deploys";
+import { resetCollaborationStates } from "./app-collaboration";
+import { openDeployById, renderDeploys, stopDeployDetail } from "./deploys";
 import { renderMemory, resetMemoryState } from "./memory";
 import { renderCalendar } from "./calendar";
 import {
@@ -243,6 +244,8 @@ export async function signOut(): Promise<void> {
       void 0;
     }
   }
+  stopDeployDetail();
+  resetCollaborationStates();
   appState.me = null;
   closeBrowse();
   resetInboxState();
@@ -694,6 +697,7 @@ export function switchView(v: View): void {
     refreshActiveView(v);
     return;
   }
+  if (appState.currentView === "deploys") stopDeployDetail();
   appState.currentView = v;
   capturePageview(v);
   appState.viewRenderSeq++;
@@ -1184,7 +1188,8 @@ export async function boot(): Promise<void> {
         params.get("scope") ?? (wantedItem ? resolveProjectScope(await ensureContexts(), wantedItem) : null);
       if (scope) contextsState.selected = scope;
     }
-    if (wanted === "deploys" && wantedItem) openDeployById(wantedItem, Number(params.get("version")) || undefined);
+    if (wanted === "deploys" && wantedItem)
+      openDeployById(wantedItem, Number(params.get("version")) || undefined, params.get("tab") ?? undefined);
     if (wanted === "crons" && wantedItem) openCronById(wantedItem);
     if (wanted === "webhooks" && wantedItem) openWebhookById(wantedItem);
     if (wanted === "skills" && wantedItem) openSkillById(wantedItem);

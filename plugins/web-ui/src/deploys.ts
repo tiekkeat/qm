@@ -1,4 +1,12 @@
-import { collaborationPanel, refreshCollaboration, viewRelease } from "./app-collaboration";
+import "./app-collaboration.css";
+import {
+  collaborationPanel,
+  collaborationState,
+  loadingIndicator,
+  stopCollaborationReads,
+  refreshCollaboration,
+  viewRelease,
+} from "./app-collaboration";
 import { openDeploymentPermissions } from "./deploy-permissions";
 import { html, nothing, render, type TemplateResult } from "lit";
 import { live } from "lit/directives/live.js";
@@ -62,6 +70,39 @@ let deployQuery = "";
 let deployTab: DeploymentTab = "yours";
 let deployPageHost: HTMLElement | null = null;
 let activeDeploy: DeploymentView | null = null;
+let detailAbort: AbortController | undefined;
+let connectionTimer: ReturnType<typeof setInterval> | undefined;
+function checkActiveConnection(): void {
+  if (!activeDeploy || appState.currentView !== "deploys" || document.hidden) return;
+  const d = activeDeploy;
+  void refreshCollaboration(d, () => drawDeployDetail(d));
+}
+export function stopDeployDetail(): void {
+  detailAbort?.abort();
+  if (activeDeploy) stopCollaborationReads(activeDeploy.id);
+  if (connectionTimer) clearInterval(connectionTimer);
+  connectionTimer = undefined;
+  window.removeEventListener("focus", checkActiveConnection);
+  document.removeEventListener("visibilitychange", checkActiveConnection);
+  activeDeploy = null;
+}
+function selectDetailTab(tab: "overview" | "versions" | "github" | "settings"): void {
+  if (!activeDeploy) return;
+  const d = activeDeploy,
+    s = collaborationState(d.id);
+  s.tab = tab;
+  const url = new URL(window.location.href);
+  if (tab === "overview") url.searchParams.delete("tab");
+  else url.searchParams.set("tab", tab);
+  if (tab !== "versions") url.searchParams.delete("version");
+  history.replaceState(null, "", url.pathname + url.search);
+  drawDeployDetail(d);
+  if (tab === "github") checkActiveConnection();
+  if (tab === "versions" && !s.release) {
+    const release = d.versions?.find((v) => v.version === (d.appliedVersion ?? d.currentVersion));
+    if (release) void viewRelease(d, release, () => drawDeployDetail(d));
+  }
+}
 let visibleVersionCount = 10;
 let editingDeploy: { id: string; field: DeployEditField } | null = null;
 let deployDraft = "";
@@ -176,7 +217,7 @@ function deploymentRow(d: DeploymentView): TemplateResult {
 
 function drawDeploysPage(): void {
   if (appState.currentView !== "deploys" || !appState.mainEl) return;
-  activeDeploy = null;
+  stopDeployDetail();
   if (!deployPageHost || deployPageHost.parentElement !== appState.mainEl) {
     deployPageHost = document.createElement("div");
     deployPageHost.className = "pane deploys-page";
@@ -235,43 +276,64 @@ function drawDeploysPage(): void {
 
 let pendingDeployId: string | null = null;
 let pendingDeployVersion: number | undefined;
+let pendingDetailTab: string | undefined;
 
-export function openDeployById(id: string, version?: number): void {
+export function openDeployById(id: string, version?: number, tab?: string): void {
   pendingDeployId = id;
   pendingDeployVersion = version;
+  pendingDetailTab = tab;
 }
 
 async function openDeploy(d: DeploymentView): Promise<void> {
+  stopDeployDetail();
+  const controller = new AbortController();
+  detailAbort = controller;
+  const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(20_000)]);
   visibleVersionCount = 10;
   editingDeploy = null;
   deployDraft = "";
   deployNotices = withoutDeploymentDetailNotice(deployNotices);
   activeDeploy = d;
+  const tabQuery = pendingDetailTab ?? new URLSearchParams(window.location.search).get("tab");
+  pendingDetailTab = undefined;
   const requestedVersion = pendingDeployVersion ?? Number(new URLSearchParams(window.location.search).get("version"));
   pendingDeployVersion = undefined;
+  const detailState = collaborationState(d.id);
+  const releaseAtOpen = detailState.release;
+  detailState.tab = requestedVersion > 0 ? "versions" : "overview";
+  if (tabQuery === "github" || tabQuery === "settings" || tabQuery === "versions") detailState.tab = tabQuery;
   const releaseQuery = Number.isSafeInteger(requestedVersion) && requestedVersion > 0 ? String(requestedVersion) : null;
   history.replaceState(
     null,
     "",
-    `${deepLinkPath(UI_BASE, "deploys", null, null, d.id)}${releaseQuery ? `?version=${encodeURIComponent(releaseQuery)}` : ""}`,
+    `${deepLinkPath(UI_BASE, "deploys", null, null, d.id)}?tab=${detailState.tab}${releaseQuery ? `&version=${encodeURIComponent(releaseQuery)}` : ""}`,
   );
   drawDeployDetail(d, true);
+  window.addEventListener("focus", checkActiveConnection);
+  document.addEventListener("visibilitychange", checkActiveConnection);
+  connectionTimer = setInterval(() => {
+    if (activeDeploy && collaborationState(activeDeploy.id).tab === "github") checkActiveConnection();
+  }, 60_000);
+  void refreshCollaboration(d, () => drawDeployDetail(d));
   try {
-    const response = await api<{ deployment?: DeploymentView }>(`/api/deployments/${encodeURIComponent(d.id)}`);
-    if (appState.currentView !== "deploys" || activeDeploy?.id !== d.id) return;
+    const response = await api<{ deployment?: DeploymentView }>(`/api/deployments/${encodeURIComponent(d.id)}`, {
+      signal,
+    });
+    if (detailAbort !== controller || signal.aborted || appState.currentView !== "deploys" || activeDeploy?.id !== d.id)
+      return;
     activeDeploy = response.deployment ?? d;
     drawDeployDetail(activeDeploy);
-    const release = activeDeploy.versions?.find((v) => v.version === requestedVersion);
-    if (release)
-      await viewRelease(activeDeploy, release, () => {
+    const release = activeDeploy.versions?.find(
+      (v) =>
+        v.version ===
+        (requestedVersion > 0 ? requestedVersion : (activeDeploy!.appliedVersion ?? activeDeploy!.currentVersion)),
+    );
+    if (release && detailState.release === releaseAtOpen)
+      void viewRelease(activeDeploy, release, () => {
         if (activeDeploy?.id === d.id) drawDeployDetail(activeDeploy);
       });
-    if (appState.currentView !== "deploys" || activeDeploy?.id !== d.id) return;
-    await refreshCollaboration(activeDeploy, () => {
-      if (activeDeploy?.id === d.id) drawDeployDetail(activeDeploy);
-    });
   } catch (error) {
-    if (activeDeploy?.id !== d.id) return;
+    if (activeDeploy?.id !== d.id || detailAbort !== controller || controller.signal.aborted) return;
     deployNotices = withDeploymentDetailNotice(deployNotices, d.id, errMessage(error, "Could not load app details."));
     drawDeployDetail(d);
   }
@@ -282,6 +344,7 @@ function drawDeployDetail(d: DeploymentView, loading = false): void {
   d = activeDeploy;
   const host = appState.mainEl.querySelector<HTMLElement>(".deploy-detail-pane") ?? document.createElement("div");
   host.className = "resource-pane deploy-detail-pane";
+  const detailState = collaborationState(d.id);
   const versions = [...(d.versions ?? [])].sort((a, b) => b.version - a.version);
   const running = d.status === "running";
   const contextScope = deploymentContextScope(d);
@@ -305,8 +368,8 @@ function drawDeployDetail(d: DeploymentView, loading = false): void {
             ${d.webUrl ? html`<button class="btn" type="button" @click=${(event: Event) => void copyText(new URL(withBase(d.webUrl!), window.location.href).href, event.currentTarget as HTMLButtonElement)}>${icon(Copy, 14)}<span>Copy URL</span></button>` : nothing}
           </div>
         </div>
-        ${loading ? html`<div class="hint">Loading authoritative app details…</div>` : nothing}
-        ${deployNotices.detail?.id === d.id ? html`<div class="status">${deployNotices.detail.text}</div>` : nothing}
+        ${loading ? loadingIndicator("Loading app details…") : nothing}
+        ${deployNotices.detail?.id === d.id ? html`<div class="status">${deployNotices.detail.text}<button class="btn" @click=${() => void openDeploy(d)}>Retry app details</button></div>` : nothing}
 
         <div class="deploy-summary">
           <span>Live v${d.appliedVersion ?? d.currentVersion ?? "—"}</span>
@@ -324,112 +387,148 @@ function drawDeployDetail(d: DeploymentView, loading = false): void {
           ${d.ownerScopeId === `personal:${appState.me?.user}` ? html`<button class="btn" type="button" @click=${() => void openDeploymentPermissions(d.id, deploymentTitle(d), d.ownerScopeId!)}>Permissions</button>` : permissionBadge(d)}
         </div>
 
-        ${
-          canManage(d)
-            ? html`<section class="deploy-detail-section">
-                <h3>Settings</h3>
-                <div class="deploy-setting-row">
-                  <div><strong>Display name</strong><span>Shown in the app bar and app list.</span></div>
-                  ${editingName ? deployEditForm(d, "displayName") : html`<div class="deploy-setting-value"><span dir="auto">${deploymentTitle(d)}</span><button class="btn" type="button" @click=${() => startEditDeploy(d, "displayName")}>Edit</button></div>`}
-                </div>
-                <div class="deploy-setting-row">
-                  <div><strong>App URL</strong><span>Changes the app URL. Existing links do not redirect.</span></div>
-                  ${editingSlug ? deployEditForm(d, "name") : html`<div class="deploy-setting-value"><code>/d/${deploymentSlug(d)}/</code><button class="btn" type="button" @click=${() => startEditDeploy(d, "name")}>Change</button></div>`}
-                </div>
-                <div class="deploy-setting-row">
-                  <div>
-                    <strong>Embedding</strong
-                    ><span
-                      >Sites allowed to show this app inside their own page. Every frame between the app and the browser
-                      tab must be listed.</span
-                    >
+        <div
+          class="app-detail-tabs"
+          role="tablist"
+          aria-label="App details"
+          @keydown=${(event: KeyboardEvent) => {
+            const tabs = ["overview", "versions", "github", "settings"] as const;
+            const index = tabs.indexOf(detailState.tab);
+            let next: number | undefined;
+            if (event.key === "ArrowRight") next = (index + 1) % tabs.length;
+            if (event.key === "ArrowLeft") next = (index + tabs.length - 1) % tabs.length;
+            if (event.key === "Home") next = 0;
+            if (event.key === "End") next = tabs.length - 1;
+            if (next === undefined) return;
+            event.preventDefault();
+            selectDetailTab(tabs[next]!);
+            requestAnimationFrame(() =>
+              document.querySelector<HTMLElement>(".app-detail-tabs [aria-selected=true]")?.focus(),
+            );
+          }}
+        >
+          ${(["overview", "versions", "github", "settings"] as const).map((tab) => html`<button id=${`app-tab-${tab}`} role="tab" aria-selected=${detailState.tab === tab} aria-controls="app-detail-panel" tabindex=${detailState.tab === tab ? 0 : -1} @click=${() => selectDetailTab(tab)}>${tab === "github" ? "GitHub" : tab[0]!.toUpperCase() + tab.slice(1)}</button>`)}
+        </div>
+        <div id="app-detail-panel" role="tabpanel" aria-labelledby=${`app-tab-${detailState.tab}`}>
+          ${detailState.tab === "overview" || detailState.tab === "github" ? collaborationPanel(d, () => drawDeployDetail(d), refreshActiveApp, detailState.tab) : nothing}
+          ${
+            canManage(d) && detailState.tab === "settings"
+              ? html`<section class="deploy-detail-section">
+                  <h3>Settings</h3>
+                  <div class="deploy-setting-row">
+                    <div><strong>Display name</strong><span>Shown in the app bar and app list.</span></div>
+                    ${editingName ? deployEditForm(d, "displayName") : html`<div class="deploy-setting-value"><span dir="auto">${deploymentTitle(d)}</span><button class="btn" type="button" @click=${() => startEditDeploy(d, "displayName")}>Edit</button></div>`}
                   </div>
-                  ${
-                    editingEmbed
-                      ? deployEditForm(d, "embedAncestors")
-                      : html`<div class="deploy-setting-value">
-                          ${embedAncestorsSummary(d)}
-                          <button class="btn" type="button" @click=${() => startEditDeploy(d, "embedAncestors")}>
-                            ${d.embedAncestors?.length ? "Change" : "Allow"}
-                          </button>
-                        </div>`
-                  }
-                </div>
-                <div class="actions deploy-danger-actions">
-                  ${
-                    d.status === "archived"
-                      ? html`<button class="btn" type="button" @click=${() => void restoreDeploy(d)}>
-                          ${icon(RotateCcw, 14)}<span>Restore deployment</span>
-                        </button>`
-                      : html`<button
-                          class="btn danger deploy-archive-trigger"
-                          data-deployment-id=${d.id}
-                          type="button"
-                          @click=${() => requestArchive(d)}
-                        >
-                          ${icon(Archive, 14)}<span>Archive deployment</span>
-                        </button>`
-                  }
-                </div>
-              </section>`
-            : nothing
-        }
-
-        <section class="deploy-detail-section">
-          <h3>Version history</h3>
-          ${
-            versions.length
-              ? html`<div class="deploy-version-list">
-                  ${versions.slice(0, visibleVersionCount).map(
-                    (version) => html`
-                      <div class="deploy-version-row">
-                        <div>
-                          <strong>v${version.version}</strong
-                          >${version.version === d.appliedVersion ? html`<span class="badge ok">Live</span>` : nothing}${version.version === d.currentVersion ? html`<span class="badge">Selected for deployment</span>` : nothing}
-                        </div>
-                        <div>
-                          <span
-                            >${version.title || "Release title unavailable"} ·
-                            ${version.publisher || "Unknown publisher"} ·
-                            ${new Date(version.createdAt).toLocaleString()}</span
+                  <div class="deploy-setting-row">
+                    <div><strong>App URL</strong><span>Changes the app URL. Existing links do not redirect.</span></div>
+                    ${editingSlug ? deployEditForm(d, "name") : html`<div class="deploy-setting-value"><code>/d/${deploymentSlug(d)}/</code><button class="btn" type="button" @click=${() => startEditDeploy(d, "name")}>Change</button></div>`}
+                  </div>
+                  <div class="deploy-setting-row">
+                    <div>
+                      <strong>Embedding</strong
+                      ><span
+                        >Sites allowed to show this app inside their own page. Every frame between the app and the
+                        browser tab must be listed.</span
+                      >
+                    </div>
+                    ${
+                      editingEmbed
+                        ? deployEditForm(d, "embedAncestors")
+                        : html`<div class="deploy-setting-value">
+                            ${embedAncestorsSummary(d)}
+                            <button class="btn" type="button" @click=${() => startEditDeploy(d, "embedAncestors")}>
+                              ${d.embedAncestors?.length ? "Change" : "Allow"}
+                            </button>
+                          </div>`
+                    }
+                  </div>
+                  <div class="actions deploy-danger-actions">
+                    ${
+                      d.status === "archived"
+                        ? html`<button class="btn" type="button" @click=${() => void restoreDeploy(d)}>
+                            ${icon(RotateCcw, 14)}<span>Restore deployment</span>
+                          </button>`
+                        : html`<button
+                            class="btn danger deploy-archive-trigger"
+                            data-deployment-id=${d.id}
+                            type="button"
+                            @click=${() => requestArchive(d)}
                           >
-                          ${version.version === versions[0]?.version ? html`<span class="badge">Newest release</span>` : nothing}
-                          <button class="btn" @click=${() => void viewRelease(d, version, () => drawDeployDetail(d))}>
-                            View version
-                          </button>
-                        </div>
-                      </div>
-                    `,
-                  )}
-                </div>`
-              : html`<div class="empty compact">No version history available.</div>`
-          }
-          ${
-            versions.length > visibleVersionCount
-              ? html`<button
-                  class="btn"
-                  type="button"
-                  @click=${() => {
-                    visibleVersionCount += 10;
-                    drawDeployDetail(d);
-                  }}
-                >
-                  Show older versions
-                </button>`
+                            ${icon(Archive, 14)}<span>Archive deployment</span>
+                          </button>`
+                    }
+                  </div>
+                </section>`
               : nothing
           }
-        </section>
-        ${collaborationPanel(
-          d,
-          () => drawDeployDetail(d),
-          async () => {
-            const response = await api<{ deployment: DeploymentView }>(`/api/deployments/${encodeURIComponent(d.id)}`);
-            if (activeDeploy?.id === d.id) {
-              activeDeploy = response.deployment;
-              drawDeployDetail(activeDeploy);
-            }
-          },
-        )}
+          ${
+            detailState.tab === "versions"
+              ? html`<section class="deploy-detail-section">
+                    <h3>Version history</h3>
+                    ${
+                      versions.length
+                        ? html`<div class="deploy-version-list">
+                            ${versions.slice(0, visibleVersionCount).map(
+                              (version) => html`
+                                <div class="deploy-version-row">
+                                  <div>
+                                    <strong>v${version.version}</strong
+                                    >${version.version === d.appliedVersion ? html`<span class="badge ok">Live</span>` : nothing}${version.version === d.currentVersion ? html`<span class="badge">Selected for deployment</span>` : nothing}
+                                  </div>
+                                  <div>
+                                    <span
+                                      >${version.title || "Release title unavailable"} ·
+                                      ${version.publisher || "Unknown publisher"} ·
+                                      ${new Date(version.createdAt).toLocaleString()}</span
+                                    >
+                                    ${version.version === versions[0]?.version ? html`<span class="badge">Newest release</span>` : nothing}
+                                    <button
+                                      class="btn"
+                                      @click=${() => {
+                                        const url = new URL(window.location.href);
+                                        url.searchParams.set("version", String(version.version));
+                                        url.searchParams.set("tab", "versions");
+                                        history.replaceState(null, "", url.pathname + url.search);
+                                        void viewRelease(d, version, () => drawDeployDetail(d));
+                                      }}
+                                    >
+                                      View version
+                                    </button>
+                                  </div>
+                                </div>
+                              `,
+                            )}
+                          </div>`
+                        : html`<div class="empty compact">No version history available.</div>`
+                    }
+                    ${
+                      versions.length > visibleVersionCount
+                        ? html`<button
+                            class="btn"
+                            type="button"
+                            @click=${() => {
+                              visibleVersionCount += 10;
+                              drawDeployDetail(d);
+                            }}
+                          >
+                            Show older versions
+                          </button>`
+                        : nothing
+                    }
+                  </section>
+                  ${collaborationPanel(d, () => drawDeployDetail(d), refreshActiveApp, "versions")}`
+              : nothing
+          }
+          ${
+            detailState.tab === "settings" && !canManage(d)
+              ? html`<section class="app-card">
+                  <h3>Settings</h3>
+                  <p>App manage access is required to change settings.</p>
+                </section>`
+              : nothing
+          }
+        </div>
+        ${collaborationPanel(d, () => drawDeployDetail(d), refreshActiveApp, "dialog")}
       </div>
       ${archiveCandidate ? archiveDialog(archiveCandidate) : nothing} ${deployToast ? undoToast(deployToast) : nothing}
     `,
@@ -438,11 +537,22 @@ function drawDeployDetail(d: DeploymentView, loading = false): void {
   if (host.parentElement !== appState.mainEl) appState.mainEl.replaceChildren(host);
 }
 
+async function refreshActiveApp(): Promise<void> {
+  const d = activeDeploy;
+  if (!d) return;
+  const response = await api<{ deployment: DeploymentView }>(`/api/deployments/${encodeURIComponent(d.id)}`, {
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (activeDeploy?.id !== d.id || appState.currentView !== "deploys") return;
+  activeDeploy = response.deployment;
+  drawDeployDetail(activeDeploy);
+}
+
 function returnToDeploysList(): void {
   editingDeploy = null;
   deployDraft = "";
   deployNotices = withoutDeploymentDetailNotice(deployNotices);
-  activeDeploy = null;
+  stopDeployDetail();
   history.replaceState(null, "", deepLinkPath(UI_BASE, "deploys", null));
   drawDeploysPage();
 }

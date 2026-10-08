@@ -114,6 +114,7 @@ function renderHarness(requestedId: string | null = null) {
     appState: { currentView: "deploys", viewRenderSeq: 1 },
     pendingDeployId: requestedId,
     pendingDeployVersion: undefined,
+    pendingDetailTab: undefined,
     archiveCandidate: null,
     restoreArchiveFocus: false,
     scopedSession: { active: null },
@@ -137,8 +138,17 @@ function renderHarness(requestedId: string | null = null) {
     UI_BASE: "",
     history: { replaceState() {} },
     URLSearchParams,
-    window: { location: { search: "" } },
+    window: { location: { search: "" }, addEventListener() {} },
     refreshCollaboration: async () => {},
+    collaborationState: () => ({ tab: "overview", reads: {} }),
+    stopDeployDetail() {},
+    detailAbort: undefined,
+    AbortController,
+    AbortSignal,
+    connectionTimer: undefined,
+    setInterval: () => undefined,
+    document: { addEventListener() {} },
+    checkActiveConnection() {},
     viewRelease: async () => {},
     errMessage: (error: Error) => error.message,
     drawDeploysPage() {
@@ -320,6 +330,9 @@ test("detail redraws reuse the scroll container and retain focus", () => {
       permissionBadge: () => "",
       canManage: () => false,
       collaborationPanel: () => "",
+      collaborationState: () => ({ tab: "overview", reads: {} }),
+      refreshActiveApp() {},
+      loadingIndicator: () => "",
     });
     runInContext(stripTypeScriptTypes(bodyOf("drawDeployDetail")), context);
     runInContext("drawDeployDetail(d)", context);
@@ -334,4 +347,35 @@ test("detail redraws reuse the scroll container and retain focus", () => {
   } finally {
     dom.window.close();
   }
+});
+
+test("an older request for the same app cannot overwrite a newer detail load", async () => {
+  const h = renderHarness();
+  const first = h.open(),
+    second = h.open();
+  h.requests[0]!.resolve({ deployment: { id: "opened-app", displayName: "Old response" } });
+  await first;
+  assert.equal(h.context.activeDeploy.displayName, undefined);
+  assert.equal(h.frames.length, 2);
+  h.requests[1]!.resolve({ deployment: { id: "opened-app", displayName: "Fresh response" } });
+  await second;
+  assert.equal(h.context.activeDeploy.displayName, "Fresh response");
+});
+
+test("a background app load preserves a release selected while details were loading", async () => {
+  const h = renderHarness();
+  const detailState: { tab: string; release?: { version: number; createdAt: number } } = { tab: "overview" };
+  h.context.collaborationState = () => detailState;
+  let automaticSelection = false;
+  h.context.viewRelease = async () => {
+    automaticSelection = true;
+  };
+  const opening = h.open();
+  detailState.release = { version: 1, createdAt: 1 };
+  h.requests[0]!.resolve({
+    deployment: { id: "opened-app", currentVersion: 2, appliedVersion: 2, versions: [{ version: 2, createdAt: 2 }] },
+  });
+  await opening;
+  assert.equal(detailState.release.version, 1);
+  assert.equal(automaticSelection, false);
 });
