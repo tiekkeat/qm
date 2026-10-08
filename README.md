@@ -33,6 +33,17 @@ isn't tied to any single vendor.
 
 Tell your coding agent of choice `Let's deploy https://github.com/yc-software/qm`. From here, it should follow the deployment guide in this repo.
 
+For a guided installation on an Ubuntu 24.04 x86_64 LAN host, use this fork's installer:
+
+```bash
+git clone --branch feat/app-github-lifecycle https://github.com/tiekkeat/qm.git qm
+cp -a qm/deploy/templates/local-docker-lan qm-deployment
+cd qm-deployment
+bash scripts/install.sh
+```
+
+It asks for hostname, permanent LAN address, interface, firewall DNS, source path, and administrator email; installs prerequisites; generates secrets; builds this source; and verifies the deployment and backups. Configure the portal and wildcard app records on your firewall, then trust the generated CA certificate on clients. See the [LAN installation guide](deploy/templates/local-docker-lan/README.md) for the exact requirements, installer modes, and troubleshooting. SMTP and model provider credentials can be configured later.
+
 You can also try out a 3rd-party hosted version of QM [here](https://www.agent37.com/qm).
 
 If you're an infra provider interested in offering a hosted version of QM, feel free to reach out.
@@ -176,7 +187,7 @@ and this repository has no production deployment workflow. See
 For a private LAN Docker host with published app subdomains, copy the
 [local Docker LAN template](./deploy/templates/local-docker-lan/README.md) into a
 separate deployment directory. Its guide covers hostname settings, DNS, HTTPS,
-credentials, startup, and an optional Ubuntu host installer.
+credentials, a guided Ubuntu installer, diagnostics, and optional local DNS hosting.
 
 ## Contributing
 
