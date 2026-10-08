@@ -74,6 +74,76 @@ test("Connector editor renders guides and keeps fields and focus stable while ty
     dom.window.close();
   }
 });
+test("Connector dropdown lists the catalog and saves the selected provider", async () => {
+  const dom = setup();
+  try {
+    dom.window.eval(`
+      window.savedBodies=[];
+      ui.configure({api:async(method)=>({ok:true,data:{}}),orgScope:()=>"org:test",connectorName:id=>({github:"GitHub",google:"Google Workspace"})[id]||id,fmtTime:x=>x});
+      ui.connectors.catalog=[
+        {provider:"github",redirectPath:"github",setupGuide:{url:"https://example.com/github",console:"GitHub",steps:["Create GitHub app"]}},
+        {provider:"google",redirectPath:"google",setupGuide:{url:"https://example.com/google",console:"Google",steps:["Create Google app"]}}
+      ];
+      ui.connectors.render();
+    `);
+    const doc = dom.window.document;
+    doc.getElementById("add-oauth-app")!.click();
+    const select = doc.getElementById("conn-provider") as HTMLSelectElement;
+    assert.deepEqual(
+      Array.from(select.options, (option) => [option.value, option.textContent?.trim()]),
+      [
+        ["github", "GitHub"],
+        ["google", "Google Workspace"],
+      ],
+    );
+    assert.equal(select.value, "github");
+    select.value = "google";
+    select.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+    assert.equal(dom.window.eval("ui.connectors.draft.provider"), "google");
+    assert.match(doc.getElementById("conn-guide")!.textContent!, /Create Google app/);
+    assert.match(doc.getElementById("conn-guide")!.textContent!, /oauth\/google/);
+    const input = doc.getElementById("conn-client-id") as HTMLInputElement;
+    input.focus();
+    input.value = "google-client";
+    input.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+    assert.equal(doc.activeElement, input);
+    assert.equal(select.value, "google");
+    dom.window.eval(`
+      ui.connectors.change("clientSecret","test-secret");
+      ui.configure({api:async(method,path,body)=>{
+        if(method==="PUT")window.savedBodies.push(body);
+        return {ok:true,data:{catalog:ui.connectors.catalog,connectors:[]}};
+      },orgScope:()=>"org:test",connectorName:id=>id,fmtTime:x=>x});
+    `);
+    await dom.window.eval("ui.connectors.save()");
+    assert.equal(dom.window.eval("savedBodies[0].provider"), "google");
+    assert.equal(dom.window.eval("savedBodies[0].clientId"), "google-client");
+  } finally {
+    dom.window.close();
+  }
+});
+test("Connector dropdown selects and locks an existing provider when editing", () => {
+  const dom = setup();
+  try {
+    dom.window.eval(`
+      ui.connectors.catalog=[{provider:"github"},{provider:"google"}];
+      ui.connectors.list=[{provider:"google",clientId:"existing-client",hasSecret:true}];
+      ui.connectors.render();
+    `);
+    const doc = dom.window.document;
+    doc.querySelector<HTMLButtonElement>("#conn-list button")!.click();
+    const select = doc.getElementById("conn-provider") as HTMLSelectElement;
+    assert.equal(select.value, "google");
+    assert.equal(select.disabled, true);
+    assert.equal((doc.getElementById("conn-client-id") as HTMLInputElement).value, "existing-client");
+    doc.getElementById("conn-reset")!.click();
+    doc.getElementById("add-oauth-app")!.click();
+    assert.equal(select.disabled, false);
+    assert.equal(select.value, "github");
+  } finally {
+    dom.window.close();
+  }
+});
 test("Connector saves use captured payloads and retain edits made during a request", async () => {
   let resolve!: (value: any) => void;
   const bodies: unknown[] = [];

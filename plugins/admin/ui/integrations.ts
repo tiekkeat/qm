@@ -214,8 +214,23 @@ cards["card-connectors"] = () => {
       </div>
       <label style="display: block; margin-bottom: 8px"
         >Connector
-        <select id="conn-provider" style="width: 100%"></select
-      ></label>
+        <select
+          id="conn-provider"
+          style="width: 100%"
+          .value=${s.draft.provider}
+          ?disabled=${!!s.editing}
+          @change=${(e: Event) => s.change("provider", (e.target as HTMLSelectElement).value)}
+        >
+          ${repeat(
+            s.catalog,
+            (c) => c.provider,
+            (c) =>
+              html`<option value=${c.provider} ?selected=${c.provider === s.draft.provider}>
+                ${context.connectorName(c.provider)}
+              </option>`,
+          )}
+        </select></label
+      >
       <div id="conn-guide" class="hint" style="margin: 0 0 12px">${connectorGuide()}</div>
       <label style="display: block; margin-bottom: 8px"
         >Client ID
