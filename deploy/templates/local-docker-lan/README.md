@@ -157,3 +157,17 @@ bash scripts/start.sh
 For an existing installation or later hostname/IP changes, edit `hosting.env`, run `bash scripts/configure-hosting.sh`, then `sudo bash scripts/apply-hosting.sh`, then `bash scripts/start.sh`. Point clients at the configured DNS server and trust `certificates/qm-lan-root.crt`. The old `https://<QM_LAN_IP>:8443` endpoint redirects to the new portal hostname.
 
 To update the source fork, pull it into the path named by `QM_SOURCE_DIR`, then run `bash scripts/start.sh`; that script checks and plans the deployment before applying it. `python3 scripts/verify.py` can recheck containers, DNS, HTTPS, and anonymous access at any time.
+
+## Apply SMTP changes
+
+The pinned CLI 0.1.14 does not automatically forward the broker's SMTP credentials to core, which sends invitation emails. The deployment helper now selects SMTP for core and generates credential-name mappings when all four SMTP values are populated. Secret values stay in `.env`; they are not copied into configuration or Git. It also copies `SMTP_PORT` and `SMTP_TLS` from `env.auth` to core when specified.
+
+After changing email settings:
+
+1. Fill `SMTP_HOST`, `SMTP_USERNAME`, `SMTP_PASSWORD`, and `AUTH_EMAIL_FROM` in `.env`. Keep this file private and at permissions `0600`.
+2. If needed, set `SMTP_PORT` and `SMTP_TLS` in `env.auth` in `qm.config.jsonc`; the defaults are port 587 with STARTTLS. Avoid putting these non-secret settings in `.env`.
+3. Run `bash scripts/start.sh`. It synchronizes core email configuration, checks SMTP credentials, and recreates the services with the current settings. A simple `docker restart` reuses the old container environment and does not apply `.env` changes.
+4. Run `bash scripts/diagnose.sh`, refresh Admin → Users, and resend or create the invitation. Existing unsent invitations are not automatically retried.
+5. Confirm that the recipient receives the email. A successful SMTP authentication check does not prove inbox delivery.
+
+Changing `.env` alone is insufficient. You do not need to reinstall Node, Docker, or Caddy, and you do not need to edit QM's invitation sender code.

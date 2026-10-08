@@ -4,13 +4,7 @@
   "publicUrl": "https://qm.example.com",
   "target": "docker",
   "basePort": 8080,
-  "services": [
-    "core",
-    "web-ui",
-    "admin",
-    "portal",
-    "auth"
-  ],
+  "services": ["core", "web-ui", "admin", "portal", "auth"],
   "plugins": [],
   "skills": [],
   "env": {
@@ -19,7 +13,8 @@
       "NODE_ENV": "production",
       "DEPLOY_APPS_DOMAIN": "apps.qm.example.com",
       "HARNESS_SECURITY_POSTURE": "auto",
-      "HARNESS_SHARING_POSTURE": "isolated"
+      "HARNESS_SHARING_POSTURE": "isolated",
+      "AUTH_EMAIL_TRANSPORT": "smtp"
     },
     "web-ui": {
       "NODE_ENV": "production"

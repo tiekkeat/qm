@@ -1,4 +1,12 @@
 {
   "printWidth": 120,
-  "proseWrap": "preserve"
+  "proseWrap": "preserve",
+  "overrides": [
+    {
+      "files": "deploy/templates/local-docker-lan/qm.config.jsonc",
+      "options": {
+        "parser": "json"
+      }
+    }
+  ]
 }
