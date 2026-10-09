@@ -94,39 +94,26 @@ export async function mount(root: HTMLElement, data: any, services: Services) {
           <div class="head"><h2>Endpoint policy</h2></div>
           <div class="body">
             <p class="hint">
-              Public HTTPS endpoints are allowed. Approve private endpoints by exact hostname, port, and IP addresses or
-              CIDRs.
+              Allow users to connect to HTTP servers, localhost, private IP addresses, and internal hostnames. When
+              disabled, only public HTTPS endpoints are allowed. Localhost refers to the QM core container.
             </p>
             ${
               policy.ok
-                ? html`<form
-                      @submit=${(event: Event) => {
-                        event.preventDefault();
-                        const fields = new FormData(event.currentTarget as HTMLFormElement);
-                        const exception = {
-                          hostname: String(fields.get("hostname") ?? "").trim(),
-                          port: Number(fields.get("port")),
-                          addresses: String(fields.get("addresses") ?? "")
-                            .split(",")
-                            .map((part) => part.trim())
-                            .filter(Boolean),
-                        };
-                        void mutate("PUT", "/api/mcp-policy", {
-                          exceptions: [...policy.data.policy.exceptions, exception],
-                        });
+                ? html`<label>
+                    <input
+                      type="checkbox"
+                      role="switch"
+                      .checked=${policy.data.policy.allowInsecurePrivateEndpoints}
+                      ?disabled=${busy}
+                      @change=${(event: Event) => {
+                        const input = event.currentTarget as HTMLInputElement;
+                        const enabled = input.checked;
+                        input.checked = policy.data.policy.allowInsecurePrivateEndpoints;
+                        void mutate("PUT", "/api/mcp-policy", { allowInsecurePrivateEndpoints: enabled });
                       }}
-                    >
-                      <label>Hostname<input name="hostname" required placeholder="tools.internal.example" /></label>
-                      <label>Port<input name="port" type="number" min="1" max="65535" value="443" required /></label>
-                      <label
-                        >Addresses or CIDRs (comma separated)<input
-                          name="addresses"
-                          required
-                          placeholder="10.0.1.20/32"
-                      /></label>
-                      <button type="submit" ?disabled=${busy}>Add exception</button>
-                    </form>
-                    ${policy.data.policy.exceptions.map((entry: any, index: number) => html`<p>${entry.hostname}:${entry.port} → ${entry.addresses.join(", ")} <button ?disabled=${busy} @click=${() => void mutate("PUT", "/api/mcp-policy", { exceptions: policy.data.policy.exceptions.filter((_: any, current: number) => current !== index) })}>Remove</button></p>`)}`
+                    />
+                    Allow HTTP and private MCP endpoints
+                  </label>`
                 : html`<p role="alert">Could not load endpoint policy.</p>`
             }
           </div>

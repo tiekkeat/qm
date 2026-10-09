@@ -68,7 +68,10 @@ To add a connection:
 2. Choose no authentication, bearer token, OAuth, or client credentials. The connection starts disabled.
 3. Connect your account. OAuth discovers the authorization server and supports metadata-document client IDs,
    dynamic registration, or a manually registered client ID with its issuer. Client credentials require an explicit token endpoint.
-4. Test discovery. Newly discovered tools start disabled. Approve the tools to expose and classify which ones are read-only.
+4. Test discovery. Newly discovered tools start disabled. Open Manage tool permissions to approve tools and classify which ones are read-only.
+   The dialog searches tool names and descriptions and shows 20 tools per page. Select all, Deselect all,
+   Mark read-only, and Allow writes apply to every search match across all pages; without a search they apply to all tools.
+   Save permissions persists the changes; Cancel discards them.
 5. Enable the connection. Unattended use is off until explicitly enabled.
 
 CONNECTOR_SECRET_KEY is required for authenticated connections and their encrypted account catalogs.
@@ -78,6 +81,9 @@ The public `/api/mcp-oauth/client-metadata` document advertises that callback fo
 
 Owners can share with a named internal teammate or a project they belong to. Each share selects tools,
 read/write access, unattended permission, and either the recipient's own account or the owner's saved account.
+Choose permitted tools opens the same searchable, paginated picker. Apply selection updates the share draft;
+Share connection saves it. Only approved tools can be shared. Connections you can manage have an Actions menu
+in the inventory with Manage and Delete. Deletion requires confirmation and removes shared access.
 Saved-account sharing explicitly authorizes recipients to execute as the credential owner without viewing its secrets.
 Recipients cannot edit, delete, or re-share the connection. Project owners manage project-owned connections.
 Changing the server URL or authentication method requires reconnecting accounts and approving tools again.
@@ -90,10 +96,12 @@ Revocation stops subsequent calls, including calls from an old tool catalog; alr
 
 ## Admin → MCP
 
-Admins can inspect scoped connections, disable them, and configure exact endpoint exceptions.
+Admins can inspect scoped connections, disable them, and toggle Allow HTTP and private MCP endpoints.
 An administrative disable blocks owner re-enablement until an administrator unblocks the connection.
-Public HTTPS endpoints are allowed by default. Private networks and HTTP require an exact hostname,
-port, and approved addresses or CIDRs. The same network policy applies to MCP discovery and calls,
+HTTP and private MCP endpoints are allowed by default, including localhost, private IP addresses, and internal DNS names.
+Admins can disable them with the deployment-wide toggle in Admin → MCP; then only public HTTPS endpoints are allowed.
+Localhost refers to the QM core container. Existing endpoint exceptions are replaced by the enabled default.
+Turning the toggle off blocks subsequent requests without deleting connections, credentials, or shares. The same network policy applies to MCP discovery and calls,
 OAuth metadata and registration, and token exchange/refresh. DNS is checked and pinned on each request;
 redirects are rejected and responses are bounded.
 

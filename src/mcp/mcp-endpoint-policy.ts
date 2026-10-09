@@ -3,15 +3,11 @@ import { isIP, BlockList } from "node:net";
 import { Agent, fetch as outboundFetch } from "undici";
 import type { DurableMap } from "../persistence/durable-map.ts";
 
-export interface McpEndpointException {
-  hostname: string;
-  port: number;
-  addresses: string[];
+export interface McpEndpointPolicy {
+  allowInsecurePrivateEndpoints: boolean;
 }
 
-export interface McpEndpointPolicy {
-  exceptions: McpEndpointException[];
-}
+export class McpEndpointPolicyError extends Error {}
 
 const privateAddresses = new BlockList();
 const privateV6Addresses = new BlockList();
@@ -55,54 +51,21 @@ export function isPublicMcpAddress(address: string): boolean {
     : family === 6 && /^[23]/.test(address) && !privateV6Addresses.check(address, "ipv6");
 }
 
-function permitsAddress(address: string, allowed: string[]): boolean {
-  return allowed.some((entry) => {
-    const [network, prefix] = entry.split("/");
-    const family = isIP(network!);
-    if (!family || isIP(address) !== family) return false;
-    if (prefix === undefined) return address === network;
-    const block = new BlockList();
-    block.addSubnet(network!, Number(prefix), family === 4 ? "ipv4" : "ipv6");
-    return block.check(address, family === 4 ? "ipv4" : "ipv6");
-  });
-}
-
 export function validateMcpPolicy(input: unknown): McpEndpointPolicy {
   const value = input as McpEndpointPolicy;
-  if (!value || !Array.isArray(value.exceptions) || value.exceptions.length > 100)
-    throw new Error("exceptions must be an array of at most 100 entries");
-  return {
-    exceptions: value.exceptions.map((entry) => {
-      if (
-        !entry ||
-        typeof entry.hostname !== "string" ||
-        !entry.hostname ||
-        /[\s/@?#\\]/.test(entry.hostname) ||
-        !Number.isInteger(entry.port) ||
-        entry.port < 1 ||
-        entry.port > 65535 ||
-        !Array.isArray(entry.addresses) ||
-        !entry.addresses.length
-      )
-        throw new Error("each exception requires hostname, port, and allowed IP addresses or CIDRs");
-      for (const address of entry.addresses) {
-        if (typeof address !== "string") throw new Error("invalid exception address");
-        const [network, prefix, extra] = address.split("/");
-        const family = isIP(network!);
-        if (
-          !family ||
-          extra !== undefined ||
-          (prefix !== undefined && (!/^\d+$/.test(prefix) || Number(prefix) > (family === 4 ? 32 : 128)))
-        )
-          throw new Error("invalid exception address");
-      }
-      return { hostname: entry.hostname.toLowerCase(), port: entry.port, addresses: [...entry.addresses] };
-    }),
-  };
+  if (!value || typeof value.allowInsecurePrivateEndpoints !== "boolean")
+    throw new Error("allowInsecurePrivateEndpoints must be a boolean");
+  return { allowInsecurePrivateEndpoints: value.allowInsecurePrivateEndpoints };
 }
 
-export function createMcpEndpointPolicy(store: DurableMap<McpEndpointPolicy>, resolve = lookup) {
-  const read = async (): Promise<McpEndpointPolicy> => (await store.get("policy")) ?? { exceptions: [] };
+export function createMcpEndpointPolicy(
+  store: DurableMap<McpEndpointPolicy>,
+  resolve: (hostname: string, options: { all: true }) => Promise<Array<{ address: string; family: number }>> = lookup,
+) {
+  const read = async (): Promise<McpEndpointPolicy> => {
+    const policy = await store.get("policy");
+    return { allowInsecurePrivateEndpoints: policy?.allowInsecurePrivateEndpoints ?? true };
+  };
   async function validate(
     input: string | URL,
   ): Promise<{ url: URL; addresses: Array<{ address: string; family: number }> }> {
@@ -110,22 +73,19 @@ export function createMcpEndpointPolicy(store: DurableMap<McpEndpointPolicy>, re
     if (url.protocol !== "https:" && url.protocol !== "http:") throw new Error("MCP endpoints must use HTTP or HTTPS");
     if (url.username || url.password || url.hash) throw new Error("MCP URLs must not contain credentials or fragments");
     const hostname = url.hostname.replace(/^\[|\]$/g, "");
-    const exception = (await read()).exceptions.find(
-      (entry) =>
-        entry.hostname === hostname.toLowerCase() &&
-        entry.port === Number(url.port || (url.protocol === "https:" ? 443 : 80)),
-    );
-    if (url.protocol !== "https:" && !exception) throw new Error("HTTP requires an admin endpoint exception");
+    const { allowInsecurePrivateEndpoints } = await read();
+    if (url.protocol !== "https:" && !allowInsecurePrivateEndpoints)
+      throw new McpEndpointPolicyError(
+        "HTTP MCP endpoints are disabled; ask an admin to enable Allow HTTP and private MCP endpoints",
+      );
     const addresses = isIP(hostname)
       ? [{ address: hostname, family: isIP(hostname) }]
       : await resolve(hostname, { all: true });
-    if (
-      !addresses.length ||
-      addresses.some(
-        ({ address }) => !(exception ? permitsAddress(address, exception.addresses) : isPublicMcpAddress(address)),
-      )
-    )
-      throw new Error("Endpoint blocked by MCP network policy; ask an admin to approve private endpoints");
+    if (!addresses.length) throw new Error("MCP endpoint did not resolve to any IP addresses");
+    if (!allowInsecurePrivateEndpoints && addresses.some(({ address }) => !isPublicMcpAddress(address)))
+      throw new McpEndpointPolicyError(
+        "Private MCP endpoints are disabled; ask an admin to enable Allow HTTP and private MCP endpoints",
+      );
     return { url, addresses };
   }
   const guardedFetch: typeof fetch = async (input, init) => {

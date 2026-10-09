@@ -30,7 +30,12 @@ test("MCP core API requires portal identity, prevents impersonation, and returns
         res.end();
         return;
       }
-      let result: unknown = { tools: [{ name: "query", inputSchema: { type: "object" } }] };
+      let result: unknown = {
+        tools: Array.from({ length: 85 }, (_, index) => ({
+          name: index === 0 ? "query" : `opnsense_${index}`,
+          inputSchema: { type: "object" },
+        })),
+      };
       if (body.method === "initialize")
         result = {
           protocolVersion: "2025-06-18",
@@ -48,11 +53,9 @@ test("MCP core API requires portal identity, prevents impersonation, and returns
     signingSecret,
     portalIdentitySecret: portalSecret,
     emailAuthPrincipals: ["alice", "bob"],
+    adminGrants: "alice:org_admin",
   });
   const built = buildApp(config);
-  await built.mcpConnections.policy.write({
-    exceptions: [{ hostname: "127.0.0.1", port, addresses: ["127.0.0.1/32"] }],
-  });
   const core = createServer(built.app, { ...serverDeps(config, built), requireSignedPortalIdentity: true });
   core.listen(0, "127.0.0.1");
   await once(core, "listening");
@@ -66,7 +69,7 @@ test("MCP core API requires portal identity, prevents impersonation, and returns
   const origin = `http://127.0.0.1:${(core.address() as { port: number }).port}`;
   const identity = await mintPortalIdentity({ p: "alice", exp: Date.now() + 60_000 }, portalSecret);
   const request = (
-    method: "GET" | "POST" | "PATCH" | "DELETE",
+    method: "GET" | "POST" | "PATCH" | "DELETE" | "PUT",
     path: string,
     body = {},
     signedIdentity: string | null = identity,
@@ -125,4 +128,48 @@ test("MCP core API requires portal identity, prevents impersonation, and returns
     0,
   );
   assert.equal((await request("GET", `/v1/mcp-connections/${id}?principalId=bob`, {}, bob)).status, 404);
+  const names = Array.from({ length: 85 }, (_, index) => (index === 0 ? "query" : `opnsense_${index}`));
+  assert.equal(
+    (
+      await request("PATCH", `/v1/mcp-connections/${id}?principalId=alice`, {
+        tools: names.map((name) => ({ name, approved: true, readOnly: true })),
+      })
+    ).status,
+    200,
+  );
+  assert.equal(
+    (
+      await request("POST", `/v1/mcp-connections/${id}/shares?principalId=alice`, {
+        scopeId: "personal:bob",
+        tools: [...names, names[0]],
+        write: false,
+        unattended: false,
+        account: "own",
+      })
+    ).status,
+    200,
+  );
+  assert.equal(
+    (await request("PATCH", `/v1/mcp-connections/${id}?principalId=bob`, { name: "Not allowed" }, bob)).status,
+    404,
+  );
+  assert.equal((await request("DELETE", `/v1/mcp-connections/${id}?principalId=bob`, {}, bob)).status, 404);
+  const policyPath = "/v1/admin/mcp-policy";
+  assert.equal((await request("GET", policyPath, {}, bob)).status, 403);
+  assert.equal((await request("PUT", policyPath, { allowInsecurePrivateEndpoints: false }, bob)).status, 403);
+  assert.deepEqual(JSON.parse((await request("GET", policyPath)).text).policy, { allowInsecurePrivateEndpoints: true });
+  assert.equal((await request("PUT", policyPath, { allowInsecurePrivateEndpoints: "false" })).status, 400);
+  assert.equal((await request("PUT", policyPath, { allowInsecurePrivateEndpoints: false })).status, 200);
+  const blocked = await request("POST", `/v1/mcp-connections/${id}/test?principalId=alice`);
+  assert.equal(blocked.status, 400);
+  assert.match(JSON.parse(blocked.text).message, /HTTP MCP endpoints are disabled/);
+  assert.equal((await request("POST", "/v1/mcp-connections?principalId=alice", input)).status, 400);
+  assert.equal((await request("PUT", policyPath, { allowInsecurePrivateEndpoints: true })).status, 200);
+  assert.equal((await request("POST", `/v1/mcp-connections/${id}/test?principalId=alice`)).status, 200);
+  assert.deepEqual(
+    (await built.auditLog.events())
+      .filter((event) => event.action === "mcp.policy.update")
+      .map((event) => JSON.parse(event.detail!)),
+    [{ allowInsecurePrivateEndpoints: false }, { allowInsecurePrivateEndpoints: true }],
+  );
 });

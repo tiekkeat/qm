@@ -9,7 +9,7 @@ import {
 import type { OAuthClientInformationMixed, OAuthTokens } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { encryptSecret, decryptSecret, type SecretKey } from "../connectors/connector-client-store.ts";
 import type { McpConnection, McpConnectionStores, McpAccess, McpAuthentication } from "./mcp-connection-store.ts";
-import type { McpNetworkPolicy } from "./mcp-endpoint-policy.ts";
+import { McpEndpointPolicyError, type McpNetworkPolicy } from "./mcp-endpoint-policy.ts";
 import type { AclStore } from "../acl/acl-store.ts";
 import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
 import type { ProjectStore } from "../projects/project-store.ts";
@@ -315,6 +315,7 @@ export function createMcpConnectionService(opts: {
           status: "failed",
           detail: detail.slice(0, 1000),
         });
+        if (failure instanceof McpEndpointPolicyError) throw failure;
         throw new Error("MCP request failed. Check the connection, account permissions, and server availability.", {
           cause: failure,
         });
@@ -327,15 +328,25 @@ export function createMcpConnectionService(opts: {
     const connection = await requireAccess(id, actor);
     if (connection.blockedByAdmin) throw new McpAccessError("This connection was disabled by an administrator");
     const tools = await withClient(connection, actor, async (client, secret) => {
-      const result = await client.listTools();
-      const discovered = result.tools.slice(0, 64).map((tool): McpToolDescriptor => ({
-        name: toolName(connection.id, tool.name),
-        serverId: id,
-        remoteName: tool.name,
-        description: tool.description ?? "",
-        inputSchema: tool.inputSchema,
-        readOnly: connection.tools.find((known) => known.remoteName === tool.name)?.readOnly ?? false,
-      }));
+      const discovered: McpToolDescriptor[] = [];
+      const cursors = new Set<string>();
+      let cursor: string | undefined;
+      do {
+        const result = await client.listTools(cursor ? { cursor } : undefined);
+        discovered.push(
+          ...result.tools.map((tool): McpToolDescriptor => ({
+            name: toolName(connection.id, tool.name),
+            serverId: id,
+            remoteName: tool.name,
+            description: tool.description ?? "",
+            inputSchema: tool.inputSchema,
+            readOnly: connection.tools.find((known) => known.remoteName === tool.name)?.readOnly ?? false,
+          })),
+        );
+        cursor = result.nextCursor;
+        if (cursor && cursors.has(cursor)) throw new Error("MCP server returned a repeated discovery cursor");
+        if (cursor) cursors.add(cursor);
+      } while (cursor);
       if (new Set(discovered.map((tool) => tool.name)).size !== discovered.length)
         throw new Error("MCP server returned colliding tool names");
       secret.tools = discovered;

@@ -4,6 +4,8 @@ import { until } from "lit/directives/until.js";
 import { api } from "./core-bridge";
 import { appState, switchView } from "./shell";
 import { deepLinkPath, UI_BASE } from "./deep-link";
+import { openMcpToolsDialog, type McpSelectableTool } from "./mcp-tools-dialog";
+import { focusDialogCancel, restoreDialogFocus, trapDialogFocus } from "./dialog-focus";
 import { errMessage } from "../../chassis/src/errors";
 
 interface Tool {
@@ -63,6 +65,7 @@ let error = false;
 let busy = false;
 let adding = false;
 let refreshSequence = 0;
+let shareDraft: { id: string; tools: Set<string> } | null = null;
 
 export function openProjectMcp(scope: string): void {
   selected = null;
@@ -222,7 +225,9 @@ function addForm() {
           <option value="none">No authentication</option>
         </select></label
       >
-      <p class="mcp-hint">Public HTTPS endpoints are allowed. Internal endpoints need an admin exception.</p>
+      <p class="mcp-hint">
+        HTTP and private endpoints work when enabled in Admin → MCP. Localhost refers to the QM core container.
+      </p>
       <div class="mcp-actions">
         <button type="submit" ?disabled=${busy}>Save draft</button>${button("Cancel", () => {
           adding = false;
@@ -282,65 +287,70 @@ function accountForm(connection: Connection) {
     </form>
   </section>`;
 }
+function reconcileToolDraft(draft: McpSelectableTool[], catalog: Tool[], sharing: boolean): void {
+  const previous = new Map(draft.map((tool) => [tool.remoteName, tool]));
+  const current = catalog
+    .filter((tool) => !sharing || tool.approved)
+    .map((tool) => ({
+      ...tool,
+      approved: previous.get(tool.remoteName)?.approved ?? (!sharing && tool.approved),
+      readOnly: sharing ? tool.readOnly : (previous.get(tool.remoteName)?.readOnly ?? tool.readOnly),
+    }));
+  draft.splice(0, draft.length, ...current);
+}
 function toolsForm(connection: Connection) {
   return html`<section class="mcp-card">
     <h2>Tools</h2>
     <p class="mcp-hint">New tools start disabled. Mark a tool read-only only after checking its behavior.</p>
-    ${button("Test connection and discover tools", () => void action(() => api(`/api/mcp-connections/${connection.id}/test`, { method: "POST", body: "{}" }), "Connection test passed. Tools refreshed."))}
-    ${
-      connection.tools.length
-        ? html`<form
-            @submit=${(event: Event) => {
-              const data = fields(event);
-              void action(
-                () =>
-                  api(`/api/mcp-connections/${connection.id}`, {
-                    method: "PATCH",
-                    body: JSON.stringify({
-                      tools: connection.tools.map((tool) => ({
-                        name: tool.remoteName,
-                        approved: data.has(`approve:${tool.remoteName}`),
-                        readOnly: data.has(`read:${tool.remoteName}`),
-                      })),
-                    }),
-                  }),
-                "Tool permissions saved.",
-              );
-            }}
-          >
-            <ul class="mcp-tools">
-              ${connection.tools.map(
-                (tool) =>
-                  html`<li>
-                    <strong>${tool.remoteName}</strong>
-                    <p>${tool.description}</p>
-                    <label class="mcp-check"
-                      ><input
-                        type="checkbox"
-                        name=${`approve:${tool.remoteName}`}
-                        .checked=${tool.approved}
-                        ?disabled=${!connection.canManage}
-                      />Enabled</label
-                    >
-                    <label class="mcp-check"
-                      ><input
-                        type="checkbox"
-                        name=${`read:${tool.remoteName}`}
-                        .checked=${tool.readOnly}
-                        ?disabled=${!connection.canManage}
-                      />Read-only</label
-                    >
-                  </li>`,
-              )}
-            </ul>
-            ${connection.canManage ? html`<button type="submit" ?disabled=${busy}>Save tool permissions</button>` : nothing}
-          </form>`
-        : html`<p>No tools discovered for your account. Connect and test this server.</p>`
-    }
+    <div class="mcp-actions">
+      ${button("Test connection and discover tools", () => void action(() => api(`/api/mcp-connections/${connection.id}/test`, { method: "POST", body: "{}" }), "Connection test passed. Tools refreshed."))}
+      ${
+        connection.tools.length
+          ? button(
+              `${connection.canManage ? "Manage tool permissions" : "View tools"} (${connection.tools.filter((tool) => tool.approved).length}/${connection.tools.length})`,
+              () =>
+                openMcpToolsDialog({
+                  tools: connection.tools,
+                  mode: connection.canManage ? "permissions" : "view",
+                  onSave: async (tools) => {
+                    try {
+                      await api(`/api/mcp-connections/${connection.id}`, {
+                        method: "PATCH",
+                        body: JSON.stringify({
+                          tools: tools.map((tool) => ({
+                            name: tool.remoteName,
+                            approved: tool.approved,
+                            readOnly: tool.readOnly,
+                          })),
+                        }),
+                      });
+                    } catch (failure) {
+                      await renderMcp();
+                      const current = inventory.connections.find((row) => row.id === connection.id);
+                      if (current) reconcileToolDraft(tools, current.tools, false);
+                      throw failure;
+                    }
+                    notice = "Tool permissions saved.";
+                    error = false;
+                    await renderMcp();
+                  },
+                }),
+            )
+          : nothing
+      }
+    </div>
+    ${connection.tools.length ? html`<p class="mcp-hint">${connection.tools.filter((tool) => tool.approved).length} enabled · ${connection.tools.length} discovered tools</p>` : html`<p>No tools discovered for your account. Connect and test this server.</p>`}
   </section>`;
+}
+function shareSelection(connection: Connection): Set<string> {
+  return shareDraft?.id === connection.id
+    ? shareDraft.tools
+    : new Set(connection.tools.filter((tool) => tool.approved && tool.readOnly).map((tool) => tool.remoteName));
 }
 function shareForm(connection: Connection) {
   if (!connection.canManage) return nothing;
+  const selectedTools = shareSelection(connection);
+  const approved = connection.tools.filter((tool) => tool.approved);
   return html`<section class="mcp-card">
     <h2>Share</h2>
     <form
@@ -362,12 +372,13 @@ function shareForm(connection: Connection) {
             method: "POST",
             body: JSON.stringify({
               scopeId: scope,
-              tools: data.getAll("tool"),
+              tools: [...selectedTools],
               write: data.has("write"),
               unattended: data.has("unattended"),
               account: value(data, "account"),
             }),
           });
+          shareDraft = null;
         }, "Connection shared.");
       }}
     >
@@ -387,10 +398,31 @@ function shareForm(connection: Connection) {
       <p class="mcp-hint">
         Saved-account sharing authorizes recipients to act as you. They cannot view your credentials.
       </p>
-      <fieldset>
-        <legend>Permitted tools</legend>
-        ${connection.tools.filter((tool) => tool.approved).map((tool) => html`<label class="mcp-check"><input type="checkbox" name="tool" value=${tool.remoteName} .checked=${tool.readOnly} />${tool.remoteName}</label>`)}
-      </fieldset>
+      <div>
+        <p>Permitted tools · ${selectedTools.size} selected</p>
+        ${button(`Choose permitted tools (${selectedTools.size}/${approved.length})`, () =>
+          openMcpToolsDialog({
+            mode: "share",
+            tools: approved.map((tool) => ({ ...tool, approved: selectedTools.has(tool.remoteName) })),
+            onSave: async (tools) => {
+              const { connection: current } = await api<{ connection: Connection }>(
+                `/api/mcp-connections/${connection.id}`,
+              );
+              const chosen = tools.filter((tool) => tool.approved).map((tool) => tool.remoteName);
+              if (
+                !current.canManage ||
+                chosen.some((name) => !current.tools.some((tool) => tool.remoteName === name && tool.approved))
+              ) {
+                await renderMcp();
+                reconcileToolDraft(tools, current.tools, true);
+                throw new Error("Available tools or access changed. Review the current catalog before applying.");
+              }
+              shareDraft = { id: connection.id, tools: new Set(chosen) };
+              draw();
+            },
+          }),
+        )}
+      </div>
       <label class="mcp-check"><input type="checkbox" name="write" />Allow write tools</label>
       <label class="mcp-check"><input type="checkbox" name="unattended" />Allow scheduled and unattended use</label>
       <button type="submit" ?disabled=${busy}>Share connection</button>
@@ -477,13 +509,7 @@ function detail(connection: Connection) {
               <div class="mcp-actions">
                 <button type="submit" ?disabled=${busy}>Save settings</button>${button(
                   "Delete",
-                  () => {
-                    if (window.confirm(`Delete ${connection.name} and revoke all access?`))
-                      void action(async () => {
-                        await api(`/api/mcp-connections/${connection.id}`, { method: "DELETE" });
-                        navigate(null);
-                      }, "Connection deleted.");
-                  },
+                  () => deleteConnection(connection),
                   true,
                 )}
               </div>
@@ -492,6 +518,79 @@ function detail(connection: Connection) {
       }
     </section>
     ${accountForm(connection)}${toolsForm(connection)}${shareForm(connection)}`;
+}
+function deleteConnection(connection: Connection): void {
+  const opener = document.activeElement as HTMLElement | null;
+  const dialog = document.createElement("dialog");
+  dialog.className = "mcp-dialog mcp-delete-dialog";
+  dialog.setAttribute("aria-labelledby", "mcp-delete-title");
+  document.body.append(dialog);
+  let saving = false;
+  let failure = "";
+  let closed = false;
+  const cleanup = () => {
+    if (closed) return;
+    closed = true;
+    render(nothing, dialog);
+    dialog.remove();
+    restoreDialogFocus(opener, () => host?.querySelector<HTMLElement>("button"));
+  };
+  const close = () => {
+    if (saving) return;
+    dialog.close();
+    cleanup();
+  };
+  dialog.addEventListener("close", cleanup);
+  dialog.addEventListener("cancel", (event) => {
+    event.preventDefault();
+    close();
+  });
+  dialog.addEventListener("keydown", (event) => trapDialogFocus(event, close));
+  function paint() {
+    render(
+      html`<header class="mcp-dialog-head"><h2 id="mcp-delete-title">Delete ${connection.name}?</h2></header>
+        <div class="mcp-delete-body">
+          <p>This removes the connection and shared access for all recipients. It cannot be undone.</p>
+          ${failure ? html`<p class="mcp-dialog-error" role="alert">${failure}</p>` : nothing}
+        </div>
+        <footer class="mcp-dialog-footer">
+          <div class="mcp-dialog-actions">
+            <button type="button" data-dialog-cancel ?disabled=${saving} @click=${close}>Cancel</button>
+            <button
+              type="button"
+              class="danger"
+              ?disabled=${saving}
+              @click=${async () => {
+                saving = true;
+                failure = "";
+                paint();
+                try {
+                  await api(`/api/mcp-connections/${connection.id}`, { method: "DELETE" });
+                  inventory.connections = inventory.connections.filter((row) => row.id !== connection.id);
+                  if (shareDraft?.id === connection.id) shareDraft = null;
+                  if (selected === connection.id) navigate(null);
+                  notice = "Connection deleted.";
+                  error = false;
+                  await renderMcp();
+                  saving = false;
+                  close();
+                } catch (error) {
+                  failure = errMessage(error);
+                  saving = false;
+                  paint();
+                }
+              }}
+            >
+              ${saving ? "Deleting…" : "Delete connection"}
+            </button>
+          </div>
+        </footer>`,
+      dialog,
+    );
+  }
+  paint();
+  dialog.showModal();
+  focusDialogCancel(dialog);
 }
 function draw() {
   if (appState.currentView !== "mcp" || !host) return;
@@ -511,17 +610,41 @@ function draw() {
   const catalog = rows.map(
     (row) =>
       html`<section class="mcp-card">
-        <h2>
-          <a
-            href=${deepLinkPath(UI_BASE, "mcp", null, null, row.id)}
-            @click=${(event: MouseEvent) => {
-              if (event.button || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-              event.preventDefault();
-              navigate(row.id);
-            }}
-            >${row.name}</a
-          >
-        </h2>
+        <div class="mcp-entry-heading">
+          <h2>
+            <a
+              href=${deepLinkPath(UI_BASE, "mcp", null, null, row.id)}
+              @click=${(event: MouseEvent) => {
+                if (event.button || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+                event.preventDefault();
+                navigate(row.id);
+              }}
+              >${row.name}</a
+            >
+          </h2>
+          ${
+            row.canManage
+              ? html`<details
+                  class="mcp-entry-menu"
+                  @keydown=${(event: KeyboardEvent) => {
+                    if (event.key === "Escape") {
+                      const menu = event.currentTarget as HTMLDetailsElement;
+                      menu.open = false;
+                      menu.querySelector("summary")?.focus();
+                    }
+                  }}
+                >
+                  <summary aria-label=${`Actions for ${row.name}`}>Actions</summary>
+                  <div>
+                    <button type="button" ?disabled=${busy} @click=${() => navigate(row.id)}>Manage</button>
+                    <button type="button" class="danger" ?disabled=${busy} @click=${() => deleteConnection(row)}>
+                      Delete
+                    </button>
+                  </div>
+                </details>`
+              : nothing
+          }
+        </div>
         <p>${new URL(row.url).host} · ${row.status ?? (row.enabled ? row.accountStatus : "Disabled")}</p>
         <p>
           ${row.access.map((right) => projectName(right.scopeId)).join(", ")} · ${row.canManage ? "Owner" : "Use only"}

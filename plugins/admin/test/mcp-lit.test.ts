@@ -22,7 +22,10 @@ test("MCP admin disable/unblock refreshes the actual Lit view after its containe
         connection.enabled = false;
         connection.blockedByAdmin = path.endsWith("/disable");
       }
-      return { ok: true, data: path.endsWith("mcp-policy") ? { policy: { exceptions: [] } } : { servers: [] } };
+      return {
+        ok: true,
+        data: path.endsWith("mcp-policy") ? { policy: { allowInsecurePrivateEndpoints: true } } : { servers: [] },
+      };
     },
     refresh: () => {
       f.root.textContent = "";
@@ -68,13 +71,62 @@ test("an older MCP admin load cannot overwrite newer inventory", async () => {
       services,
     );
     pending[2]!({ ok: true, data: { servers: [] } });
-    pending[3]!({ ok: true, data: { policy: { exceptions: [] } } });
+    pending[3]!({ ok: true, data: { policy: { allowInsecurePrivateEndpoints: true } } });
     await second;
     pending[0]!({ ok: true, data: { servers: [] } });
-    pending[1]!({ ok: true, data: { policy: { exceptions: [] } } });
+    pending[1]!({ ok: true, data: { policy: { allowInsecurePrivateEndpoints: true } } });
     await first;
     assert.match(f.root.textContent!, /New/);
     assert.doesNotMatch(f.root.textContent!, /Old/);
+  } finally {
+    f.window.close();
+  }
+});
+
+test("MCP endpoint toggle saves immediately and retains persisted state when saving fails", async () => {
+  const f = litFixture();
+  f.document.body.dataset.subview = "mcp";
+  let enabled = true;
+  let fail = false;
+  let pending: Promise<void> | undefined;
+  const writes: unknown[] = [];
+  const services = {
+    api: async (method: string, path: string, body?: unknown) => {
+      if (method === "PUT") {
+        writes.push(body);
+        if (fail) return { ok: false, data: { message: "Save failed" } };
+        enabled = (body as { allowInsecurePrivateEndpoints: boolean }).allowInsecurePrivateEndpoints;
+      }
+      return {
+        ok: true,
+        data: path.endsWith("mcp-policy") ? { policy: { allowInsecurePrivateEndpoints: enabled } } : { servers: [] },
+      };
+    },
+    refresh: () => {
+      f.root.textContent = "";
+      pending = f.ui.mcp.mount(f.root, { connections: [] }, services);
+    },
+  };
+  try {
+    await f.ui.mcp.mount(f.root, { connections: [] }, services);
+    const toggle = () => f.root.querySelector<HTMLInputElement>('[role="switch"]')!;
+    assert.equal(toggle().checked, true);
+    assert.doesNotMatch(f.root.textContent!, /Add exception|Addresses or CIDRs/);
+    toggle().click();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await pending;
+    assert.equal(toggle().checked, false);
+    assert.deepEqual(JSON.parse(JSON.stringify(writes)), [{ allowInsecurePrivateEndpoints: false }]);
+    fail = true;
+    toggle().click();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(toggle().checked, false);
+    assert.match(f.root.textContent!, /Save failed/);
+    fail = false;
+    toggle().click();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await pending;
+    assert.equal(toggle().checked, true);
   } finally {
     f.window.close();
   }

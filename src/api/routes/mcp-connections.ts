@@ -47,8 +47,7 @@ function connectionInput(body: unknown, partial = false): Partial<McpConnectionI
   if (body.homeAccountOwner === null || typeof body.homeAccountOwner === "string")
     out.homeAccountOwner = body.homeAccountOwner;
   if (body.tools !== undefined) {
-    if (!Array.isArray(body.tools) || body.tools.length > 64)
-      throw new Error("tools must be an array of at most 64 tools");
+    if (!Array.isArray(body.tools)) throw new Error("tools must be an array");
     out.tools = body.tools.map((tool) => {
       if (
         !isObj(tool) ||
@@ -67,7 +66,6 @@ function shareInput(body: unknown): McpAccess {
     !isObj(body) ||
     typeof body.scopeId !== "string" ||
     !Array.isArray(body.tools) ||
-    body.tools.length > 64 ||
     !body.tools.every((tool) => typeof tool === "string") ||
     typeof body.write !== "boolean" ||
     typeof body.unattended !== "boolean" ||
@@ -100,6 +98,7 @@ async function handle(ctx: ApiCtx): Promise<void> {
             principalId: principal,
             action: "mcp.policy.update",
             resource: "mcp-policy",
+            detail: JSON.stringify(policy),
             scopeLabel: orgScope(),
             status: "ok",
           });

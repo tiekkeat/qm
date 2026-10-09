@@ -17,7 +17,13 @@ import type { McpExecutionContext } from "../src/mcp/mcp-connection-service.ts";
 import { createAuditLog } from "../src/audit/audit-log.ts";
 import { parseRef } from "../src/acl/resource-ref.ts";
 
-function fixture(encryption = true) {
+function fixture(
+  encryption = true,
+  catalog?: (cursor?: string) => {
+    tools: Array<{ name: string; description?: string; inputSchema: { type: "object" } }>;
+    nextCursor?: string;
+  },
+) {
   const stores = {
     connections: createMemoryMap<McpConnection>(),
     accounts: createMemoryMap<McpAccount>(),
@@ -29,7 +35,7 @@ function fixture(encryption = true) {
   const calls: Array<{ method: string; token: string; tool?: string }> = [];
   const events: unknown[] = [];
   const policy = {
-    read: async () => ({ exceptions: [] }),
+    read: async () => ({ allowInsecurePrivateEndpoints: true }),
     write: async (input: unknown) => validateMcpPolicy(input),
     validate: async (input: string | URL) => ({ url: new URL(input), addresses: [{ address: "8.8.8.8", family: 4 }] }),
     fetch: (async (_url, init) => {
@@ -70,7 +76,11 @@ function fixture(encryption = true) {
       const token = headers.get("authorization") ?? "";
       if (init?.method === "GET") return new Response(null, { status: 405 });
       if (init?.method === "DELETE") return new Response(null, { status: 204 });
-      const request = JSON.parse(String(init?.body)) as { id?: number; method: string; params?: { name?: string } };
+      const request = JSON.parse(String(init?.body)) as {
+        id?: number;
+        method: string;
+        params?: { name?: string; cursor?: string };
+      };
       if (request.id === undefined) return new Response(null, { status: 202 });
       calls.push({ method: request.method, token, tool: request.params?.name });
       let result: unknown = { content: [{ type: "text", text: token || "public" }] };
@@ -91,6 +101,7 @@ function fixture(encryption = true) {
             { name: "update", inputSchema: { type: "object" } },
           ],
         };
+      if (request.method === "tools/list" && catalog) result = catalog(request.params?.cursor);
       return Response.json({ jsonrpc: "2.0", id: request.id, result });
     }) as typeof fetch,
   };
@@ -273,8 +284,8 @@ test("project owners alone manage project connections; saved home credentials re
   assert.equal(await (await f.service.forTurn(f.context("bob", scope))).call(`${id}_query`, {}), "Bearer alice-secret");
 });
 
-test("network policy blocks private and mapped addresses and validates explicit exceptions", async () => {
-  for (const address of [
+test("network policy toggle defaults enabled, persists, and replaces legacy exceptions", async () => {
+  const privateAddresses = [
     "127.0.0.1",
     "10.2.3.4",
     "169.254.169.254",
@@ -282,17 +293,40 @@ test("network policy blocks private and mapped addresses and validates explicit 
     "::ffff:127.0.0.1",
     "fc00::1",
     "198.18.1.1",
-  ])
-    assert.equal(isPublicMcpAddress(address), false, address);
+  ];
+  for (const address of privateAddresses) assert.equal(isPublicMcpAddress(address), false, address);
   assert.equal(isPublicMcpAddress("8.8.8.8"), true);
-  const policy = createMcpEndpointPolicy(createMemoryMap<McpEndpointPolicy>());
-  await assert.rejects(policy.validate("https://127.0.0.1/mcp"));
-  await policy.write({ exceptions: [{ hostname: "127.0.0.1", port: 8080, addresses: ["127.0.0.1/32"] }] });
-  await policy.validate("http://127.0.0.1:8080/mcp");
-  await assert.rejects(policy.validate("http://127.0.0.1:8081/mcp"));
-  await assert.rejects(
-    policy.write({ exceptions: [{ hostname: "localhost", port: 80, addresses: ["127.0.0.1/99"] }] }),
-  );
+  const store = createMemoryMap<McpEndpointPolicy>();
+  const resolve = async () => [
+    { address: "10.2.3.4", family: 4 },
+    { address: "8.8.8.8", family: 4 },
+  ];
+  const policy = createMcpEndpointPolicy(store, resolve);
+  assert.deepEqual(await policy.read(), { allowInsecurePrivateEndpoints: true });
+  await store.put("policy", { exceptions: [] } as unknown as McpEndpointPolicy);
+  assert.deepEqual(await policy.read(), { allowInsecurePrivateEndpoints: true });
+  for (const address of privateAddresses) {
+    const host = address.includes(":") ? `[${address}]` : address;
+    await policy.validate(`http://${host}:8080/mcp`);
+    await policy.validate(`https://${host}/mcp`);
+  }
+  await policy.validate("http://tools.internal:8080/mcp");
+  await policy.validate("http://8.8.8.8/mcp");
+  await policy.write({ allowInsecurePrivateEndpoints: false });
+  assert.deepEqual(await createMcpEndpointPolicy(store).read(), { allowInsecurePrivateEndpoints: false });
+  for (const address of privateAddresses) {
+    const host = address.includes(":") ? `[${address}]` : address;
+    await assert.rejects(policy.validate(`https://${host}/mcp`), /Private MCP endpoints are disabled/);
+  }
+  await assert.rejects(policy.validate("https://tools.internal/mcp"), /Private MCP endpoints are disabled/);
+  await assert.rejects(policy.validate("http://8.8.8.8/mcp"), /HTTP MCP endpoints are disabled/);
+  await policy.validate("https://8.8.8.8/mcp");
+  for (const value of [null, {}, { exceptions: [] }, { allowInsecurePrivateEndpoints: "true" }])
+    await assert.rejects(policy.write(value), /must be a boolean/);
+  for (const url of ["file:///etc/passwd", "https://user:password@example.com/mcp", "https://example.com/mcp#secret"])
+    await assert.rejects(policy.validate(url));
+  await policy.write({ allowInsecurePrivateEndpoints: true });
+  await policy.validate("http://tools.internal/mcp");
 });
 
 test("OAuth discovery, PKCE callback, refresh and replay protection are durable and encrypted", async () => {
@@ -354,7 +388,7 @@ test("legacy credentials migrate once into encryption while runtime reads stay c
   assert.equal((await backing.get("legacy"))?.secretEnc, encrypted.secretEnc);
 });
 
-test("guarded HTTP fetch pins approved endpoints, streams SSE and rejects redirects", async (t) => {
+test("guarded HTTP fetch streams SSE, rejects redirects and observes toggle updates", async (t) => {
   const { createServer } = await import("node:http");
   const server = createServer((req, res) => {
     if (req.url === "/redirect") {
@@ -373,12 +407,13 @@ test("guarded HTTP fetch pins approved endpoints, streams SSE and rejects redire
   });
   const port = (server.address() as { port: number }).port;
   const policy = createMcpEndpointPolicy(createMemoryMap<McpEndpointPolicy>());
-  await policy.write({ exceptions: [{ hostname: "localhost", port, addresses: ["127.0.0.2/32"] }] });
-  await assert.rejects(policy.validate(`http://localhost:${port}/mcp`));
-  await policy.write({ exceptions: [{ hostname: "127.0.0.1", port, addresses: ["127.0.0.1/32"] }] });
   const response = await policy.fetch(`http://127.0.0.1:${port}/mcp`);
   assert.match(await response.text(), /data: first[\s\S]*data: second/);
   await assert.rejects(policy.fetch(`http://127.0.0.1:${port}/redirect`));
+  await policy.write({ allowInsecurePrivateEndpoints: false });
+  await assert.rejects(policy.fetch(`http://127.0.0.1:${port}/mcp`), /HTTP MCP endpoints are disabled/);
+  await policy.write({ allowInsecurePrivateEndpoints: true });
+  assert.match(await (await policy.fetch(`http://127.0.0.1:${port}/mcp`)).text(), /data: second/);
 });
 
 test("public no-auth connections work without credential encryption", async () => {
@@ -431,4 +466,57 @@ test("credential owners can disconnect their own account after connection access
   await f.service.disconnect(id, "bob");
   assert.equal(await f.stores.accounts.get(`${id}:bob`), null);
   assert.ok(await f.stores.accounts.get(`${id}:alice`));
+});
+
+test("scoped MCP discovery collects every page and supports approval and sharing beyond 64 tools", async () => {
+  const catalog = Array.from({ length: 85 }, (_, index) => ({
+    name: `opnsense_${index}`,
+    inputSchema: { type: "object" as const },
+  }));
+  const f = fixture(true, (cursor) => ({
+    tools: cursor ? catalog.slice(40) : catalog.slice(0, 40),
+    ...(cursor ? {} : { nextCursor: "page2" }),
+  }));
+  const row = await f.service.create("alice", { name: "OPNsense", url: "https://tools.example/mcp", auth: "bearer" });
+  await f.service.connect(row.id, "alice", { bearerToken: "alice-secret" });
+  assert.equal((await f.service.test(row.id, "alice")).length, 85);
+  await f.service.update(row.id, "alice", {
+    enabled: true,
+    tools: catalog.map((tool) => ({ name: tool.name, approved: true, readOnly: true })),
+  });
+  await f.service.share(row.id, "alice", {
+    scopeId: "personal:bob",
+    tools: catalog.map((tool) => tool.name),
+    write: false,
+    unattended: false,
+    account: "saved",
+  });
+  const turn = await f.service.forTurn(f.context("bob"));
+  assert.equal(turn.toolDefs().length, 85);
+  assert.equal(await turn.call(`${row.id}_opnsense_84`, {}), "Bearer alice-secret");
+  await assert.rejects(
+    f.service.update(row.id, "alice", { tools: [{ name: "removed", approved: true, readOnly: true }] }),
+    /Tool not found/,
+  );
+  await assert.rejects(
+    f.service.share(row.id, "alice", {
+      scopeId: "personal:bob",
+      tools: ["removed"],
+      write: false,
+      unattended: false,
+      account: "saved",
+    }),
+    /Only approved tools/,
+  );
+});
+
+test("scoped MCP discovery rejects repeated pagination cursors without publishing partial catalogs", async () => {
+  const f = fixture(true, () => ({ tools: [], nextCursor: "repeat" }));
+  const row = await f.service.create("alice", {
+    name: "Invalid pagination",
+    url: "https://tools.example/mcp",
+    auth: "none",
+  });
+  await assert.rejects(f.service.test(row.id, "alice"));
+  assert.equal((await f.service.get(row.id, "alice")).tools.length, 0);
 });
