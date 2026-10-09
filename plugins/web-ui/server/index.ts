@@ -1526,6 +1526,41 @@ const apiRoutes: readonly WebRoute[] = [
       );
     },
   },
+  ...["GET", "POST"].map((method) => ({
+    method,
+    path: "/api/scopes/:scopeId/sandboxes",
+    handle: async (c: WebCtx) => {
+      const path = `/v1/scopes/${encodeURIComponent(c.params.scopeId!)}/sandboxes`;
+      if (method === "GET") return relayCore(c.res, "GET", `${path}?principalId=${encodeURIComponent(c.user)}`);
+      const input = await readJson<Record<string, unknown>>(c.req, c.res);
+      if (!input) return;
+      return relayCore(c.res, "POST", path, JSON.stringify({ ...input, principalId: c.user }));
+    },
+  })),
+  ...["deletion", "archive"].map((suffix) => ({
+    method: "GET",
+    path: `/api/projects/:id/${suffix}`,
+    handle: async (c: WebCtx) =>
+      relayCore(
+        c.res,
+        "GET",
+        `/v1/projects/${encodeURIComponent(c.params.id!)}/${suffix}?principalId=${encodeURIComponent(c.user)}`,
+      ),
+  })),
+  {
+    method: "DELETE",
+    path: "/api/projects/:id",
+    handle: async (c) => {
+      const input = await readJson<{ confirm?: boolean }>(c.req, c.res);
+      if (!input) return;
+      return relayCore(
+        c.res,
+        "DELETE",
+        `/v1/projects/${encodeURIComponent(c.params.id!)}`,
+        JSON.stringify({ principalId: c.user, confirm: input.confirm === true }),
+      );
+    },
+  },
   {
     method: "POST",
     path: "/api/projects",

@@ -5,6 +5,8 @@ import { swallowAs } from "../util/errors.ts";
 
 export interface ManagedGroupDirectory {
   recognizes(groupId: string): boolean;
+  readableMembership?(groupId: string, principalId: string): Promise<boolean>;
+  writable?(groupId: string): Promise<boolean>;
   membership(groupId: string, principalId: string): Promise<boolean | undefined>;
   members(groupId: string): Promise<string[] | undefined>;
   version(groupId: string): Promise<string | undefined>;
@@ -13,7 +15,10 @@ export interface ManagedGroupDirectory {
 }
 
 export interface ScopeMembershipDeps {
-  managedGroups?: Pick<ManagedGroupDirectory, "recognizes" | "membership" | "members">;
+  managedGroups?: Pick<
+    ManagedGroupDirectory,
+    "recognizes" | "membership" | "members" | "readableMembership" | "writable"
+  >;
   directory?: {
     channelMember(channelId: string, principalId: string): Promise<boolean>;
     groupMember(groupId: string, principalId: string): Promise<boolean>;
@@ -195,7 +200,11 @@ export function createCanReadScope(deps: ScopeMembershipDeps): CanReadScope {
     if (kind === "team") {
       return deps.identity?.classify(principalId).teamIds?.includes(ref) === true;
     }
-    if (kind === "group") return memberOfSharedScope(deps, kind, ref, principalId, targetScope);
+    if (kind === "group") {
+      if (deps.managedGroups?.recognizes(ref) && deps.managedGroups.readableMembership)
+        return activePrincipal(deps, principalId) && deps.managedGroups.readableMembership(ref, principalId);
+      return memberOfSharedScope(deps, kind, ref, principalId, targetScope);
+    }
     if (kind === "channel") {
       if (await memberOfSharedScope(deps, kind, ref, principalId, targetScope)) return true;
       const isPrivate = await deps.directory
@@ -239,6 +248,13 @@ export function createCanManageScope(deps: ScopeMembershipDeps): CanManageScope 
   return async function canManageScope(principalId: string, scope: ScopeId): Promise<boolean> {
     if (!principalId || !activePrincipal(deps, principalId)) return false;
     const { kind, ref } = parseScopeId(scope);
+    if (
+      kind === "group" &&
+      deps.managedGroups?.recognizes(ref) &&
+      deps.managedGroups.writable &&
+      !(await deps.managedGroups.writable(ref))
+    )
+      return false;
     if (kind === "personal") return samePerson(ref, principalId);
     if (kind === "group") return currentSharedScopeMember(deps, kind, ref, principalId);
     if (kind === "channel") {
@@ -260,6 +276,14 @@ export function createManagesArtifactHome(
 ): ManagesArtifactHome {
   return async function managesArtifactHome(homeScopeId, createdBy, principalId): Promise<boolean> {
     if (!principalId || !activePrincipal(deps, principalId)) return false;
+    const parsed = parseScopeId(homeScopeId);
+    if (
+      parsed.kind === "group" &&
+      deps.managedGroups?.recognizes(parsed.ref) &&
+      deps.managedGroups.writable &&
+      !(await deps.managedGroups.writable(parsed.ref))
+    )
+      return false;
     if (await canManageScope(principalId, homeScopeId)) return true;
     const { kind, ref } = parseScopeId(homeScopeId);
     if (!samePerson(createdBy, principalId)) return false;

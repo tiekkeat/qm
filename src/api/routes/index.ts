@@ -1,3 +1,4 @@
+import { sandboxRoutes } from "./sandboxes.ts";
 import { mcpConnectionRoutes } from "./mcp-connections.ts";
 import { appCollaborationRoutes } from "./app-collaboration.ts";
 import { accountRoutes } from "./accounts.ts";
@@ -101,6 +102,7 @@ export const apiRoutes: ReadonlyArray<Route<ApiCtx>> = [
   ...surfaceRoutes,
   ...fileUploadRoutes,
   ...projectRoutes,
+  ...sandboxRoutes,
   ...contextPolicyRoutes,
   ...cronRoutes,
   ...loopRoutes,

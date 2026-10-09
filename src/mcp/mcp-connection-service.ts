@@ -123,7 +123,7 @@ export function createMcpConnectionService(opts: {
     if (home.kind === "personal") return samePerson(actor, home.ref);
     const id = home.kind === "group" ? projectIdFromGroupRef(home.ref) : null;
     const project = id ? await projects.get(id) : null;
-    return !!project && samePerson(project.ownerId, actor);
+    return !!project && (!project.lifecycle || project.lifecycle === "active") && samePerson(project.ownerId, actor);
   }
   async function access(connection: McpConnection, actor: string): Promise<McpAccess[]> {
     if (!(await opts.active(actor))) return [];
@@ -571,9 +571,18 @@ export function createMcpConnectionService(opts: {
         audit("admin-unblock", connection, actor);
       });
     },
-    async delete(id: string, actor: string) {
+    async delete(id: string, actor: string, projectDeletion = false) {
       return lock.withLock(`mcp-connection:${id}`, async () => {
-        const connection = await requireAccess(id, actor, true);
+        const stored = await stores.connections.get(id);
+        let connection: McpConnection;
+        if (projectDeletion && stored) {
+          const parsed = parseScopeId(stored.ownerScopeId);
+          const projectId = parsed.kind === "group" ? projectIdFromGroupRef(parsed.ref) : null;
+          const project = projectId ? await projects.get(projectId) : null;
+          if (!project || project.lifecycle !== "deleting" || project.deletion?.actorId !== actor)
+            throw new McpAccessError();
+          connection = stored;
+        } else connection = await requireAccess(id, actor, true);
         await stores.connections.delete(id);
         for (const [key, row] of await stores.accounts.entries())
           if (row.connectionId === id) await stores.accounts.delete(key);

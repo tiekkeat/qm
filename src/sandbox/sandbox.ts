@@ -94,6 +94,7 @@ export function visibleTools(tools: readonly string[]): string[] {
 }
 
 export interface ProvisionOptions {
+  lifecycleCleanup?: boolean;
   sandboxId?: string;
   env?: Record<string, string>;
   egress?: EgressPolicy;

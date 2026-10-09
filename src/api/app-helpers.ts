@@ -272,8 +272,10 @@ export function createAppHelpers(deps: AppDeps, app: App) {
 
   async function projectsForViewer(principalId: string): Promise<ProjectView[]> {
     if (!deps.projects || !deps.identity.isInternal(deps.identity.classify(principalId))) return [];
-    const projects = (await deps.projects.listForMember(principalId)).filter((project) =>
-      deps.identity.isInternal(deps.identity.classify(project.ownerId)),
+    const projects = (await deps.projects.listForMember(principalId)).filter(
+      (project) =>
+        (project.lifecycle && project.lifecycle !== "active") ||
+        deps.identity.isInternal(deps.identity.classify(project.ownerId)),
     );
     return Promise.all(projects.map(projectView));
   }
@@ -284,9 +286,19 @@ export function createAppHelpers(deps: AppDeps, app: App) {
     if (!deps.projects) return false;
     const project = await deps.projects.get(projectIdFromGroupRef(ref)!);
     if (!project || project.orgId !== orgIdOf()) return false;
-    if (!deps.identity.isInternal(deps.identity.classify(project.ownerId))) return false;
+    if (
+      (!project.lifecycle || project.lifecycle === "active") &&
+      !deps.identity.isInternal(deps.identity.classify(project.ownerId))
+    )
+      return false;
     if (!deps.identity.isInternal(deps.identity.classify(principalId))) return false;
-    return (await deps.projects.membership(ref, principalId).catch(() => false)) === true;
+    return (
+      (await (
+        project.lifecycle && project.lifecycle !== "active"
+          ? deps.projects.readableMembership(ref, principalId)
+          : deps.projects.membership(ref, principalId)
+      ).catch(() => false)) === true
+    );
   }
 
   async function sessionsForViewer(principalId: string): Promise<Session[]> {
@@ -424,6 +436,7 @@ export function createAppHelpers(deps: AppDeps, app: App) {
   async function principalCanAccessCurrentScope(principalId: string, targetScope: ScopeId): Promise<boolean> {
     if (await principalCanWriteScope(principalId, targetScope)) return true;
     const { kind, ref } = parseScopeId(targetScope);
+    if (kind === "group" && deps.projects?.recognizes(ref)) return principalCanReadScope(principalId, targetScope);
     if (kind !== "channel") return false;
     if (!deps.identity.isInternal(deps.identity.classify(principalId))) return false;
     if ((await deps.directory.channelPrivacy?.(ref).catch(() => undefined)) !== false) return false;

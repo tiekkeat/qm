@@ -101,3 +101,28 @@ test("project routes bind the signed-in principal and relay canonical scope and 
     },
   );
 });
+
+test("sandbox and deletion relays bind the signed-in user", async () => {
+  let before = calls.length;
+  await fetch(`${base}/api/scopes/personal%3Aalice/sandboxes`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ action: "retire", sandboxId: "box", confirm: true, principalId: "mallory" }),
+  });
+  const mutation = calls.slice(before).find((call) => call.url.startsWith("/v1/scopes/personal%3Aalice/sandboxes"));
+  assert.equal(mutation?.body.principalId, "alice");
+  assert.equal(mutation?.body.confirm, true);
+  before = calls.length;
+  await fetch(`${base}/api/projects/p1/deletion`, { headers });
+  assert.ok(calls.slice(before).some((call) => call.url.includes("principalId=alice")));
+  before = calls.length;
+  await fetch(`${base}/api/projects/p1`, {
+    method: "DELETE",
+    headers,
+    body: JSON.stringify({ confirm: true, principalId: "mallory" }),
+  });
+  assert.deepEqual(calls.slice(before).find((call) => call.method === "DELETE")?.body, {
+    principalId: "alice",
+    confirm: true,
+  });
+});

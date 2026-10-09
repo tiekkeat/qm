@@ -25,6 +25,15 @@ export interface Project {
   slackChannel?: ProjectSlackChannel;
   createdAt: number;
   updatedAt: number;
+  lifecycle?: "active" | "deleting" | "archived";
+  deletion?: {
+    actorId: string;
+    startedAt: number;
+    archivedAt?: number;
+    memberIds: string[];
+    completed: string[];
+    error?: string;
+  };
 }
 
 type ProjectMutation =
@@ -34,6 +43,12 @@ type ProjectMutation =
 type ProjectMutationEffect = (result: Extract<ProjectMutation, { status: "ok" }>) => Promise<void>;
 
 export interface ProjectStore {
+  deleting(): Promise<Project[]>;
+  beginDeletion(id: string, actorId: string): Promise<Project>;
+  deletionProgress(id: string, completed: string[], error?: string, archived?: boolean): Promise<Project>;
+  canManage(groupRef: string, actorId: string): Promise<boolean>;
+  readableMembership(groupRef: string, actorId: string): Promise<boolean>;
+  writable(groupRef: string): Promise<boolean>;
   create(input: { name: string; ownerId: string }): Promise<Project>;
   get(id: string): Promise<Project | null>;
   listForMember(principalId: string): Promise<Project[]>;
@@ -88,6 +103,15 @@ function cleanName(name: string): string {
 function visible(project: Project): Project {
   return {
     ...project,
+    ...(project.deletion
+      ? {
+          deletion: {
+            ...project.deletion,
+            memberIds: [...project.deletion.memberIds],
+            completed: [...project.deletion.completed],
+          },
+        }
+      : {}),
     memberIds: [...project.memberIds],
     ...(project.channelMemberIds ? { channelMemberIds: [...project.channelMemberIds] } : {}),
     ...(project.slackChannel ? { slackChannel: { ...project.slackChannel } } : {}),
@@ -119,7 +143,7 @@ export function createProjectStore(
   }
 
   function effectiveMemberIds(project: Project): string[] {
-    return [...new Set([...project.memberIds, ...(project.channelMemberIds ?? [])])];
+    return project.deletion?.memberIds ?? [...new Set([...project.memberIds, ...(project.channelMemberIds ?? [])])];
   }
 
   async function mutate(
@@ -135,6 +159,10 @@ export function createProjectStore(
       const outcome: { status: ProjectMutation["status"] } = { status: "not_found" };
       let changed = false;
       const updated = await backing.update(id, (project) => {
+        if (project.lifecycle && project.lifecycle !== "active") {
+          outcome.status = "forbidden";
+          return project;
+        }
         const canChangeRoster = add
           ? project.memberIds.some((member) => samePerson(member, actorId))
           : samePerson(project.ownerId, actorId);
@@ -167,6 +195,60 @@ export function createProjectStore(
   }
 
   return {
+    async deleting() {
+      return (await backing.all())
+        .filter((project) => project.orgId === configOrgId() && project.lifecycle === "deleting")
+        .map(visible);
+    },
+    async beginDeletion(id, actorId) {
+      return withLock(id, async () => {
+        const project = await backing.get(id);
+        if (
+          !project ||
+          project.orgId !== configOrgId() ||
+          !samePerson(project.ownerId, actorId) ||
+          !isActiveMember(actorId)
+        )
+          throw new Error("only the project owner can delete this project");
+        if (project.lifecycle === "deleting" || project.lifecycle === "archived") return visible(project);
+        const updated: Project = {
+          ...project,
+          lifecycle: "deleting",
+          updatedAt: Math.max(now(), project.updatedAt + 1),
+          deletion: { actorId, startedAt: now(), memberIds: effectiveMemberIds(project), completed: [] },
+        };
+        await backing.put(id, updated);
+        return visible(updated);
+      });
+    },
+    async deletionProgress(id, completed, error, archived = false) {
+      return withLock(id, async () => {
+        const project = await backing.get(id);
+        if (!project?.deletion || project.lifecycle !== "deleting") throw new Error("project deletion is not pending");
+        const updated: Project = {
+          ...project,
+          lifecycle: archived ? "archived" : "deleting",
+          updatedAt: Math.max(now(), project.updatedAt + 1),
+          deletion: { ...project.deletion, completed, error, ...(archived ? { archivedAt: now() } : {}) },
+        };
+        await backing.put(id, updated);
+        return visible(updated);
+      });
+    },
+    async canManage(groupRef, actorId) {
+      const project = await projectForGroup(groupRef);
+      return (
+        !!project && project.lifecycle !== "archived" && samePerson(project.ownerId, actorId) && isActiveMember(actorId)
+      );
+    },
+    async readableMembership(groupRef, actorId) {
+      const project = await projectForGroup(groupRef);
+      return !!project && isActiveMember(actorId) && effectiveMemberIds(project).some((id) => samePerson(id, actorId));
+    },
+    async writable(groupRef) {
+      const project = await projectForGroup(groupRef);
+      return !!project && (!project.lifecycle || project.lifecycle === "active");
+    },
     async create(input) {
       const name = cleanName(input.name);
       if (!name || !input.ownerId) throw new Error("project requires name and ownerId");
@@ -194,7 +276,7 @@ export function createProjectStore(
         .filter(
           (project) =>
             project.orgId === configOrgId() &&
-            isActiveMember(project.ownerId) &&
+            ((project.lifecycle && project.lifecycle !== "active") || isActiveMember(project.ownerId)) &&
             isActiveMember(principalId) &&
             effectiveMemberIds(project).includes(principalId),
         )
@@ -211,7 +293,11 @@ export function createProjectStore(
         const outcome: { status: ProjectMutation["status"] } = { status: "not_found" };
         let changed = false;
         const updated = await backing.update(id, (project) => {
-          if (project.ownerId !== ownerId || !isActiveMember(ownerId)) {
+          if (
+            (project.lifecycle && project.lifecycle !== "active") ||
+            project.ownerId !== ownerId ||
+            !isActiveMember(ownerId)
+          ) {
             outcome.status = "forbidden";
             return project;
           }
@@ -234,7 +320,12 @@ export function createProjectStore(
         let changed = false;
         const updated = await backing.update(id, (project) => {
           const isMember = project.memberIds.some((member) => samePerson(member, actorId));
-          if (!isMember || !isActiveMember(project.ownerId) || !isActiveMember(actorId)) {
+          if (
+            (project.lifecycle && project.lifecycle !== "active") ||
+            !isMember ||
+            !isActiveMember(project.ownerId) ||
+            !isActiveMember(actorId)
+          ) {
             outcome.status = "forbidden";
             return project;
           }
@@ -273,7 +364,11 @@ export function createProjectStore(
         let changed = false;
         const next = [...new Set(memberIds)].sort();
         const updated = await backing.update(id, (project) => {
-          if (!project.slackChannel || !isActiveMember(project.ownerId)) {
+          if (
+            (project.lifecycle && project.lifecycle !== "active") ||
+            !project.slackChannel ||
+            !isActiveMember(project.ownerId)
+          ) {
             outcome.status = "forbidden";
             return project;
           }
@@ -300,19 +395,32 @@ export function createProjectStore(
     },
     async listLinked() {
       return (await backing.all())
-        .filter((project) => project.orgId === configOrgId() && project.slackChannel && isActiveMember(project.ownerId))
+        .filter(
+          (project) =>
+            project.orgId === configOrgId() &&
+            (!project.lifecycle || project.lifecycle === "active") &&
+            project.slackChannel &&
+            isActiveMember(project.ownerId),
+        )
         .map(visible);
     },
     async slackChannel(groupRef) {
       const project = await projectForGroup(groupRef);
-      if (!project || !isActiveMember(project.ownerId) || !project.slackChannel) return undefined;
+      if (
+        !project ||
+        (project.lifecycle && project.lifecycle !== "active") ||
+        !isActiveMember(project.ownerId) ||
+        !project.slackChannel
+      )
+        return undefined;
       return { ...project.slackChannel };
     },
     recognizes: isProjectGroupRef,
     async membership(groupRef, principalId) {
       const project = await projectForGroup(groupRef);
       return project
-        ? isActiveMember(project.ownerId) &&
+        ? (!project.lifecycle || project.lifecycle === "active") &&
+            isActiveMember(project.ownerId) &&
             isActiveMember(principalId) &&
             effectiveMemberIds(project).includes(principalId)
         : undefined;
@@ -326,14 +434,20 @@ export function createProjectStore(
     },
     async version(groupRef) {
       const project = await projectForGroup(groupRef);
-      return project ? String(project.updatedAt) : undefined;
+      return project && (!project.lifecycle || project.lifecycle === "active") ? String(project.updatedAt) : undefined;
     },
     async withVersion(groupRef, version, fn) {
       const id = projectIdFromGroupRef(groupRef);
       if (!id) return undefined;
       return withLock(id, async () => {
         const project = await backing.get(id);
-        if (!project || project.orgId !== configOrgId() || String(project.updatedAt) !== version) return undefined;
+        if (
+          !project ||
+          (project.lifecycle && project.lifecycle !== "active") ||
+          project.orgId !== configOrgId() ||
+          String(project.updatedAt) !== version
+        )
+          return undefined;
         return fn();
       });
     },

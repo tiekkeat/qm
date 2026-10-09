@@ -55,8 +55,8 @@ export function createSandboxRouter(opts: RoutingSandboxOptions): Sandbox {
     return sandbox;
   };
 
-  const useHandle = <T>(handle: SandboxHandle, action: () => Promise<T>): Promise<T> =>
-    handle.resourceId ? resources.use(handle.resourceId, action) : action();
+  const useHandle = <T>(handle: SandboxHandle, action: () => Promise<T>, cleanup = false): Promise<T> =>
+    handle.resourceId ? resources.use(handle.resourceId, action, false, cleanup) : action();
 
   async function computerTarget(scopeId: string) {
     const resource = await resources.resolve(scopeId);
@@ -121,7 +121,7 @@ export function createSandboxRouter(opts: RoutingSandboxOptions): Sandbox {
       const routedLayers = layers.map((layer) =>
         layer.mode === "rw" ? { ...layer, scopeId: resource.backingScopeId } : layer,
       );
-      const handle = await resources.use(resource.id, () => provision(routedLayers), true);
+      const handle = await resources.use(resource.id, () => provision(routedLayers), true, provOpts?.lifecycleCleanup);
       return { ...handle, backend: resource.backend, scopeId: resource.ownerScopeId, resourceId: resource.id };
     },
 
@@ -161,7 +161,12 @@ export function createSandboxRouter(opts: RoutingSandboxOptions): Sandbox {
     teardown(handle, tdOpts?: TeardownOptions): Promise<void> {
       const action = () => forHandle(handle).teardown(handle, tdOpts);
       return handle.resourceId
-        ? resources.use(handle.resourceId, action, !!tdOpts?.destroy || !!forHandle(handle).profile.parksOnTeardown)
+        ? resources.use(
+            handle.resourceId,
+            action,
+            !!tdOpts?.destroy || !!forHandle(handle).profile.parksOnTeardown,
+            true,
+          )
         : action();
     },
 
@@ -195,16 +200,20 @@ export function createSandboxRouter(opts: RoutingSandboxOptions): Sandbox {
             return useHandle(handle, start);
           },
           readProcess: (handle: SandboxHandle, id: string, o?) =>
-            useHandle(handle, () =>
-              requireCap(forHandle(handle), "readProcess", handle.scopeId).readProcess(handle, id, o),
+            useHandle(
+              handle,
+              () => requireCap(forHandle(handle), "readProcess", handle.scopeId).readProcess(handle, id, o),
+              true,
             ),
           writeStdin: (handle: SandboxHandle, id: string, data: string) =>
             useHandle(handle, () =>
               requireCap(forHandle(handle), "writeStdin", handle.scopeId).writeStdin(handle, id, data),
             ),
           signalProcess: (handle: SandboxHandle, id: string, sig: string) =>
-            useHandle(handle, () =>
-              requireCap(forHandle(handle), "signalProcess", handle.scopeId).signalProcess(handle, id, sig),
+            useHandle(
+              handle,
+              () => requireCap(forHandle(handle), "signalProcess", handle.scopeId).signalProcess(handle, id, sig),
+              true,
             ),
           listProcesses: (handle: SandboxHandle) =>
             useHandle(handle, () =>

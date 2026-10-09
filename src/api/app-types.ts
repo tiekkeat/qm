@@ -1,3 +1,7 @@
+import type { SandboxResources } from "../sandbox/sandbox-resources.ts";
+import type { LoopStore } from "../loops/loop-store.ts";
+import type { MemoryService } from "../memory/memory-service.ts";
+import type { SandboxInventory, SandboxAction, ProjectDeletionPreview, ProjectArchive } from "./app-sandboxes.ts";
 import type { McpConnectionService } from "../mcp/mcp-connection-service.ts";
 import type { ExternalSlackPolicies } from "../resolution/external-slack.ts";
 import type { InviteMailer } from "../admin/invite-email.ts";
@@ -388,6 +392,12 @@ export interface App {
     viewer: string,
     sinceCursor: number,
   ): Promise<SessionBackgroundOutput | null>;
+  listSandboxes(principalId: string, scope: ScopeId): Promise<SandboxInventory>;
+  manageSandbox(principalId: string, scope: ScopeId, input: SandboxAction): Promise<SandboxInventory>;
+  projectDeletionPreview(principalId: string, id: string): Promise<ProjectDeletionPreview>;
+  resumeProjectDeletions(): Promise<number>;
+  deleteProject(principalId: string, id: string): Promise<ProjectView>;
+  projectArchive(principalId: string, id: string): Promise<ProjectArchive>;
   listContexts(principalId: string): Promise<ContextSummary[]>;
   listProjects(principalId: string): Promise<ProjectView[]>;
   createProject(principalId: string, name: string): Promise<ProjectView | null>;
@@ -681,6 +691,10 @@ export interface AppDeps {
   directory: DirectoryStore;
   emailAuthMembers?: DirectoryMember[];
   projects?: ProjectStore;
+  sandboxResources?: SandboxResources;
+  recordLifecycleError?: (scope: ScopeId, error: unknown) => void;
+  loopStore?: LoopStore;
+  memory?: MemoryService;
   deploy: DeployService;
   deployAppsDomain?: string;
   deploymentLayer?: DeploymentLayerRuntime;

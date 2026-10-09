@@ -1,3 +1,6 @@
+import { redactSecrets } from "./harness/redact-secrets.ts";
+import { createProjectScopeGuard } from "./projects/project-scope-guard.ts";
+import { parseScopeId } from "./types.ts";
 import { createMcpEndpointPolicy, type McpEndpointPolicy } from "./mcp/mcp-endpoint-policy.ts";
 import { createMcpConnectionService, type McpConnectionService } from "./mcp/mcp-connection-service.ts";
 import type { McpConnection, McpAccount, McpOAuthFlow } from "./mcp/mcp-connection-store.ts";
@@ -717,11 +720,18 @@ export function buildApp(
     ...(config.connectorSecretKey ? { connectorSecretKey: config.connectorSecretKey } : {}),
   });
   void configStore.hydrate?.().catch(reportFailureAs("startup: hydrate configuration", undefined));
-  const skills: SkillStore = createSkillStore({
-    backing: artifactMap<Skill>("skills"),
+  const projects = createProjectStore(artifactMap<Project>("projects"), {
+    isActiveMember: (principalId) => identity.isInternal(identity.classify(principalId)),
     advisoryLock,
-    ...(config.skillSigningSecret ? { signingSecret: config.skillSigningSecret } : {}),
   });
+  const projectScopeGuard = createProjectScopeGuard(projects, advisoryLock);
+  const skills: SkillStore = projectScopeGuard.skills(
+    createSkillStore({
+      backing: artifactMap<Skill>("skills"),
+      advisoryLock,
+      ...(config.skillSigningSecret ? { signingSecret: config.skillSigningSecret } : {}),
+    }),
+  );
   const skillPacks = createSkillPackStore({ backing: artifactMap<SkillPack>("skill_packs") });
   const skillBundles = createSkillBundleStore({ backing: artifactMap<SkillBundle>("skill_bundles") });
   const livenessCache = createLivenessCache(artifactMap<ScopeLivenessRecord>("credential_liveness"));
@@ -819,7 +829,7 @@ export function buildApp(
     config.securityScreen === "off" && overrides.securityScreener ? "enforce" : config.securityScreen,
   );
 
-  const workspace = createLocalWorkspaceStore(config.dataDir);
+  const workspace = projectScopeGuard.workspace(createLocalWorkspaceStore(config.dataDir));
   const blobTransfer: BlobTransferStore =
     config.transferStore === "s3" && config.s3Bucket
       ? createS3BlobTransferStore({
@@ -836,9 +846,11 @@ export function buildApp(
           ...(config.s3Prefix ? { prefix: config.s3Prefix } : {}),
         })
       : createLocalDurableByteStore(join(config.dataDir, "docstore"));
-  const files: FileArtifactStore = config.databaseUrl
-    ? createPostgresFileArtifactStore(config.databaseUrl, fileBytes)
-    : createMemoryFileArtifactStore(fileBytes);
+  const files: FileArtifactStore = projectScopeGuard.files(
+    config.databaseUrl
+      ? createPostgresFileArtifactStore(config.databaseUrl, fileBytes)
+      : createMemoryFileArtifactStore(fileBytes),
+  );
   const fileUploads =
     config.databaseUrl && config.snapshotStore === "s3" && config.s3Bucket
       ? createDirectFileUploads({
@@ -854,14 +866,16 @@ export function buildApp(
     : createMemoryService(workspace);
   // Session storage is built further down; trace-derived providers only read it after the first turn.
   const memorySessions: { store?: SessionStore } = {};
-  const baseMemory: MemoryService = createConfiguredMemoryService({
-    defaultMemory,
-    config: config.memoryProviderConfig,
-    sessionEntries: (sessionId) => {
-      if (!memorySessions.store) throw new Error("session store is not ready");
-      return memorySessions.store.getEntries(sessionId, { limit: MEMORY_CAPTURE_ENTRY_WINDOW });
-    },
-  });
+  const baseMemory: MemoryService = projectScopeGuard.memory(
+    createConfiguredMemoryService({
+      defaultMemory,
+      config: config.memoryProviderConfig,
+      sessionEntries: (sessionId) => {
+        if (!memorySessions.store) throw new Error("session store is not ready");
+        return memorySessions.store.getEntries(sessionId, { limit: MEMORY_CAPTURE_ENTRY_WINDOW });
+      },
+    }),
+  );
   const errors = withErrorReporting(config.databaseUrl ? createPostgresErrorLog(config.databaseUrl) : createErrorLog());
   const sandboxOnError = (e: { category: string; code: string; message: string; scopeLabel?: string }) =>
     errors.record({
@@ -1152,6 +1166,16 @@ export function buildApp(
     backends: sandboxBackends,
     defaultBackend: config.sandboxBackend,
     lock: advisoryLock,
+    onLifecycleError: (record, error) =>
+      errors.record(
+        {
+          category: "sandbox",
+          code: "lifecycle_failed",
+          message: redactSecrets(errMessage(error)),
+          scopeLabel: record.ownerScopeId,
+        },
+        error,
+      ),
     beforeRetire: async (record) => {
       if (
         (await processes?.liveByScope(record.ownerScopeId))?.some(
@@ -1181,6 +1205,26 @@ export function buildApp(
         config.capabilityTokenCompression,
       );
       return { egressToken };
+    },
+    canCleanupScope: async (actorId, scopeId) => {
+      const parsed = parseScopeId(scopeId);
+      const id = parsed.kind === "group" ? projectIdFromGroupRef(parsed.ref) : null;
+      const project = id ? await projects.get(id) : null;
+      return project?.lifecycle === "deleting" && project.deletion?.actorId === actorId;
+    },
+    canReadScope: async (actorId, scopeId) =>
+      identity.isInternal(identity.classify(actorId)) &&
+      ((await admin.adminStatusOf(identity.classify(actorId))).isAdmin || (await canReadScope(actorId, scopeId))),
+    canManageScope: async (actorId, scopeId) => {
+      if (!identity.isInternal(identity.classify(actorId))) return false;
+      if ((await admin.adminStatusOf(identity.classify(actorId))).isAdmin) return true;
+      const parsed = parseScopeId(scopeId);
+      if (parsed.kind === "group" && projects.recognizes(parsed.ref)) return projects.canManage(parsed.ref, actorId);
+      return canManageScope(actorId, scopeId);
+    },
+    scopeIsActive: async (scopeId) => {
+      const parsed = parseScopeId(scopeId);
+      return parsed.kind !== "group" || !projects.recognizes(parsed.ref) || (await projects.writable(parsed.ref));
     },
     canUseScope: (actorId, scopeId) => membership.canUseSandboxScope!(actorId, scopeId),
   });
@@ -1718,10 +1762,6 @@ export function buildApp(
       errors.record({ category: "memory", code: "capture_failed", message: errMessage(e), scopeLabel: scope }, e),
   });
   const directory = config.databaseUrl ? createPostgresDirectoryStore(config.databaseUrl) : createDirectoryStore();
-  const projects = createProjectStore(artifactMap<Project>("projects"), {
-    isActiveMember: (principalId) => identity.isInternal(identity.classify(principalId)),
-    advisoryLock,
-  });
   const mcpConnections = createMcpConnectionService({
     stores: {
       connections: artifactMap<McpConnection>("mcp_connections"),
@@ -1787,6 +1827,14 @@ export function buildApp(
       );
     },
     managesArtifactHome,
+    withScopeWrite: projectScopeGuard.write,
+    scopeIsActive: projectScopeGuard.active,
+    canTransferHome: async (scope, actorId) => {
+      const parsed = parseScopeId(scope);
+      const id = parsed.kind === "group" ? projectIdFromGroupRef(parsed.ref) : null;
+      const project = id ? await projects.get(id) : null;
+      return project?.lifecycle === "deleting" && project.deletion?.actorId === actorId;
+    },
     ...(deployGitSecret && deployGitBase
       ? {
           deploymentEnv: async (deployment: Deployment): Promise<Record<string, string>> => {
@@ -2238,6 +2286,14 @@ export function buildApp(
         }
       : {}),
     projects,
+    sandboxResources,
+    recordLifecycleError: (scope, error) =>
+      errors.record(
+        { category: "project", code: "cleanup_failed", message: redactSecrets(errMessage(error)), scopeLabel: scope },
+        error,
+      ),
+    loopStore,
+    memory,
     environments,
     deploy: deployService,
     deployAppsDomain: config.awsDeploy.appsDomain,
@@ -2411,6 +2467,10 @@ export function buildApp(
     60_000,
     { label: "run-results" },
   );
+  const projectDeletionSweeper = createSweeper(() => app.resumeProjectDeletions(), 30_000, {
+    label: "project-deletion",
+    immediate: true,
+  });
   const orphanedSignalSweeper = createSweeper(
     async () => {
       for (const runId of await runSignals.pendingRunIds()) {
@@ -2770,6 +2830,7 @@ export function buildApp(
       wakeSweep.start();
       swarms?.start();
       orphanedSignalSweeper.start();
+      projectDeletionSweeper.start();
       sessionReturnSweeper.start();
       runResultSweeper.start();
       approvalDeliverySweeper.start();
@@ -2800,6 +2861,7 @@ export function buildApp(
       wakeSweep.stop(),
       swarms?.stop(),
       orphanedSignalSweeper.stop(),
+      projectDeletionSweeper.stop(),
       sessionReturnSweeper.stop(),
       runResultSweeper.stop(),
       approvalDeliverySweeper.stop(),

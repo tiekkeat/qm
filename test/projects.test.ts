@@ -1261,3 +1261,23 @@ test("Slack-linked project turns use the inherited channel roster", async () => 
   await runNowSettled(built.scheduler, inactiveCron.id);
   assert.equal((await built.crons.get(inactiveCron.id))?.enabled, false);
 });
+
+test("quiet archived project sessions remain readable and never offer continuation or mutation", async () => {
+  const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "project-archive-")) }));
+  try {
+    const project = await built.projects.create({ name: "Archived", ownerId: "owner" });
+    const scope = projectScopeId(project.id);
+    const session = await built.sessions.getOrCreateByThread("web:owner:archived", "group", scope);
+    await built.sessions.addParticipant(session.id, "owner", undefined, { includeHistory: true });
+    await built.sessions.updateTitle(session.id, "Saved conversation");
+    await built.projects.beginDeletion(project.id, "owner");
+    await built.projects.deletionProgress(project.id, [], undefined, true);
+    assert.equal((await built.app.listSessions("owner"))[0]!.readOnly, true);
+    assert.equal((await built.app.getSessionForViewer(session.id, "owner"))!.session.readOnly, true);
+    assert.equal(await built.app.updateSession(session.id, "owner", { title: "Changed" }), null);
+    assert.equal(await built.app.forkSession(session.id, "owner"), null);
+    assert.equal((await built.sessions.get(session.id))!.title, "Saved conversation");
+  } finally {
+    await built.runtime.stop();
+  }
+});

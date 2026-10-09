@@ -130,6 +130,7 @@ export interface DeliveredFile {
 }
 
 export interface CoreSession {
+  readOnly?: boolean;
   status?: { emoji: string; text: string } | null;
   id: string;
   type: "dm" | "channel" | "group";
@@ -253,6 +254,8 @@ export interface CoreContext {
 }
 
 export interface CoreProject {
+  lifecycle?: "active" | "deleting" | "archived";
+  deletion?: { completed: string[]; error?: string };
   id: string;
   name: string;
   ownerId: string;
@@ -605,7 +608,8 @@ export function continuableMessages(
 
 export const SUBAGENT_THREAD_PREFIX = "agent:main:subagent:";
 
-export function isContinuable(s: Pick<CoreSession, "threadRef" | "scopeId">, user: string): boolean {
+export function isContinuable(s: Pick<CoreSession, "threadRef" | "scopeId" | "readOnly">, user: string): boolean {
+  if (s.readOnly) return false;
   if (s.threadRef.startsWith(SUBAGENT_THREAD_PREFIX))
     return s.scopeId === `personal:${user}` || s.scopeId.startsWith("channel:") || s.scopeId.startsWith("group:");
   if (!s.threadRef.startsWith("web:")) return false;

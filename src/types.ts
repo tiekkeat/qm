@@ -95,6 +95,7 @@ export interface SessionStatus {
 }
 
 export interface Session {
+  readOnly?: boolean;
   id: string;
   type: SessionType;
   scopeId: ScopeId;

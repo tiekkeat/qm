@@ -1,3 +1,5 @@
+import { redactSecrets } from "../harness/redact-secrets.ts";
+import { errMessage } from "../util/errors.ts";
 import { withLiveTurnMembership } from "../resolution/scope-membership.ts";
 import { randomUUID } from "node:crypto";
 import type { DurableMap } from "../persistence/durable-map.ts";
@@ -19,6 +21,7 @@ export interface SandboxResource {
   availableActions?: string[];
   machineId?: string;
   cleanupPending?: boolean;
+  executionBlocked?: boolean;
   spec?: AgentComputerSpec;
   error?: string;
 }
@@ -37,6 +40,7 @@ export interface SandboxDefault {
 }
 
 export interface SandboxResources {
+  forProjectDeletion(actorId: string, scopeId: ScopeId): Promise<SandboxResources>;
   forTurn(turn: { actorId: string; scopeId: ScopeId; isCurrent: () => Promise<boolean> }): SandboxResources;
   initialize(): Promise<void>;
   list(
@@ -58,8 +62,9 @@ export interface SandboxResources {
   access(actorId: string, id: string): Promise<SandboxResource>;
   status(actorId: string, id: string): Promise<ComputerStatus>;
   restart(actorId: string, id: string): Promise<void>;
+  blockExecution(actorId: string, id: string): Promise<void>;
   retire(actorId: string, id: string): Promise<void>;
-  use<T>(id: string, action: () => Promise<T>, exclusive?: boolean): Promise<T>;
+  use<T>(id: string, action: () => Promise<T>, exclusive?: boolean, cleanup?: boolean): Promise<T>;
   setDefault(actorId: string, scopeId: ScopeId, id: string | null): Promise<void>;
   resolve(scopeId: ScopeId): Promise<SandboxResource | null>;
   get(id: string): Promise<SandboxResource>;
@@ -74,8 +79,13 @@ export function createSandboxResources(opts: {
   defaultBackend: SandboxBackendName;
   provisionOptions?: (scopeId: string) => Promise<ProvisionOptions>;
   beforeDefaultChange?: (scopeId: string) => Promise<void>;
+  onLifecycleError?: (record: SandboxResource, error: unknown) => void;
   beforeRetire?: (record: SandboxResource) => Promise<void>;
   lock: AdvisoryLock;
+  canCleanupScope?(actorId: string, scopeId: ScopeId): Promise<boolean>;
+  canManageScope?(actorId: string, scopeId: ScopeId): Promise<boolean>;
+  canReadScope?(actorId: string, scopeId: ScopeId): Promise<boolean>;
+  scopeIsActive?(scopeId: ScopeId): Promise<boolean>;
   canUseScope(actorId: string, scopeId: ScopeId): Promise<boolean>;
 }): SandboxResources {
   let upgraded: Promise<void> | undefined;
@@ -100,22 +110,45 @@ export function createSandboxResources(opts: {
     if (!parseScopeId(scopeId).kind || !(await opts.canUseScope(actorId, scopeId)))
       throw new Error("sandbox access requires permission to use its owning scope");
   };
+  const authorizeManage = async (actorId: string, scopeId: ScopeId): Promise<void> => {
+    if (!(await (opts.canManageScope ?? opts.canUseScope)(actorId, scopeId)))
+      throw new Error("sandbox management requires permission from its owner");
+  };
+  const requireActive = async (scopeId: ScopeId): Promise<void> => {
+    if (opts.scopeIsActive && !(await opts.scopeIsActive(scopeId))) throw new Error("project is read-only");
+  };
   const get = async (id: string): Promise<SandboxResource> => {
     await initialize();
     const record = await opts.records.get(id);
     if (!record) throw new Error(`sandbox not found: ${id}`);
     return record;
   };
-  const use = async <T>(id: string, action: () => Promise<T>, exclusive = false): Promise<T> => {
+  const use = async <T>(id: string, action: () => Promise<T>, exclusive = false, cleanup = false): Promise<T> => {
     await get(id);
     const lock = exclusive || !opts.lock.withSharedLock ? opts.lock.withLock : opts.lock.withSharedLock;
     return lock(`sandbox-resource:${id}`, async () => {
       const current = await get(id);
       if (current.state === "retired") throw new Error("sandbox has been retired");
+      if (!cleanup) {
+        if (current.executionBlocked) throw new Error("sandbox retirement is pending");
+        await requireActive(current.ownerScopeId);
+      }
       return action();
     });
   };
   return {
+    async forProjectDeletion(actorId, scopeId) {
+      if (!(await opts.canCleanupScope?.(actorId, scopeId)))
+        throw new Error("project cleanup has no persisted authorization");
+      const authorizeCleanup = async (actor: string, target: ScopeId) =>
+        actor === actorId && target === scopeId && (await opts.canCleanupScope?.(actorId, scopeId)) === true;
+      return createSandboxResources({
+        ...opts,
+        canUseScope: authorizeCleanup,
+        canReadScope: authorizeCleanup,
+        canManageScope: authorizeCleanup,
+      });
+    },
     forTurn: (turn) =>
       createSandboxResources({
         ...opts,
@@ -126,10 +159,18 @@ export function createSandboxResources(opts: {
     initialize,
     get,
     use,
+    async blockExecution(actorId, id) {
+      const record = await get(id);
+      await authorizeManage(actorId, record.ownerScopeId);
+      await opts.lock.withLock(`sandbox-resource:${id}`, async () => {
+        const current = await get(id);
+        if (current.state !== "retired") await opts.records.put(id, { ...current, executionBlocked: true });
+      });
+    },
     async retire(actorId, id) {
       await initialize();
       const record = await get(id);
-      await authorize(actorId, record.ownerScopeId);
+      await authorizeManage(actorId, record.ownerScopeId);
       await opts.lock.withLock(`sandbox-resource:${id}`, () =>
         opts.lock.withLock(`sandbox-default:${record.ownerScopeId}`, async () => {
           const current = await get(id);
@@ -146,7 +187,8 @@ export function createSandboxResources(opts: {
             await backend.destroyScope(current.backingScopeId);
             await opts.records.put(id, { ...retiring, cleanupPending: false, error: undefined });
           } catch (error) {
-            await opts.records.put(id, { ...retiring, error: String(error) });
+            opts.onLifecycleError?.(current, error);
+            await opts.records.put(id, { ...retiring, error: redactSecrets(errMessage(error)) });
             throw error;
           }
         }),
@@ -168,7 +210,7 @@ export function createSandboxResources(opts: {
       await initialize();
       const record = await get(id);
       if (record.state === "retired") throw new Error("sandbox has been retired");
-      await authorize(actorId, record.ownerScopeId);
+      await authorizeManage(actorId, record.ownerScopeId);
       const backend = opts.backends[record.backend];
       if (!backend?.restartComputer) throw new Error(`sandbox restart unavailable: ${record.backend}`);
       await use(id, () => backend.restartComputer!(record.backingScopeId), true);
@@ -179,16 +221,19 @@ export function createSandboxResources(opts: {
       return route?.sandboxId ? get(route.sandboxId) : null;
     },
     async list(actorId, scopeId) {
-      await authorize(actorId, scopeId);
+      if (!(await (opts.canReadScope ?? opts.canUseScope)(actorId, scopeId)))
+        throw new Error("sandbox access requires permission to read its owning scope");
       await initialize();
       const route = await opts.defaults.get(scopeId);
       const sandboxes: SandboxResource[] = [];
       for (const record of await opts.records.all()) {
-        if (!(await opts.canUseScope(actorId, record.ownerScopeId))) continue;
+        if (!(await (opts.canReadScope ?? opts.canUseScope)(actorId, record.ownerScopeId))) continue;
         const backend = opts.backends[record.backend];
         let availableActions = actionsFor(backend).filter((action) => action !== "create");
         if (record.state === "retired")
           availableActions = (record.cleanupPending || record.error) && backend?.destroyScope ? ["retire"] : [];
+        if (!(await (opts.canManageScope ?? opts.canUseScope)(actorId, record.ownerScopeId)))
+          availableActions = availableActions.filter((action) => action === "status");
         sandboxes.push({ ...record, availableActions });
       }
       const providers = (Object.entries(opts.backends) as Array<[SandboxBackendName, Sandbox]>)
@@ -207,7 +252,8 @@ export function createSandboxResources(opts: {
     },
     async create(actorId, scopeId, backend, name, reservationId) {
       await initialize();
-      await authorize(actorId, scopeId);
+      await authorizeManage(actorId, scopeId);
+      await requireActive(scopeId);
       if (!Object.hasOwn(opts.backends, backend) || !opts.backends[backend as SandboxBackendName])
         throw new Error(`sandbox backend unavailable: ${backend}`);
       const id = reservationId ?? randomUUID();
@@ -223,47 +269,54 @@ export function createSandboxResources(opts: {
         legacy: false,
         state: "provisioning",
       };
-      return opts.lock.withLock(`sandbox-resource:${id}`, async () => {
-        const existing = await opts.records.get(id);
-        if (existing) {
-          if (existing.ownerScopeId !== scopeId || existing.createdBy !== actorId || existing.backend !== backend)
-            throw new Error("sandbox reservation ownership mismatch");
-          if (existing.state === "ready") return existing;
-          if (existing.state === "retired") throw new Error("sandbox reservation is retired");
-        }
-        await opts.records.put(id, record);
-        const sandbox = opts.backends[record.backend]!;
-        try {
-          const handle = await sandbox.provision(
-            [{ scopeId: record.backingScopeId, mountPath: "/", mode: "rw" }],
-            await opts.provisionOptions?.(scopeId),
-          );
-          const ready: SandboxResource = {
-            ...record,
-            state: "ready",
-            machineId: handle.id,
-            spec: sandbox.profile.spec,
-          };
-          await opts.records.put(id, ready);
-          return ready;
-        } catch (error) {
-          await opts.records.put(id, {
-            ...record,
-            state: "failed",
-            error: error instanceof Error ? error.message : String(error),
-          });
-          throw error;
-        }
-      });
+      return opts.lock.withLock(`project-work:${scopeId}`, () =>
+        opts.lock.withLock(`sandbox-resource:${id}`, async () => {
+          await requireActive(scopeId);
+          await authorizeManage(actorId, scopeId);
+          const existing = await opts.records.get(id);
+          if (existing) {
+            if (existing.ownerScopeId !== scopeId || existing.createdBy !== actorId || existing.backend !== backend)
+              throw new Error("sandbox reservation ownership mismatch");
+            if (existing.state === "ready") return existing;
+            if (existing.state === "retired") throw new Error("sandbox reservation is retired");
+          }
+          await opts.records.put(id, record);
+          const sandbox = opts.backends[record.backend]!;
+          try {
+            const handle = await sandbox.provision(
+              [{ scopeId: record.backingScopeId, mountPath: "/", mode: "rw" }],
+              await opts.provisionOptions?.(scopeId),
+            );
+            const ready: SandboxResource = {
+              ...record,
+              state: "ready",
+              machineId: handle.id,
+              spec: sandbox.profile.spec,
+            };
+            await opts.records.put(id, ready);
+            return ready;
+          } catch (error) {
+            opts.onLifecycleError?.(record, error);
+            await opts.records.put(id, {
+              ...record,
+              state: "failed",
+              error: redactSecrets(errMessage(error)),
+            });
+            throw error;
+          }
+        }),
+      );
     },
     async setDefault(actorId, scopeId, id) {
       await initialize();
-      await authorize(actorId, scopeId);
+      await authorizeManage(actorId, scopeId);
+      if (id !== null) await requireActive(scopeId);
       await opts.lock.withLock(`sandbox-default:${scopeId}`, async () => {
         if (id !== null) {
           const record = await get(id);
           await authorize(actorId, record.ownerScopeId);
-          if (record.state === "retired") throw new Error("sandbox has been retired");
+          if (record.state === "retired" || record.executionBlocked)
+            throw new Error("sandbox has been retired or retirement is pending");
           if (record.ownerScopeId !== scopeId)
             throw new Error(
               "the default sandbox must belong to this scope; use sandbox_id for another authorized scope",

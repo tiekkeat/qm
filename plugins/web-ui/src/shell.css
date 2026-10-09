@@ -13282,3 +13282,45 @@ body.app-edit-embed .custom-chat-shell.app-edit-chat > .chat-bottom-dock {
   white-space: pre-wrap;
   min-width: 80px;
 }
+
+.sandbox-row {
+  padding: 14px 0;
+  border-bottom: 1px solid var(--border-color, #ddd);
+}
+.sandbox-actions,
+.sandbox-create {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+.sandbox-create label {
+  display: grid;
+  gap: 4px;
+}
+.sandbox-status {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 360px;
+  overflow: auto;
+  font-size: 12px;
+}
+.sandbox-create {
+  align-items: end;
+}
+.sandbox-create input,
+.sandbox-create select {
+  border: 1px solid var(--border, #ddd);
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: var(--background, transparent);
+  color: inherit;
+  font: inherit;
+  min-width: 0;
+}
+.sandbox-create input {
+  width: 100%;
+}
+.sandbox-create .context-hint {
+  flex-basis: 100%;
+}

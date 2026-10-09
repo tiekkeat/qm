@@ -112,7 +112,6 @@ export function createSessionMethods(
     sessionForViewer,
     managedProjectMembership,
     filesForViewer,
-    canUseContext,
     currentResourceScopesForViewer,
     contextsFor,
     projectsForViewer,
@@ -254,7 +253,8 @@ export function createSessionMethods(
         visibility.minCreatedAt > visibility.maxCreatedAt
       )
         return false;
-      if (!(await sessionForViewer(sessionId, principalId))) return false;
+      const writableSession = await sessionForViewer(sessionId, principalId);
+      if (!writableSession || !(await principalCanWriteScope(principalId, writableSession.scopeId))) return false;
       const window = (await deps.sessions.participantWindowsOf(sessionId)).find((w) => w.principalId === principalId);
       return (
         !!window &&
@@ -285,8 +285,13 @@ export function createSessionMethods(
       const w = windowedTranscript(visible, window);
       const earlier = w.earlier + read.earlier;
       const pins = await decoratedPins(pinRecords, visible, (seq) => viewerStoredEntryAt(sessionId, principalId, seq));
+      const parsedScope = parseScopeId(session.scopeId);
+      const projectReadOnly =
+        parsedScope.kind === "group" &&
+        deps.projects?.recognizes(parsedScope.ref) &&
+        !(await deps.projects.writable(parsedScope.ref));
       return {
-        session,
+        session: { ...session, ...(projectReadOnly ? { readOnly: true } : {}) },
         entries: w.entries,
         ...(earlier > 0 ? { earlierEntries: earlier } : {}),
         ...(pins.length ? { pins } : {}),
@@ -295,7 +300,7 @@ export function createSessionMethods(
 
     async pinConversationItem(threadRef, addedBy, pin) {
       const session = await deps.sessions.getByThread(threadRef);
-      if (!session) return { error: "not_found" };
+      if (!session || !(await principalCanWriteScope(addedBy, session.scopeId))) return { error: "not_found" };
       const text = pin.text?.trim().slice(0, MAX_PIN_TEXT_CHARS);
       if (pin.entrySeq !== undefined) {
         const exists = (await viewerEntryAt(session.id, addedBy, pin.entrySeq)) !== undefined;
@@ -355,7 +360,7 @@ export function createSessionMethods(
     async uploadFileForViewer(principalId, input) {
       const ownerScopeId = scopeId("personal", principalId);
       const createdInScope = input.scopeId ?? ownerScopeId;
-      if (!(await canUseContext(principalId, createdInScope))) return null;
+      if (!(await principalCanWriteScope(principalId, createdInScope))) return null;
       const name = safeAttachmentName(input.name);
       const mimetype = (input.mimetype ?? mimeFromName(name)).split(";")[0]!.trim().toLowerCase() || mimeFromName(name);
       const id = fileArtifactId(`upload:${principalId}:${createdInScope}:${Date.now()}:${randomUUID()}`, "in", 0);
@@ -470,17 +475,23 @@ export function createSessionMethods(
             ...(goal.floor ? { floor: { ...goal.floor } } : {}),
           });
       }
-      if (
-        workingThreadRefs.size === 0 &&
-        waiting.size === 0 &&
-        failedChildren.size === 0 &&
-        jobCounts.size === 0 &&
-        watchCounts.size === 0 &&
-        cronCounts.size === 0
-      )
-        return sessions;
+      const readOnlyScopes = new Set(
+        (
+          await Promise.all(
+            [...new Set(sessions.map((s) => s.scopeId))].map(async (scope) => {
+              const parsed = parseScopeId(scope);
+              return parsed.kind === "group" &&
+                deps.projects?.recognizes(parsed.ref) &&
+                !(await deps.projects.writable(parsed.ref))
+                ? scope
+                : null;
+            }),
+          )
+        ).filter((scope) => scope !== null),
+      );
       return sessions.map((s) => ({
         ...s,
+        ...(readOnlyScopes.has(s.scopeId) ? { readOnly: true } : {}),
         ...(workingThreadRefs.has(s.threadRef) ? { working: true } : {}),
         ...(waiting.has(s.id) ? { awaitingInput: true } : {}),
         ...(failedChildren.has(s.id) ? { lastTurnFailed: true } : {}),
@@ -830,7 +841,7 @@ export function createSessionMethods(
 
     async updateSession(sessionId, principalId, patch) {
       const session = await sessionForViewer(sessionId, principalId);
-      if (!session) return null;
+      if (!session || !(await principalCanWriteScope(principalId, session.scopeId))) return null;
       const { status, ...view } = patch;
       if (status !== undefined) {
         const participants = await deps.sessions.participantWindowsOf(sessionId);
@@ -903,7 +914,7 @@ export function createSessionMethods(
 
     async regenerateTitle(sessionId, principalId) {
       const session = await sessionForViewer(sessionId, principalId);
-      if (!session) return null;
+      if (!session || !(await principalCanWriteScope(principalId, session.scopeId))) return null;
       const parsed = parseScopeId(session.scopeId);
       const projectMembers = parsed.kind === "group" ? await deps.projects?.members(parsed.ref) : undefined;
       return deps.orchestrator.regenerateTitle(sessionId, principalId, projectMembers);
@@ -912,7 +923,7 @@ export function createSessionMethods(
     async forkSession(sessionId, principalId, opts) {
       if (!(await sessionForViewer(sessionId, principalId))) return null;
       const source = await deps.sessions.get(sessionId);
-      if (!source) return null;
+      if (!source || !(await principalCanWriteScope(principalId, source.scopeId))) return null;
       const parsed = parseScopeId(source.scopeId);
       const fork = async (projectMembers?: readonly string[]) => {
         let visible = transcriptEntries((await transcripts.forViewer(sessionId, principalId)).entries);

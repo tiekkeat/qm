@@ -499,6 +499,7 @@ function recentItem(item: RecentItem, shownThreads: ReadonlySet<string>): Templa
               </div>
               <button
                 class="recent-project-new-chat"
+                ?disabled=${!!projectOf(item.scopeId)?.lifecycle && projectOf(item.scopeId)?.lifecycle !== "active"}
                 type="button"
                 aria-label=${newChatHint(name)}
                 ${tip(NEW_CHAT_TOOLTIP)}
@@ -534,6 +535,8 @@ export function startNewChat(
   name: string | null = null,
   threadRef?: string,
 ): Conversation | null {
+  const project = scopeId ? projectOf(scopeId) : undefined;
+  if (project?.lifecycle && project.lifecycle !== "active") return null;
   closeSidebarOnNarrowView();
   if (scopeId) sessionsState.collapsedProjectScopes.delete(scopeId);
   const pane = startNewChatInCanvas(scopeId ?? undefined, threadRef);
@@ -556,7 +559,8 @@ function startProjectChat(event: Event, scopeId: string, name: string | null): v
 }
 
 function projectMenuPopover(item: Extract<RecentItem, { kind: "project" }>): TemplateResult {
-  const owned = projectOf(item.scopeId)?.ownerId === appState.me?.user;
+  const project = projectOf(item.scopeId);
+  const owned = project?.ownerId === appState.me?.user && (!project?.lifecycle || project.lifecycle === "active");
   return html`
     <div class="session-menu-popover" role="menu" ${ref(placeSessionMenu)} @click=${(e: Event) => e.stopPropagation()}>
       <button
@@ -1718,6 +1722,11 @@ async function runSessionsRefresh(
     sessionsState.list = reconcileSessions(r.sessions ?? [], sessionsState.list, openConversationIds());
     sessionsState.loaded = true;
     sessionsNotice = "";
+    for (const conversation of allConversations()) {
+      const session = sessionsState.list.find((session) => session.id === conversation.state.sessionId);
+      if (session?.readOnly && conversation.state.agent)
+        void openSessionInto(conversation, session, undefined, undefined, false);
+    }
     return true;
   } catch (e) {
     if (seq !== sessionRefreshSeq) return sessionsState.loaded || ((await newerRun()) ?? false);
@@ -1770,7 +1779,7 @@ export async function openSessionInto(
     }
     return;
   }
-  if (s.id === conv.state.sessionId && !entriesPrefetch) return;
+  if (s.id === conv.state.sessionId && !entriesPrefetch && !s.readOnly) return;
 
   refreshSessionsOnOpen();
 
@@ -1784,7 +1793,7 @@ export async function openSessionInto(
 
   const fetchEntries = (): Promise<TranscriptPage | null> =>
     fetchTranscript(s.id, { tailTurns: TAIL_TURNS }).catch(() => null);
-  const continuable = isContinuable(s, appState.me?.user ?? "");
+  let continuable = isContinuable(s, appState.me?.user ?? "");
   const [entriesRes, approvalsRes] = await Promise.all([
     entriesPrefetch ? entriesPrefetch.then((r) => r ?? fetchEntries()) : fetchEntries(),
     continuable ? (approvalsPrefetch ?? fetchSessionApprovals(s.id)) : Promise.resolve(null),
@@ -1795,7 +1804,7 @@ export async function openSessionInto(
     if (sessionsState.openingKey !== opening) return;
     sessionsState.openingKey = null;
   }
-  if (!entriesPrefetch && conv.state.sessionId === s.id) {
+  if (!entriesPrefetch && conv.state.sessionId === s.id && !s.readOnly && !entriesRes?.session?.readOnly) {
     renderList();
     return;
   }
@@ -1806,6 +1815,8 @@ export async function openSessionInto(
     return;
   }
 
+  s = entriesRes.session ?? s;
+  continuable = isContinuable(s, appState.me?.user ?? "");
   const split = inheritedTranscript(s, entriesRes.entries ?? []);
   const messages = entriesToMessages(split.current, transcriptModel());
   const inheritedMessages = entriesToMessages(split.inherited, transcriptModel());

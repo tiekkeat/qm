@@ -1,3 +1,4 @@
+import { sandboxSection, archiveSection, projectDeletionSection, loadSandboxes, resetSandboxes } from "./sandboxes";
 import { projectMcpSection } from "./mcp";
 import { previewFile } from "./file-open.ts";
 import { peopleResults, type DirectoryMatch } from "./people-results";
@@ -115,7 +116,7 @@ let createProjectSeq = 0;
 let contextsResetSeq = 0;
 let contextsFetchSeq = 0;
 let contextsQuery = "";
-let contextsWorkspaceFilter: "active" | "all" = "active";
+let contextsWorkspaceFilter: "active" | "all" | "archived" = "active";
 
 async function fetchContexts(): Promise<CoreContext[]> {
   const fetchSeq = ++contextsFetchSeq;
@@ -131,6 +132,7 @@ async function fetchContexts(): Promise<CoreContext[]> {
 }
 
 export function resetContextsState(): void {
+  resetSandboxes();
   contextsState.list = [];
   contextsState.loaded = false;
   contextsState.loadedAt = 0;
@@ -184,6 +186,8 @@ export async function renderContexts(): Promise<void> {
     contextsState.list.some((c) => c.scopeId === contextsState.selected) &&
     contextsState.resourcesScope !== contextsState.selected
   ) {
+    const selected = contextsState.list.find((c) => c.scopeId === contextsState.selected);
+    if (selected) void loadSandboxes(selected, drawContexts);
     void loadScopeResources(contextsState.selected);
     void loadAmbientPolicy(contextsState.selected, drawContexts);
     void loadContextModel(contextsState.selected, drawContexts);
@@ -312,21 +316,26 @@ function gridTpl(): TemplateResult {
     const meta = contextMeta(context);
     return (
       (!q || `${meta.title} ${meta.sub}`.toLowerCase().includes(q)) &&
-      (contextsWorkspaceFilter === "all" ||
-        context.kind === "personal" ||
-        Boolean(context.project) ||
-        Boolean(context.sessionCount))
+      (contextsWorkspaceFilter === "archived"
+        ? context.project?.lifecycle === "archived"
+        : (context.project?.lifecycle !== "archived" || contextsWorkspaceFilter === "all") &&
+          (contextsWorkspaceFilter === "all" ||
+            context.kind === "personal" ||
+            Boolean(context.project) ||
+            Boolean(context.sessionCount)))
     );
   };
   const projects = contextsState.list.filter(matches);
   const groupOf = (context: CoreContext) => {
     if (context.kind === "personal") return "personal";
+    if (context.project?.lifecycle === "archived") return "archived";
     return context.project ? "web" : "slack";
   };
   const groups = [
     { key: "personal", label: "Personal" },
     { key: "web", label: "Web" },
     { key: "slack", label: "Slack" },
+    { key: "archived", label: "Archived projects" },
   ]
     .map((g) => ({ ...g, items: projects.filter((context) => groupOf(context) === g.key) }))
     .filter((g) => g.items.length > 0);
@@ -386,7 +395,11 @@ function gridTpl(): TemplateResult {
               contextsWorkspaceFilter = value as typeof contextsWorkspaceFilter;
               drawContexts();
             },
-            options: [html`<option value="active">Active only</option>`, html`<option value="all">Everything</option>`],
+            options: [
+              html`<option value="active">Active only</option>`,
+              html`<option value="all">Everything</option>`,
+              html`<option value="archived">Archived projects</option>`,
+            ],
           })}</label
         >
       </div>
@@ -416,6 +429,9 @@ function detailTpl(c: CoreContext): TemplateResult {
   const { title, sub, glyph } = contextMeta(c);
   const sessions = sessionsIn(c.scopeId);
   const completelyEmpty = sessions.length === 0 && scopeResourcesEmpty(c.scopeId);
+  let emptyTitle = "This project is ready for work";
+  if (c.project?.lifecycle === "archived") emptyTitle = "This project is archived";
+  if (c.project?.lifecycle === "deleting") emptyTitle = "Project cleanup is in progress";
   return html`
     <div class="context-detail">
       <button class="context-back" type="button" @click=${() => selectContext(null)}>
@@ -434,13 +450,18 @@ function detailTpl(c: CoreContext): TemplateResult {
         </div>
         <div class="context-detail-actions">
           ${
-            c.project
+            c.project && (!c.project.lifecycle || c.project.lifecycle === "active")
               ? html`<button class="btn context-add-member" type="button" @click=${() => toggleMemberPicker(c)}>
                   ${icon(UserPlus, 15)}<span>Add people</span>
                 </button>`
               : nothing
           }
-          <button class="btn primary context-new-chat" type="button" @click=${() => startChatIn(c)}>
+          <button
+            class="btn primary context-new-chat"
+            type="button"
+            ?disabled=${!!c.project?.lifecycle && c.project.lifecycle !== "active"}
+            @click=${() => startChatIn(c)}
+          >
             ${icon(Plus, 15)}<span>New chat</span>
           </button>
         </div>
@@ -452,10 +473,9 @@ function detailTpl(c: CoreContext): TemplateResult {
               ? html`
                   <section class="context-panel context-project-empty">
                     <span class="context-glyph large" aria-hidden="true">${icon(glyph, 22)}</span>
-                    <h2>This project is ready for work</h2>
+                    <h2>${emptyTitle}</h2>
                     <p>
-                      Start a conversation with New chat. Files, automations, and other work created there will stay
-                      scoped to this project.
+                      ${c.project?.lifecycle && c.project.lifecycle !== "active" ? "Saved project data remains available here in a read-only archive." : "Start a conversation with New chat. Files, automations, and other work created there will stay scoped to this project."}
                     </p>
                   </section>
                 `
@@ -474,11 +494,17 @@ function detailTpl(c: CoreContext): TemplateResult {
                   ${resourceSections(c.scopeId)}
                 `
           }
-          ${c.project ? projectMcpSection(c.scopeId) : nothing}
+          ${sandboxSection(c, drawContexts)} ${archiveSection(c)}
+          ${c.project && (!c.project.lifecycle || c.project.lifecycle === "active") ? projectMcpSection(c.scopeId) : nothing}
         </div>
         <aside class="context-settings" aria-label=${c.project ? "Project settings" : "Context settings"}>
-          ${c.project ? projectMembersSection(c) : nothing} ${c.project ? projectSlackSection(c) : nothing}
-          ${contextModelSection(c.scopeId)} ${channelHeaderSection(c.scopeId)} ${ambientPolicySection(c.scopeId)}
+          ${c.project ? projectMembersSection(c) : nothing}
+          ${!c.project?.lifecycle || c.project.lifecycle === "active" ? html`${c.project ? projectSlackSection(c) : nothing}${contextModelSection(c.scopeId)} ${channelHeaderSection(c.scopeId)} ${ambientPolicySection(c.scopeId)}` : html`<p class="context-hint">${c.project.lifecycle === "archived" ? "Archived project · Read-only" : "Project deletion in progress · Read-only"}</p>`}
+          ${projectDeletionSection(c, isProjectOwner(c), drawContexts, (project) => {
+            upsertProject(project);
+            void loadScopeResources(c.scopeId);
+            void refreshSessions({ silent: true });
+          })}
         </aside>
       </div>
     </div>
@@ -713,7 +739,10 @@ function projectMembersSection(context: CoreContext): TemplateResult {
                   : nothing
               }
               ${
-                isProjectOwner(context) && principalId !== project.ownerId && !viaChannel
+                (!project.lifecycle || project.lifecycle === "active") &&
+                isProjectOwner(context) &&
+                principalId !== project.ownerId &&
+                !viaChannel
                   ? html`<button
                       class="project-icon-button danger"
                       type="button"
@@ -1368,7 +1397,10 @@ async function loadScopeResources(scopeId: string): Promise<void> {
       crons: r.crons ?? [],
       deployments: r.deployments ?? [],
       skills: r.skills ?? [],
-      manageable: r.manageable === true,
+      manageable:
+        r.manageable === true &&
+        (!contextsState.list.find((c) => c.scopeId === scopeId)?.project?.lifecycle ||
+          contextsState.list.find((c) => c.scopeId === scopeId)?.project?.lifecycle === "active"),
     };
   } catch (e) {
     if (stale()) return;
@@ -1419,7 +1451,10 @@ function selectContext(scopeId: string | null): void {
   resetChannelHeader();
   syncUrlFromState();
   drawContexts();
+  resetSandboxes();
   if (scopeId) {
+    const context = contextsState.list.find((c) => c.scopeId === scopeId);
+    if (context) void loadSandboxes(context, drawContexts);
     void loadScopeResources(scopeId);
     void loadAmbientPolicy(scopeId, drawContexts);
     void loadContextModel(scopeId, drawContexts);
@@ -1428,6 +1463,7 @@ function selectContext(scopeId: string | null): void {
 }
 
 function startChatIn(c: CoreContext): void {
+  if (c.project?.lifecycle && c.project.lifecycle !== "active") return;
   startNewChat(c.kind === "personal" ? null : c.scopeId, c.name);
 }
 

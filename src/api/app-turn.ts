@@ -133,6 +133,8 @@ export function createTurnMethods(
         ) {
           return { status: "refused", reason: "you're not a member of that context" };
         }
+        if (project.lifecycle && project.lifecycle !== "active")
+          return { status: "refused", reason: "This project is read-only because it is being deleted or archived." };
         const roster = (await deps.projects?.members(conversationRef)) ?? [];
         const activeMemberIds = roster.filter((memberId) => deps.identity.isInternal(deps.identity.classify(memberId)));
         if (!activeMemberIds.includes(actor.id))

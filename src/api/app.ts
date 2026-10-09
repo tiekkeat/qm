@@ -1,3 +1,4 @@
+import { createSandboxMethods } from "./app-sandboxes.ts";
 import { WorkAdmissionClosed } from "../util/admitted-work.ts";
 import { createResourceSearchMethods } from "./app-resource-search.ts";
 import type { App, AppDeps } from "./app-types.ts";
@@ -22,6 +23,7 @@ export function createApp(deps: AppDeps): App {
     swarms: deps.swarms,
     ...createTurnMethods(deps, helpers, ambient),
     ...createSessionMethods(deps, helpers),
+    ...createSandboxMethods(deps, helpers),
     ...createMessagingMethods(deps, helpers, ambient),
     ...createDeploymentMethods(deps, helpers),
     ...createSkillMethods(deps, helpers),

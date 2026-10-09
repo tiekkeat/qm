@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import { inflateRawSync } from "node:zlib";
 import { EXTERNAL_APP_SHARING_OFF } from "../feature-flags.ts";
 import { notifyDeploymentShared } from "./share-notice.ts";
 import type { DeliveryStore } from "../delivery/delivery-store.ts";
@@ -10,7 +12,7 @@ import type { Grant, Permission, ScopeId } from "../types.ts";
 import { isManageableCreationScope, parseScopeId, scopeId } from "../types.ts";
 import type { AclStore } from "../acl/acl-store.ts";
 import { deployRef, encodeRef } from "../acl/resource-ref.ts";
-import { normalizeRelPath } from "./deploy-fs.ts";
+import { readTree, normalizeRelPath } from "./deploy-fs.ts";
 import { samePerson } from "../directory/person.ts";
 import type { AuditLog } from "../audit/audit-log.ts";
 import {
@@ -115,10 +117,14 @@ export interface DeployService {
     actor: { createdBy: string },
   ): Promise<DeploymentGrantee[]>;
   assertShareAllowed(ownerScopeId: ScopeId, grantee: ScopeId, permission: Permission | null): Promise<void>;
+  projectDeletionBlockers(
+    scope: ScopeId,
+    dependencies: readonly string[],
+  ): Promise<Array<{ appId: string; name: string; reason: string }>>;
   transferDeploymentOwner(
     idOrName: string,
     toScope: ScopeId,
-    actor: { callerId: string; actingScopeId?: ScopeId },
+    actor: { callerId: string; actingScopeId?: ScopeId; projectDeletion?: boolean },
   ): Promise<Deployment>;
 }
 
@@ -143,6 +149,9 @@ export interface DeployServiceDeps {
   canWriteScope?: (principalId: string, scopeId: ScopeId) => Promise<boolean>;
   canManageEmail?: (email: string) => Promise<boolean>;
   externalSharingAllowed?: (ownerScopeId: ScopeId) => Promise<boolean>;
+  withScopeWrite?: <T>(scopes: readonly ScopeId[], action: () => Promise<T>) => Promise<T>;
+  scopeIsActive?: (scope: ScopeId) => Promise<boolean>;
+  canTransferHome?: (scope: ScopeId, actorId: string) => Promise<boolean>;
   managesArtifactHome?: (homeScopeId: ScopeId, createdBy: string, principalId: string) => Promise<boolean>;
   deploymentEnv?: (deployment: Deployment) => Promise<Record<string, string>>;
 }
@@ -187,8 +196,35 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
     if ((await deps.canManageEmail?.(ref)) || (await externalSharingAllowed(ownerScopeId))) return;
     throw new Error(EXTERNAL_APP_SHARING_OFF);
   }
-  function withDeployLock<T>(id: string, fn: () => Promise<T>): Promise<T> {
-    return deployQueue(id, () => advisoryLock.withLock(`deploy:${id}`, fn));
+  const heldDeployments = new AsyncLocalStorage<{ ids: Set<string>; active: boolean }>();
+  function withDeployLock<T>(
+    id: string,
+    fn: () => Promise<T>,
+    extraScopes: ScopeId[] = [],
+    cleanupActor?: string,
+  ): Promise<T> {
+    const parent = heldDeployments.getStore();
+    if (parent?.active && parent.ids.has(id)) return fn();
+    return deployQueue(id, () =>
+      advisoryLock.withLock(`deploy:${id}`, async () => {
+        const app = await deps.deployStore.get(id);
+        const cleanup = !!app && !!cleanupActor && (await deps.canTransferHome?.(app.ownerScopeId, cleanupActor));
+        const scopes = [...(!cleanup && app ? [app.ownerScopeId] : []), ...extraScopes];
+        const context = { ids: new Set([...(parent?.active ? parent.ids : []), id]), active: true };
+        const work = () =>
+          heldDeployments.run(context, async () => {
+            try {
+              return await fn();
+            } finally {
+              context.active = false;
+            }
+          });
+        if (deps.withScopeWrite) return deps.withScopeWrite(scopes, work);
+        for (const scope of scopes)
+          if (deps.scopeIsActive && !(await deps.scopeIsActive(scope))) throw new Error("project is read-only");
+        return work();
+      }),
+    );
   }
 
   const applyVersion = async (
@@ -419,7 +455,7 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
     }
   }
 
-  return {
+  const service: DeployService = {
     providerProfile: deps.provider.profile,
     assertShareAllowed,
 
@@ -461,7 +497,7 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
           scopeLabel: input.ownerScopeId,
         });
         return (await deps.deployStore.get(d.id))!;
-      });
+      }, [input.ownerScopeId, ...(input.createdInScope ? [input.createdInScope] : [])]);
     },
 
     async redeploy(id, input) {
@@ -974,10 +1010,80 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
       return (await grantsOn(d)).map((g) => ({ scope: g.granteeScopeId, permission: g.permission }));
     },
 
+    async projectDeletionBlockers(scope, dependencies) {
+      const refs = [...new Set([scope, encodeURIComponent(scope), ...dependencies])];
+      const blockers: Array<{ appId: string; name: string; reason: string }> = [];
+      for (const app of await deps.deployStore.list()) {
+        if (app.ownerScopeId !== scope && app.createdInScope !== scope) continue;
+        if (app.status === "archived") continue;
+        const revisions = [
+          ...new Map(
+            [currentVersionOf(app), runnableVersion(app)]
+              .filter((version) => version !== undefined)
+              .map((version) => [version.version, version]),
+          ).values(),
+        ];
+        if (!revisions.length) {
+          if (app.ownerScopeId === scope)
+            blockers.push({
+              appId: app.id,
+              name: app.displayName ?? app.name ?? app.id,
+              reason:
+                "The published revision cannot be inspected. Publish a complete revision before deleting the project.",
+            });
+          continue;
+        }
+        const texts: string[] = [];
+        for (const version of revisions) {
+          const values = Object.values(version.env ?? {});
+          texts.push(...values);
+          for (const value of values) {
+            const parts = value.split(".");
+            if (parts.length === 2 || parts.length === 3) {
+              try {
+                const payload = JSON.parse(
+                  Buffer.from(parts[parts.length === 3 ? 1 : 0]!, "base64url").toString("utf8"),
+                );
+                texts.push(JSON.stringify(payload));
+                if (payload.encoding === "deflate-raw" && typeof payload.claims === "string")
+                  texts.push(
+                    inflateRawSync(Buffer.from(payload.claims, "base64url"), { maxOutputLength: 131_072 }).toString(
+                      "utf8",
+                    ),
+                  );
+              } catch {
+                continue;
+              }
+            }
+          }
+          const files =
+            (await deps.deployStore.filesOf(app.id, version.version)) ?? (await readTree(version.snapshotDir));
+          texts.push(
+            ...files.map((file) =>
+              typeof file.data === "string" ? file.data : Buffer.from(file.data).toString("utf8"),
+            ),
+          );
+        }
+        if (texts.some((text) => refs.some((ref) => ref && text.includes(ref))))
+          blockers.push({
+            appId: app.id,
+            name: app.displayName ?? app.name ?? app.id,
+            reason:
+              "This app references project compute, a project connection, or project-scoped credentials. Move those dependencies to an active scope and publish a new revision first.",
+          });
+      }
+      return blockers;
+    },
     async transferDeploymentOwner(idOrName, toScope, actor) {
       const d = (await deps.deployStore.get(idOrName)) ?? (await deps.deployStore.getByName(idOrName));
       if (!d) throw new Error(`no such app: ${idOrName}`);
-      if (!(await managesHome(d, actor.callerId, actor.actingScopeId))) {
+      if (deps.scopeIsActive && !(await deps.scopeIsActive(toScope)))
+        throw new Error("destination project is read-only");
+      const cleanup =
+        actor.projectDeletion === true && (await deps.canTransferHome?.(d.ownerScopeId, actor.callerId)) === true;
+      if (!cleanup && deps.scopeIsActive && !(await deps.scopeIsActive(d.ownerScopeId)))
+        throw new Error("source project is read-only");
+      if (!(await managesHome(d, actor.callerId, actor.actingScopeId)) && !cleanup) {
         throw new Error(`only the owner can transfer "${d.name ?? d.id}"`);
       }
       if (d.ownerScopeId === toScope) return d;
@@ -1006,6 +1112,36 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
       return (await deps.deployStore.get(d.id))!;
     },
   };
+  const transfer = service.transferDeploymentOwner.bind(service);
+  service.transferDeploymentOwner = async (id, target, actor) => {
+    const app = (await deps.deployStore.get(id)) ?? (await deps.deployStore.getByName(id));
+    if (!app) throw new Error(`no such app: ${id}`);
+    return withDeployLock(
+      app.id,
+      () => transfer(id, target, actor),
+      [target],
+      actor.projectDeletion ? actor.callerId : undefined,
+    );
+  };
+  const publish = service.deployOrUpdate.bind(service);
+  service.deployOrUpdate = async (input) => {
+    const existingName = input.renameFrom ?? input.name;
+    const app = existingName ? await deps.deployStore.getByName(existingName) : null;
+    return app ? withDeployLock(app.id, () => publish(input)) : publish(input);
+  };
+  const share = service.shareDeployment.bind(service);
+  service.shareDeployment = async (id, ...args) => {
+    const app = (await deps.deployStore.get(id)) ?? (await deps.deployStore.getByName(id));
+    if (!app) throw new Error(`no such app: ${id}`);
+    return withDeployLock(app.id, () => share(id, ...args));
+  };
+  const setPublic = service.setDeploymentPublic.bind(service);
+  service.setDeploymentPublic = async (id, ...args) => {
+    const app = (await deps.deployStore.get(id)) ?? (await deps.deployStore.getByName(id));
+    if (!app) throw new Error(`no such app: ${id}`);
+    return withDeployLock(app.id, () => setPublic(id, ...args));
+  };
+  return service;
 }
 
 function endpointsEqual(a: DeployEndpoint, b: DeployEndpoint | null): boolean {

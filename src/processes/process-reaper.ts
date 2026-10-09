@@ -3,12 +3,13 @@ import { createSweeper } from "../util/sweeper.ts";
 import { createNoopLeaderLease, type LeaderLease } from "../persistence/leader-lease.ts";
 import { awaitProcessExit } from "../sandbox/await-process-exit.ts";
 import { processIsGone } from "../sandbox/process-poll.ts";
-import type { ProcessSandbox } from "../sandbox/sandbox.ts";
+import type { ProcessSandbox, ProvisionOptions } from "../sandbox/sandbox.ts";
 import { errMessage } from "../util/errors.ts";
 
 const PROCESS_REAPER_LEASE_KEY = "processes:reaper";
 
 export interface ReaperKillHookOptions {
+  lifecycleCleanup?: boolean;
   termGraceMs?: number;
   killGraceMs?: number;
 }
@@ -20,10 +21,9 @@ export function createReaperKillHook(
   const termGraceMs = opts?.termGraceMs ?? 5_000;
   const killGraceMs = opts?.killGraceMs ?? 2_000;
   return async (rec) => {
-    const handle = await sandbox.provision(
-      [{ scopeId: rec.scopeId, mode: "rw", mountPath: "" }],
-      rec.sandboxId ? { sandboxId: rec.sandboxId } : undefined,
-    );
+    let provisionOptions: ProvisionOptions | undefined = rec.sandboxId ? { sandboxId: rec.sandboxId } : undefined;
+    if (opts?.lifecycleCleanup) provisionOptions = { ...provisionOptions, lifecycleCleanup: true };
+    const handle = await sandbox.provision([{ scopeId: rec.scopeId, mode: "rw", mountPath: "" }], provisionOptions);
     try {
       await sandbox.signalProcess(handle, rec.processId, "TERM");
       let status = await awaitProcessExit(sandbox, handle, rec.processId, termGraceMs);
