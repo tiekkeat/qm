@@ -22,6 +22,7 @@ const VIEW_TITLES: Record<View, string> = {
   loops: "Loops",
   webhooks: "Webhooks",
   files: "Files",
+  mcp: "MCP",
   keychain: "Keychain",
   deploys: "Apps",
   memory: "Memory",

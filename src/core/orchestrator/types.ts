@@ -1,3 +1,4 @@
+import type { McpConnectionService } from "../../mcp/mcp-connection-service.ts";
 import type { ExternalSlackPolicies } from "../../resolution/external-slack.ts";
 import type { RuntimeService } from "../../harness/runtime-types.ts";
 import type { SandboxResources } from "../../sandbox/sandbox-resources.ts";
@@ -158,6 +159,7 @@ export interface OrchestratorDeps {
   admin?: AdminService;
   memory: MemoryService;
   mcp?: McpToolService;
+  mcpConnections?: McpConnectionService;
   memoryPolicy?: MemoryPolicy;
   memoryStrategy?: MemoryStrategy;
   skills?: SkillStore;

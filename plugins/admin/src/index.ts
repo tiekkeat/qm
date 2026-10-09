@@ -307,12 +307,18 @@ const WRITES = new Map<string, string[]>([
   ["users", ["PUT", "POST"]],
   ["slack-installation", ["POST", "PUT", "DELETE"]],
   ["model-providers", ["PUT", "DELETE"]],
+  ["mcp-servers", ["PUT", "DELETE"]],
+  ["mcp-connections", ["POST"]],
+  ["mcp-policy", ["PUT"]],
   ["shared-codex", ["POST", "PUT", "DELETE"]],
   ["model-registry", ["POST", "PUT", "DELETE"]],
   ["custom-providers", ["PUT", "DELETE"]],
 ]);
 
 const READS = [
+  "mcp-servers",
+  "mcp-connections",
+  "mcp-policy",
   "metrics",
   "spend",
   "egress",

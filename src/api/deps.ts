@@ -1,3 +1,4 @@
+import type { McpConnectionService } from "../mcp/mcp-connection-service.ts";
 import type { AppGitHubService } from "../deploy/app-github.ts";
 import type { DeployStore } from "../deploy/deploy-store.ts";
 import type { AccountStore } from "../auth/accounts.ts";
@@ -136,6 +137,7 @@ export interface ServerDeps {
   providerKeys?: ModelProviderAvailability;
   modelCredentials?: ModelCredentialStore;
   userModelCredentials?: UserModelCredentialStore;
+  mcpConnections?: McpConnectionService;
   mcpServers?: McpServerStore;
   mcpToolService?: McpToolService;
   modelCredentialFetch?: typeof fetch;

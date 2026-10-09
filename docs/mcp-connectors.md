@@ -55,3 +55,54 @@ HTTP redirects are rejected for every MCP authentication mode. Updating an endpo
 or credential host is an administrative trust decision. Tool call auditing records
 the initiating actor as before; authentication does not expand the audience allowed
 to receive the result.
+
+## Browse → MCP
+
+Internal users manage remote HTTP MCP connections from the left sidebar's Browse → MCP page.
+The inventory includes personal connections, direct shares, and connections in projects the user currently belongs to.
+Project connections are usable only in that project's conversations, including its linked Slack channel.
+
+To add a connection:
+
+1. Choose Add MCP, enter its name and exact server URL, and select a personal home or a project you own.
+2. Choose no authentication, bearer token, OAuth, or client credentials. The connection starts disabled.
+3. Connect your account. OAuth discovers the authorization server and supports metadata-document client IDs,
+   dynamic registration, or a manually registered client ID with its issuer. Client credentials require an explicit token endpoint.
+4. Test discovery. Newly discovered tools start disabled. Approve the tools to expose and classify which ones are read-only.
+5. Enable the connection. Unattended use is off until explicitly enabled.
+
+CONNECTOR_SECRET_KEY is required for authenticated connections and their encrypted account catalogs.
+Credentials stay in core and are never returned in API read responses or injected into a shared sandbox.
+OAuth uses the fixed public callback `/api/mcp-oauth/callback`; configure PUBLIC_WEB_URL to the reachable web surface.
+The public `/api/mcp-oauth/client-metadata` document advertises that callback for servers supporting metadata-document client IDs.
+
+Owners can share with a named internal teammate or a project they belong to. Each share selects tools,
+read/write access, unattended permission, and either the recipient's own account or the owner's saved account.
+Saved-account sharing explicitly authorizes recipients to execute as the credential owner without viewing its secrets.
+Recipients cannot edit, delete, or re-share the connection. Project owners manage project-owned connections.
+Changing the server URL or authentication method requires reconnecting accounts and approving tools again.
+Replacing or disconnecting an account removes its saved-account delegations; reconnecting never restores those grants automatically.
+
+Tool catalogs and execution are resolved for the initiating actor and the conversation's scope and audience.
+Every call rechecks current membership, sharing, selected tools, unattended permission, and account authorization.
+Personal access does not carry into a project, and project membership does not carry access into personal chats.
+Revocation stops subsequent calls, including calls from an old tool catalog; already-dispatched remote operations cannot be undone.
+
+## Admin → MCP
+
+Admins can inspect scoped connections, disable them, and configure exact endpoint exceptions.
+An administrative disable blocks owner re-enablement until an administrator unblocks the connection.
+Public HTTPS endpoints are allowed by default. Private networks and HTTP require an exact hostname,
+port, and approved addresses or CIDRs. The same network policy applies to MCP discovery and calls,
+OAuth metadata and registration, and token exchange/refresh. DNS is checked and pinned on each request;
+redirects are rejected and responses are bounded.
+
+Existing admin-registered servers remain labeled Legacy instance-wide, retaining their tool names and audience.
+Legacy bearer/client secrets migrate idempotently to encrypted records when persistent connector encryption is configured.
+To narrow a legacy audience, add a scoped connection, verify its intended user/project access, and disable the legacy entry.
+
+The scoped API is `/v1/mcp-connections` with list/create and `/:id` read/update/delete operations.
+`/:id/test` tests authenticated discovery, `/:id/tools` reads the current catalog, `/:id/account` connects/disconnects
+an account, and `/:id/shares` creates or revokes scoped use-only shares. User requests bind `principalId` to the verified
+portal identity or live capability actor. The web surface injects the signed-in identity and signs each core request.
+Admin endpoints are `/v1/admin/mcp-connections`, `/:id/disable`, `/:id/unblock`, and `/v1/admin/mcp-policy`.

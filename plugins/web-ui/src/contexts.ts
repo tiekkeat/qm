@@ -1,3 +1,4 @@
+import { projectMcpSection } from "./mcp";
 import { previewFile } from "./file-open.ts";
 import { peopleResults, type DirectoryMatch } from "./people-results";
 import { html, nothing, render, type TemplateResult } from "lit";
@@ -473,6 +474,7 @@ function detailTpl(c: CoreContext): TemplateResult {
                   ${resourceSections(c.scopeId)}
                 `
           }
+          ${c.project ? projectMcpSection(c.scopeId) : nothing}
         </div>
         <aside class="context-settings" aria-label=${c.project ? "Project settings" : "Context settings"}>
           ${c.project ? projectMembersSection(c) : nothing} ${c.project ? projectSlackSection(c) : nothing}

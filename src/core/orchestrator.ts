@@ -2781,6 +2781,27 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
             `[orchestrator] trigger delivery has no surface tools (missing deliveries store?) — reply would be lost session=${session.id}`,
           );
 
+        const scopedMcp =
+          !external && deps.mcpConnections
+            ? await deps.mcpConnections.forTurn({
+                principalId: actor.id,
+                scopeId,
+                audience: conversation.audience,
+                unattended: !liveAuthorTurn,
+                readOnly: strictReadOnly,
+              })
+            : undefined;
+        const turnMcp =
+          !external && deps.mcp
+            ? {
+                ...deps.mcp,
+                toolDefs: () => [...deps.mcp!.toolDefs(), ...(scopedMcp?.toolDefs() ?? [])],
+                call: (name: string, args: Record<string, unknown>, principalId?: string) =>
+                  name.startsWith("mc") && !deps.mcp!.toolDefs().some((tool) => tool.name === name) && scopedMcp
+                    ? scopedMcp.call(name, args)
+                    : deps.mcp!.call(name, args, principalId),
+              }
+            : undefined;
         const baseTools = createToolContext({
           sandbox: deps.sandbox,
           sandboxResources: turnSandboxResources,
@@ -2897,7 +2918,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           memoryCaptureMetadata: () => ({ sessionId: session.id, inheritedRecords: captureDependencies() }),
           memoryScopeId,
           ...(memoryAccess ? { memoryAccess } : {}),
-          ...(!external && deps.mcp ? { mcp: deps.mcp } : {}),
+          ...(turnMcp ? { mcp: turnMcp } : {}),
           ...(input.surface === "slack" ? { actingSlackUserId: actor.id } : {}),
           ...(deps.deploymentLayer
             ? {

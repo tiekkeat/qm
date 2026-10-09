@@ -1,3 +1,4 @@
+import { openMcpById } from "./mcp";
 import { html, nothing, render, type TemplateResult } from "lit";
 import { Box, Brain, Clock, Files, Folder, KeyRound, Repeat, Rocket, ShieldUser, Webhook, type IconNode } from "lucide";
 import { deepLinkPath, isPlainLeftClick, UI_BASE } from "./deep-link";
@@ -34,6 +35,7 @@ export function destinations(): Destination[] {
     to("files", Files, "Files", "Everything you and QM have shared"),
     to("crons", Clock, "Crons", "Work that runs on a schedule"),
     to("webhooks", Webhook, "Webhooks", "Inbound events that wake QM"),
+    to("mcp", Box, "MCP", "Servers and tools you can access"),
     to("keychain", KeyRound, "Keychain", "Connected accounts and credentials"),
     to("deploys", Rocket, "Apps", "What QM has shipped for you"),
     to("memory", Brain, "Memory", "What QM remembers about your work"),
@@ -87,6 +89,7 @@ function go(d: Destination): void {
     return;
   }
   setScopedSession(null);
+  if (d.view === "mcp") openMcpById(null);
   switchView(d.view);
 }
 

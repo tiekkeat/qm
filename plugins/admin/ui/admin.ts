@@ -1,3 +1,4 @@
+export * as mcp from "./mcp.ts";
 import * as governance from "./governance.ts";
 import * as settings from "./settings.ts";
 import * as integrations from "./integrations.ts";

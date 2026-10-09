@@ -30,6 +30,7 @@ const VIEWS = [
   "loops",
   "files",
   "keychain",
+  "mcp",
   "deploys",
   "memory",
   "skills",

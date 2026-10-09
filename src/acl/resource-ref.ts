@@ -1,4 +1,4 @@
-const RESOURCE_KINDS = ["file", "skill", "deploy", "cron", "service-cred"] as const;
+const RESOURCE_KINDS = ["file", "skill", "deploy", "cron", "service-cred", "mcp"] as const;
 export type ResourceKind = (typeof RESOURCE_KINDS)[number];
 
 export interface ResourceRef {
@@ -7,6 +7,7 @@ export interface ResourceRef {
 }
 
 const PREFIX: Record<Exclude<ResourceKind, "file">, string> = {
+  mcp: "mcp:",
   skill: "skill:",
   deploy: "deployment:",
   cron: "cron:",

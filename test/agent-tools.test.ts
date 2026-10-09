@@ -2824,6 +2824,7 @@ test("unified sandbox rejects missing, mistyped and unrelated action fields befo
   const tc = new Proxy(fakeToolContext(), {
     get(target, key, receiver) {
       const value = Reflect.get(target, key, receiver);
+      if (key === "mcpToolDefs") return value.bind(target);
       if (typeof value !== "function") return value;
       return () => {
         dispatched++;
@@ -3548,23 +3549,35 @@ test("conversation coordinator mailbox checks never block on children", async ()
   assert.ok(waits.every((timeout) => timeout === 0));
 });
 
-test("resource catalog exposes one home per operation and leaves MCP tools intact", async () => {
+test("resource catalog exposes one home per operation and uses the turn's authorized MCP tools", async () => {
+  const context = fakeToolContext();
+  context.mcpToolDefs = () => [
+    {
+      name: "example_search",
+      serverId: "example",
+      remoteName: "search",
+      description: "Search",
+      inputSchema: { type: "object", properties: {} },
+      readOnly: true,
+    },
+  ];
   const tools = createAgentTools(
-    { current: fakeToolContext() },
+    { current: context },
     {
       controlTools: true,
       mcpTools: () => [
         {
-          name: "example_search",
-          serverId: "example",
+          name: "unauthorized",
+          serverId: "other",
           remoteName: "search",
-          description: "Search",
-          inputSchema: { type: "object", properties: {} },
+          description: "Forbidden",
+          inputSchema: { type: "object" },
           readOnly: true,
         },
       ],
     },
   );
+  assert.ok(!tools.some((tool) => tool.name === "unauthorized"));
   const names = tools.map((tool) => tool.name);
   for (const name of ["files", "apps", "skills", "subagents", "goal", "cron", "example_search"])
     assert.ok(names.includes(name));

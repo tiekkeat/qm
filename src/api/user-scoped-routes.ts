@@ -9,6 +9,18 @@ function pat(method: string, template: string, field?: Field): Rule {
 }
 
 const USER_SCOPED: Rule[] = [
+  ...["GET", "POST"].map((method) => pat(method, "/v1/mcp-connections", { in: "query", name: "principalId" })),
+  ...["GET", "PATCH", "DELETE"].map((method) =>
+    pat(method, "/v1/mcp-connections/:id", { in: "query", name: "principalId" }),
+  ),
+  pat("GET", "/v1/mcp-connections/:id/tools", { in: "query", name: "principalId" }),
+  pat("POST", "/v1/mcp-connections/:id/test", { in: "query", name: "principalId" }),
+  ...["POST", "DELETE"].flatMap((method) =>
+    ["account", "shares"].map((operation) =>
+      pat(method, `/v1/mcp-connections/:id/${operation}`, { in: "query", name: "principalId" }),
+    ),
+  ),
+
   pat("POST", "/v1/composio/complete-auth"),
   pat("POST", "/v1/composio/authorize"),
   pat("POST", "/v1/composio/execute"),

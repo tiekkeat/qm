@@ -1,3 +1,4 @@
+import { renderMcp, openMcpById, routeMcpHistory } from "./mcp";
 import { loadMessageTranscript, messageLinkSeq } from "./message-link.ts";
 import { initializeBrowserErrors, stopBrowserErrors } from "./browser-errors";
 import { initializeAnalytics, capturePageview, stopAnalytics } from "./product-analytics";
@@ -223,6 +224,7 @@ const ICON = {
   contexts: Folder,
   files: Files,
   keychain: KeyRound,
+  mcp: Box,
   deploys: Rocket,
   webhooks: Webhook,
   crons: Clock,
@@ -748,6 +750,9 @@ export function switchView(v: View): void {
     case "files":
       void renderFiles();
       break;
+    case "mcp":
+      void renderMcp();
+      break;
     case "keychain":
       void renderConnectors();
       break;
@@ -814,6 +819,9 @@ function refreshActiveView(v: View): void {
       break;
     case "files":
       void renderFiles();
+      break;
+    case "mcp":
+      void renderMcp();
       break;
     case "keychain":
       clearConnectorNotice();
@@ -978,12 +986,13 @@ export function replacePanePreservingFocus(host: HTMLElement): void {
 }
 
 window.addEventListener("popstate", () => {
-  const routed = ["crons", "webhooks", "inbox", "skills"];
+  const routed = ["crons", "webhooks", "inbox", "skills", "mcp"];
   if (!routed.includes(appState.currentView)) return;
   const { view, item } = parseDeepLink(UI_BASE, location.pathname, location.search);
   if (view !== appState.currentView) return;
   if (view === "crons") routeCronsHistory(item);
   else if (view === "webhooks") routeWebhooksHistory(item);
+  else if (view === "mcp") routeMcpHistory(item);
   else if (view === "skills") routeSkillsHistory(item);
   else routeInboxHistory(item);
 });
@@ -1191,6 +1200,7 @@ export async function boot(): Promise<void> {
     if (wanted === "deploys" && wantedItem)
       openDeployById(wantedItem, Number(params.get("version")) || undefined, params.get("tab") ?? undefined);
     if (wanted === "crons" && wantedItem) openCronById(wantedItem);
+    if (wanted === "mcp") openMcpById(wantedItem);
     if (wanted === "webhooks" && wantedItem) openWebhookById(wantedItem);
     if (wanted === "skills" && wantedItem) openSkillById(wantedItem);
     switchView(wanted as View);

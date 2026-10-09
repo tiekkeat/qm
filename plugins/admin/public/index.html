@@ -6633,7 +6633,17 @@
       const EFFECT_LABELS = { allow: "Allow", deny: "Deny", require_approval: "Require approval" };
       const SECTIONS = [
         {
-          views: ["governance", "models", "credentials", "connectors", "slack-settings", "customize", "users", "spend"],
+          views: [
+            "governance",
+            "models",
+            "credentials",
+            "connectors",
+            "mcp",
+            "slack-settings",
+            "customize",
+            "users",
+            "spend",
+          ],
         },
         {
           label: "Logs",
@@ -6791,6 +6801,7 @@
         credentials: "Credentials",
         customize: "Customize",
         connectors: "Connectors",
+        mcp: "MCP",
         users: "Users",
         keychain: "Keychain",
         user: "User",
@@ -6828,6 +6839,7 @@
         "deployments",
       ]);
       const ORG_WIDE = new Set([
+        "mcp",
         "retention",
         "users",
         "spend",
@@ -6840,7 +6852,7 @@
         "customize",
         "slack-settings",
       ]);
-      const ENDPOINT = { history: "sessions", files: "files", live: "runs" };
+      const ENDPOINT = { mcp: "mcp-connections", history: "sessions", files: "files", live: "runs" };
       const HISTORY_PAGE_SIZE = 50;
       const ERRORS_PAGE_SIZE = 50;
 
@@ -9192,6 +9204,7 @@
       function paintData(root, data) {
         root.textContent = "";
         ({
+          mcp: (root, data) => governanceUI.mcp.mount(root, data, { api, refresh: renderData }),
           metrics: renderMetrics,
           spend: renderSpend,
           egress: renderEgress,

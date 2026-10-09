@@ -1,3 +1,4 @@
+import { mcpConnectionRoutes } from "./mcp-connections.ts";
 import { appCollaborationRoutes } from "./app-collaboration.ts";
 import { accountRoutes } from "./accounts.ts";
 import { browserModelRoutes } from "./browser-model.ts";
@@ -93,6 +94,7 @@ export const apiRoutes: ReadonlyArray<Route<ApiCtx>> = [
   ...keychainRoutes,
   ...secretDropRoutes,
   ...connectorRoutes,
+  ...mcpConnectionRoutes,
   ...composioRoutes,
   ...adminRoutes,
   ...skillPackRoutes,

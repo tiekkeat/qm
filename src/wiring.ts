@@ -1,3 +1,6 @@
+import { createMcpEndpointPolicy, type McpEndpointPolicy } from "./mcp/mcp-endpoint-policy.ts";
+import { createMcpConnectionService, type McpConnectionService } from "./mcp/mcp-connection-service.ts";
+import type { McpConnection, McpAccount, McpOAuthFlow } from "./mcp/mcp-connection-store.ts";
 import {
   createAppGitHubService,
   type AppGitHubService,
@@ -520,6 +523,7 @@ export interface BuiltApp {
   refreshModels: () => Promise<void>;
   customProviders: CustomProviderStore;
   refreshCustomProviders: () => Promise<void>;
+  mcpConnections: McpConnectionService;
   mcpServers: McpServerStore;
   mcpToolService: McpToolService;
   acl: AclStore;
@@ -858,7 +862,6 @@ export function buildApp(
       return memorySessions.store.getEntries(sessionId, { limit: MEMORY_CAPTURE_ENTRY_WINDOW });
     },
   });
-  const mcpServers = createMcpServerStore(artifactMap<McpServer>("mcp_servers"));
   const errors = withErrorReporting(config.databaseUrl ? createPostgresErrorLog(config.databaseUrl) : createErrorLog());
   const sandboxOnError = (e: { category: string; code: string; message: string; scopeLabel?: string }) =>
     errors.record({
@@ -1255,6 +1258,10 @@ export function buildApp(
     sharedLogins: artifactMap<import("./model/user-model-credential-store.ts").SharedCodexLogin>("shared_model_logins"),
     lock: advisoryLock,
   });
+  const mcpServers = createMcpServerStore(
+    artifactMap<McpServer>("mcp_servers"),
+    keychainKeyMaterial ? credentialKey : undefined,
+  );
   const keychain: Keychain | undefined = keychainKeyMaterial ? credentialStore : undefined;
   const mcpToolService = createMcpToolService({
     servers: mcpServers,
@@ -1715,6 +1722,25 @@ export function buildApp(
     isActiveMember: (principalId) => identity.isInternal(identity.classify(principalId)),
     advisoryLock,
   });
+  const mcpConnections = createMcpConnectionService({
+    stores: {
+      connections: artifactMap<McpConnection>("mcp_connections"),
+      accounts: artifactMap<McpAccount>("mcp_accounts"),
+      flows: artifactMap<McpOAuthFlow>("mcp_oauth_flows"),
+    },
+    acl,
+    projects,
+    lock: advisoryLock,
+    audit: auditLog,
+    policy: createMcpEndpointPolicy(artifactMap<McpEndpointPolicy>("mcp_endpoint_policy")),
+    ...(keychainKeyMaterial ? { key: credentialKey } : {}),
+    active: async (actor) => {
+      await identity.refresh(true);
+      return identity.isInternal(identity.classify(actor));
+    },
+    recipient: async (actor) => (await app.directoryMember(actor))?.type === "internal",
+    callbackUrl: `${(config.publicWebUrl ?? config.publicUrl ?? config.apiBaseUrl ?? "http://localhost:8080").replace(/\/$/, "")}/api/mcp-oauth/callback`,
+  });
   const canReadScope = createCanReadScope({ managedGroups: projects, directory, identity, sessions });
   const canWriteScope = createCanWriteScope({ managedGroups: projects, directory, identity });
   const canManageScope = createCanManageScope({ managedGroups: projects, directory, identity, sessions });
@@ -1992,6 +2018,7 @@ export function buildApp(
     acl,
     admin,
     mcp: mcpToolService,
+    mcpConnections,
     ...(config.maxContextTokens !== undefined ? { maxContextTokens: config.maxContextTokens } : {}),
     execTimeoutMs: config.execTimeoutDefaultMs,
     execTimeoutCeilingMs: config.execTimeoutMaxMs,
@@ -2184,6 +2211,7 @@ export function buildApp(
     refreshModels,
     customProviders,
     refreshCustomProviders,
+    mcpConnections,
     mcpServers,
     mcpToolService,
     ...(overrides.modelCredentialFetch ? { modelCredentialFetch: overrides.modelCredentialFetch } : {}),
@@ -2906,6 +2934,7 @@ export function buildApp(
     refreshModels,
     customProviders,
     refreshCustomProviders,
+    mcpConnections,
     mcpServers,
     mcpToolService,
     acl,
@@ -3021,6 +3050,7 @@ export function serverDeps(
     refreshModels: built.refreshModels,
     customProviders: built.customProviders,
     refreshCustomProviders: built.refreshCustomProviders,
+    mcpConnections: built.mcpConnections,
     mcpServers: built.mcpServers,
     mcpToolService: built.mcpToolService,
     ...(config.brandingDefault ? { brandingDefault: config.brandingDefault } : {}),

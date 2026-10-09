@@ -2181,6 +2181,26 @@ const apiRoutes: readonly WebRoute[] = [
       );
     },
   },
+  ...["GET", "POST", "PATCH", "DELETE"].flatMap((method) =>
+    ["/api/mcp-connections", "/api/mcp-connections/:id", "/api/mcp-connections/:id/:operation"].map((path) => ({
+      method,
+      path,
+      handle: async (c: WebCtx) => {
+        const suffix = c.params.id
+          ? `/${encodeURIComponent(c.params.id)}${c.params.operation ? `/${encodeURIComponent(c.params.operation)}` : ""}`
+          : "";
+        const query = new URLSearchParams(c.url.searchParams);
+        query.set("principalId", c.user);
+        let body = "";
+        if (method === "POST" || method === "PATCH") {
+          const input = await readJson<Record<string, unknown>>(c.req, c.res);
+          if (!input) return;
+          body = JSON.stringify({ ...input, principalId: c.user });
+        }
+        return relayCore(c.res, method as HttpMethod, `/v1/mcp-connections${suffix}?${query}`, body);
+      },
+    })),
+  ),
   {
     method: "GET",
     path: "/api/connectors",
@@ -3325,6 +3345,18 @@ const routeRequest = async (req: IncomingMessage, res: ServerResponse) => {
   if (method === "POST" && path === "/signout") {
     res.writeHead(200, { "set-cookie": "webuiuser=; HttpOnly; Path=/; Max-Age=0", "content-type": "application/json" });
     return res.end(JSON.stringify({ ok: true }));
+  }
+
+  if (method === "GET" && path === "/api/mcp-oauth/client-metadata")
+    return relayCore(res, "GET", "/v1/mcp-oauth/client-metadata");
+
+  if (method === "GET" && path === "/api/mcp-oauth/callback") {
+    const result = await coreFetch("GET", `/v1/mcp-oauth/callback${url.search}`);
+    return sendHtml(
+      res,
+      result.status,
+      callbackHtml(`view=mcp&status=${result.status === 200 ? "connected" : "error"}`),
+    );
   }
 
   let oauthCallbackPrefix: string | null = null;

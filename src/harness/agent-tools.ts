@@ -4171,7 +4171,7 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
     },
   });
 
-  const mcpDefs = opts?.mcpTools?.() ?? [];
+  const mcpDefs = ref.current?.mcpToolDefs?.() ?? [];
   const mcpTools = mcpDefs
     .filter((d) => !opts?.readOnly || d.readOnly)
     .map((d) =>
