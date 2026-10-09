@@ -59,6 +59,9 @@ function relay(
     forwardCookies?: boolean;
   },
 ): void {
+  const headers = { ...target.headers };
+  if (req.headers["content-length"] !== undefined) headers["content-length"] = req.headers["content-length"];
+  else if (req.headers["transfer-encoding"] !== undefined) headers["transfer-encoding"] = "chunked";
   const up = httpRequest(
     {
       protocol: target.protocol,
@@ -66,7 +69,7 @@ function relay(
       port: target.port,
       method: req.method,
       path: target.path,
-      headers: target.headers,
+      headers,
     },
     (upRes) => {
       const out: Record<string, string | string[]> = {};
