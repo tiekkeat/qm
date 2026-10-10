@@ -794,6 +794,10 @@ export async function api<T = unknown>(path: string, init?: RequestInit): Promis
     const msg = details?.message ?? details?.reason ?? details?.error ?? `HTTP ${r.status}`;
     throw new ApiError(msg, r.status, body);
   }
+  if (path === "/api/turn" && typeof window !== "undefined" && typeof init?.body === "string") {
+    const input = JSON.parse(init.body) as { threadRef?: string };
+    window.dispatchEvent(new CustomEvent("qm-agent-selection", { detail: { threadRef: input.threadRef } }));
+  }
   return body as T;
 }
 

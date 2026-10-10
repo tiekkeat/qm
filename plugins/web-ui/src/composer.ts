@@ -1,3 +1,4 @@
+import "./agent-picker";
 import { appEditSlug } from "./app-edit";
 import {
   runtimeConfigKey,
@@ -690,6 +691,11 @@ export function createComposerSurface(ctx: ConvCtx, options: ComposerOptions = {
               ${icon(Paperclip, 18)}
             </button>
             ${runtimeControls}
+            <qm-agent-picker
+              .scopeId=${ctx.chat.state.scopeId ?? `personal:${appState.me?.user}`}
+              .threadRef=${ctx.chat.state.threadRef ?? ""}
+              .disabled=${inputBlocked}
+            ></qm-agent-picker>
           </div>
           <div class="composer-right">${sendControls(agent)}</div>
         </div>

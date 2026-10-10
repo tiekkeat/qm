@@ -659,6 +659,7 @@ export interface ClientToolResult {
 }
 
 export interface TurnRequest {
+  customAgent?: import("./agents/agent-service.ts").AgentSelection | null;
   slackSource?: { accountId: string; teamId: string; userId: string; externalPolicyNamespace?: string };
   externalSlack?: {
     accountId: string;

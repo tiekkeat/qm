@@ -39,6 +39,7 @@ export function destinations(): Destination[] {
     to("keychain", KeyRound, "Keychain", "Connected accounts and credentials"),
     to("deploys", Rocket, "Apps", "What QM has shipped for you"),
     to("memory", Brain, "Memory", "What QM remembers about your work"),
+    to("agents", Brain, "Agents", "Custom specialists you can create and share"),
     to("skills", Box, "Skills", "Reusable procedures QM can follow"),
   ];
   if (can("loops")) list.push(to("loops", Repeat, "Loops", "Standing work QM keeps pushing forward"));

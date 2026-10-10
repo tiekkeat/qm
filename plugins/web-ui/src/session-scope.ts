@@ -75,7 +75,7 @@ export function scopeToolCount(tool: SessionTool, scope: string, onReady: () => 
   return hit?.count ?? null;
 }
 
-export type SessionTool = "crons" | "files" | "memory" | "apps" | "skills" | "keychain";
+export type SessionTool = "crons" | "files" | "memory" | "apps" | "skills" | "agents" | "keychain";
 
 export interface SessionTopbarOpts {
   status?: CoreSession["status"];
@@ -184,7 +184,7 @@ export function sessionTopbarTpl(o: SessionTopbarOpts): TemplateResult {
       ${sessionStatusMark(o.status)}
       <div class="topbar-actions session-tools">
         ${tool("crons", Clock3, "Crons")} ${tool("apps", Rocket, "Apps")} ${tool("files", Files, "Files")}
-        ${tool("skills", Box, "Skills")} ${tool("memory", Brain, "Memory")}
+        ${tool("agents", Brain, "Agents")} ${tool("skills", Box, "Skills")} ${tool("memory", Brain, "Memory")}
         ${tool("keychain", KeyRound, "Your keychain")}
       </div>
       <div class="topbar-actions form-menu-control session-tools-more" data-align="right" data-drop="down">
@@ -201,8 +201,9 @@ export function sessionTopbarTpl(o: SessionTopbarOpts): TemplateResult {
         <div class="menu-popover" role="menu" hidden>
           <div class="menu-title">This conversation's workspace</div>
           ${sheetTool("crons", Clock3, "Crons")} ${sheetTool("apps", Rocket, "Apps")}
-          ${sheetTool("files", Files, "Files")} ${sheetTool("skills", Box, "Skills")}
-          ${sheetTool("memory", Brain, "Memory")} ${sheetTool("keychain", KeyRound, "Your keychain")}
+          ${sheetTool("agents", Brain, "Agents")} ${sheetTool("files", Files, "Files")}
+          ${sheetTool("skills", Box, "Skills")} ${sheetTool("memory", Brain, "Memory")}
+          ${sheetTool("keychain", KeyRound, "Your keychain")}
         </div>
       </div>
     </header>

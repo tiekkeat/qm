@@ -1054,6 +1054,7 @@ export function createSessionMethods(
     },
 
     async grant(g) {
+      if (parseRef(g.ref).kind === "agent") throw new Error("Manage agent access through the agent sharing API");
       if (parseRef(g.ref).kind === "mcp") throw new Error("Manage MCP access through the MCP sharing API");
       if (parseRef(g.ref).kind === "deploy") {
         g = {
@@ -1087,6 +1088,7 @@ export function createSessionMethods(
         );
     },
     async revokeGrant(ownerScopeId, ref, granteeScopeId, revokedBy) {
+      if (parseRef(ref).kind === "agent") throw new Error("Manage agent access through the agent sharing API");
       if (parseRef(ref).kind === "mcp") throw new Error("Manage MCP access through the MCP sharing API");
       await deps.acl.revoke(ownerScopeId, ref, granteeScopeId, revokedBy, await artifactAuthor(ownerScopeId, ref));
       deps.auditLog.record({

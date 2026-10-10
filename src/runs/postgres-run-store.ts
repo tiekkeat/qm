@@ -475,6 +475,14 @@ export function createPostgresRunStore(connectionString: string, opts?: { maxCla
       return (rowCount ?? 0) > 0;
     },
 
+    async withdrawAgent(agentId) {
+      const { rowCount } = await q(
+        "DELETE FROM runs WHERE status = 'pending' AND attempts = 0 AND turn_user_seq IS NULL AND request::jsonb -> 'customAgent' ->> 'id' = $1",
+        [agentId],
+      );
+      return rowCount ?? 0;
+    },
+
     async withdraw(runId: string, opts): Promise<boolean> {
       const { rowCount } = await q(
         "DELETE FROM runs WHERE id = $1 AND status = 'pending' AND (NOT $2::boolean OR (attempts = 0 AND turn_user_seq IS NULL))",

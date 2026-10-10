@@ -27,6 +27,30 @@ const CONVERSATION_UPDATE =
 
 const FAMILIES: AgentApiFamily[] = [
   {
+    match: (_m, p) => p.startsWith("/v1/agents"),
+    guidance:
+      "Use the agent-management skill to create and improve versioned specialist agents. Changes require a human-started turn and current owner/contributor rights. Never publish or delete without user authorization.",
+    routes: [
+      { method: "GET", path: "/v1/agents", summary: "list agents available in this workspace" },
+      {
+        method: "POST",
+        path: "/v1/agents",
+        summary: "{package} creates a draft; metadata, instructions, files, tool restrictions and examples",
+      },
+      { method: "GET", path: "/v1/agents/:id?version=", summary: "inspect an authorized package revision" },
+      {
+        method: "POST",
+        path: "/v1/agents/:id",
+        summary: "{action:save|publish|restore|suggest|share|grants|import-skill,...}; saves require expectedVersion",
+      },
+      {
+        method: "DELETE",
+        path: "/v1/agents/:id",
+        summary: "{confirm:true} retains history and disables use; owner only",
+      },
+    ],
+  },
+  {
     match: (method, path) =>
       (method === "GET" &&
         ["identity", "connections", "toolkits", "tools"].some((name) => path === `/v1/composio/${name}`)) ||

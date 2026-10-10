@@ -203,6 +203,9 @@ export type AttachResult = { ok: true; files: AttachedFileMeta[]; staged: number
 export type AttachFiles = (files: readonly string[]) => Promise<AttachResult>;
 
 export interface ToolContext extends SurfaceToolDeps {
+  agentToolsAllowlist?: string[] | null;
+  manageAgents?(action: string, input: Record<string, unknown>): Promise<unknown>;
+  readAgentPackage?(path: string): Promise<string>;
   runtime?(request: RuntimeRequest, signal?: AbortSignal): Promise<RuntimeResult>;
   attach: AttachFiles;
   sessionSyscalls?: SessionSyscalls;

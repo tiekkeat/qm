@@ -1,3 +1,4 @@
+import { allowsAgentTool, agentApiOperation } from "../agents/tool-policy.ts";
 import { externalSlackCapabilityAllowed } from "./external-slack-capability.ts";
 import { MemoryDisclosureDenied } from "../memory/disclosure.ts";
 import { reportBackendError, startTiming } from "../../plugins/chassis/src/error-reporting.ts";
@@ -301,6 +302,13 @@ async function gate(
       body = JSON.parse(raw);
     } catch {
       sendJson(res, 400, { error: "bad_request", message: "invalid JSON body" });
+      return null;
+    }
+  }
+  if (capability?.agentTools) {
+    const operation = agentApiOperation(method, pathname, body);
+    if (!operation || !allowsAgentTool(capability.agentTools, operation.name, operation.action)) {
+      sendJson(res, 403, { error: "forbidden", message: "The selected agent restricts this operation" });
       return null;
     }
   }

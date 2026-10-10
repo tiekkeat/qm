@@ -1846,6 +1846,35 @@ const apiRoutes: readonly WebRoute[] = [
       return relayCore(res, "GET", `/v1/scope-resources?${qs.toString()}`);
     },
   },
+  ...["/api/agents", "/api/agents/binding", "/api/agents/:id"].flatMap((path) => [
+    {
+      method: "GET" as const,
+      path,
+      handle: async (c: WebCtx) => {
+        const query = new URLSearchParams(c.url.searchParams);
+        query.set("principalId", c.user);
+        const suffix = c.params.id ? `/${encodeURIComponent(c.params.id)}` : path.slice("/api/agents".length);
+        return relayCore(c.res, "GET", `/v1/agents${suffix}?${query}`);
+      },
+    },
+    ...(["POST", "DELETE"] as const).map((method) => ({
+      method,
+      path,
+      handle: async (c: WebCtx) => {
+        let input: Record<string, unknown>;
+        try {
+          input = JSON.parse(await readBodyCapped(c.req, 6_000_000));
+          if (!input || typeof input !== "object" || Array.isArray(input))
+            return json(c.res, 400, { error: "bad_request" });
+        } catch (e) {
+          if (e instanceof PayloadTooLargeError) throw e;
+          return json(c.res, 400, { error: "bad_request" });
+        }
+        const suffix = c.params.id ? `/${encodeURIComponent(c.params.id)}` : path.slice("/api/agents".length);
+        return relayCore(c.res, method, `/v1/agents${suffix}`, JSON.stringify({ ...input, principalId: c.user }));
+      },
+    })),
+  ]),
   {
     method: "GET",
     path: "/api/skills",
@@ -2622,11 +2651,13 @@ const apiRoutes: readonly WebRoute[] = [
       let channelName: string | undefined;
       const attachments: CoreAttachment[] = [];
       let approval: { requestId: string; approved: boolean; scope?: string } | undefined;
+      let customAgent: unknown;
       let proactiveOpener = false;
       let idempotencyKey: string | undefined;
       try {
         const p = JSON.parse(await readBody(req));
         text = String(p.text ?? "");
+        customAgent = p.customAgent;
         idempotencyKey = namespacedSendKey(user, p.idempotencyKey);
         if (
           !idempotencyKey &&
@@ -2687,6 +2718,7 @@ const apiRoutes: readonly WebRoute[] = [
         ...(timezone ? { timezone } : {}),
         ...(attachments.length ? { attachments } : {}),
         ...(approval ? { approval } : {}),
+        ...(customAgent !== undefined ? { customAgent } : {}),
         ...(proactiveOpener ? { proactiveOpener: true } : {}),
         ...(idempotencyKey ? { idempotencyKey } : {}),
       };

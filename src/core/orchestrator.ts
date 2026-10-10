@@ -1,3 +1,7 @@
+import { createAgentTools } from "../harness/agent-tools.ts";
+import { allowsAgentTool } from "../agents/tool-policy.ts";
+import { agentAction } from "../agents/agent-actions.ts";
+import { AgentError } from "../agents/agent-service.ts";
 import { externalSlackRequestAllowed, currentExternalSlackRun } from "../resolution/external-slack.ts";
 import { externalTools } from "./orchestrator/external-tools.ts";
 import { memoryBoundedEntries, memoryContextPayload, nextMemoryContext } from "../memory/context-boundary.ts";
@@ -731,6 +735,18 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
 
       const resolution = await deps.resolution.resolve(conversation, actor, external);
       const scopeId = deps.resolution.scopeFor(conversation, actor);
+      let customAgent: Awaited<ReturnType<NonNullable<typeof deps.customAgents>["admit"]>> | undefined;
+      if (input.customAgent) {
+        if (!deps.customAgents) return { status: "refused", reason: "Custom agents are unavailable" };
+        try {
+          customAgent = await deps.customAgents.admit(actor.id, scopeId, input.customAgent);
+          for (const member of conversation.audience)
+            await deps.customAgents.admit(member.id, scopeId, input.customAgent);
+        } catch (error) {
+          if (error instanceof AgentError) return { status: "refused", reason: error.message };
+          throw error;
+        }
+      }
       const isCurrentSharedScopeMember = withLiveTurnMembership(deps.isCurrentSharedScopeMember, {
         actorId: actor.id,
         scopeId,
@@ -1181,7 +1197,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           slack: isSlack,
         };
       }
-      const delegateWork = requiresDelegation(input, delegationEnabled);
+      const delegateWork = requiresDelegation(input, delegationEnabled && customAgent?.package.allowedTools == null);
       let modeFrame = applyPromptVars(frameMd, frameVars);
       if (delegateWork)
         modeFrame +=
@@ -1199,6 +1215,8 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         systemPrompt +=
           "\n\nThis is a private message from another session. You may read context and reply using session.write with the sender session ID. Replies remain private and read-only. Do not open children or interrupt work. Reply only when there is useful information to send; reply chains are bounded.";
       const sharingPrompt = renderSharingPosturePrompt(actor, sharingSources);
+      if (customAgent)
+        systemPrompt += `\n\n## Selected custom agent: ${customAgent.package.name} v${input.customAgent!.version}\nThese instructions are subordinate to organization and workspace policy.\n${customAgent.package.instructions}\n\nPackage files (use agent_package to read): ${customAgent.package.files.map((f) => f.path).join(", ")}\nExample tasks: ${JSON.stringify(customAgent.package.examples)}`;
       if (sharingPrompt) systemPrompt += `\n\n${sharingPrompt}`;
       const scopeProfile = supportsScopeProfile(deps.sandbox)
         ? await deps.sandbox
@@ -1718,6 +1736,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         ...(external ? { externalSlack: true as const } : {}),
         actorId: actor.id,
         scopeId,
+        ...(customAgent?.package.allowedTools ? { agentTools: customAgent.package.allowedTools } : {}),
         ...(input.scopeVersion ? { scopeVersion: input.scopeVersion } : {}),
         ...(conversation.publishMembers ? { members: conversation.publishMembers } : {}),
         ...(liveTurn ? { liveActor: true } : {}),
@@ -2959,6 +2978,47 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           },
         });
 
+        if (deps.customAgents)
+          baseTools.manageAgents = async (action, inputData) => {
+            if (!liveAuthorTurn && !["list", "read"].includes(action))
+              throw new AgentError("Agent changes require a human-started conversation", 403);
+            return agentAction(deps.customAgents!, actor.id, scopeId, action, inputData);
+          };
+        if (customAgent) {
+          baseTools.agentToolsAllowlist = customAgent.package.allowedTools;
+          baseTools.readAgentPackage = async (path) => {
+            if (path === "AGENT.md") return customAgent!.package.instructions;
+            const file = customAgent!.package.files.find((f) => f.path === path);
+            if (!file) throw new AgentError("Package file not found", 404);
+            return file.encoding === "base64" ? `Binary ${file.mimetype ?? "file"}: ${file.content}` : file.content;
+          };
+          const definitions = createAgentTools(
+            { current: baseTools },
+            {
+              controlTools: true,
+              sessionTools: !!baseTools.sessionSyscalls,
+              sandboxResources: !!turnSandboxResources,
+              readOnly: strictReadOnly,
+              surfaceName: input.surface,
+              surfaceTools: input.surfaceTools === true,
+            },
+          );
+          const available = new Set(definitions.map((t) => t.name));
+          const missing = customAgent.package.requiredTools.filter((name) => {
+            if (available.has(name)) return !allowsAgentTool(customAgent!.package.allowedTools, name);
+            const split = name.lastIndexOf(".");
+            if (split < 0) return true;
+            const tool = name.slice(0, split);
+            return (
+              !available.has(tool) || !allowsAgentTool(customAgent!.package.allowedTools, tool, name.slice(split + 1))
+            );
+          });
+          if (missing.length)
+            return {
+              status: "refused",
+              reason: `Missing agent capabilities: ${missing.join(", ")}. Connect them in this workspace.`,
+            };
+        }
         const tools = external ? externalTools(baseTools, accessResource) : baseTools;
 
         if (input.attachments?.some((attachment) => attachment.sourceId)) {
@@ -3655,6 +3715,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                 }
                 Object.assign(payload, swarmEntryProvenance);
                 if (input.runId) payload.runId = input.runId;
+                if (input.customAgent) payload.customAgent = input.customAgent;
                 if (actor.displayName?.trim() && typeof payload.name !== "string")
                   payload.name = actor.displayName.trim();
                 if (input.displayText?.trim() && payload.text === input.text && typeof payload.display !== "string")

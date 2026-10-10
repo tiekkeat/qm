@@ -251,6 +251,13 @@ export function createMemoryRunStore(opts?: { maxClaims?: number }): MemoryRunti
       return true;
     },
 
+    async withdrawAgent(agentId) {
+      let count = 0;
+      for (const run of runs.values())
+        if (run.request.customAgent?.id === agentId && (await this.withdraw(run.id, { unstartedOnly: true }))) count++;
+      return count;
+    },
+
     async withdraw(runId, opts) {
       const run = runs.get(runId);
       if (!run || run.status !== "pending") return false;

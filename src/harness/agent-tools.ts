@@ -1,3 +1,4 @@
+import { allowsAgentTool, exposesAgentTool } from "../agents/tool-policy.ts";
 import { MaskedExecutionError } from "../security/secret-masking.ts";
 import type { DocumentInput } from "../core/document-inputs.ts";
 import { createKeyedQueue } from "../util/async.ts";
@@ -4330,7 +4331,77 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
     },
   });
 
+  const agents = defineTool({
+    name: "agents",
+    label: "agents",
+    description:
+      "Create, inspect, save, publish, restore, suggest improvements, share or delete custom agents. Use the agent-management skill. Changes require the asking user's authority; package saves never publish automatically. input is JSON; saves require expectedVersion and package. Deletion requires confirm:true after user confirmation.",
+    parameters: Type.Object({
+      action: Type.String({
+        enum: [
+          "list",
+          "read",
+          "create",
+          "save",
+          "publish",
+          "restore",
+          "suggest",
+          "grants",
+          "share",
+          "delete",
+          "import-skill",
+        ],
+      }),
+      input: Type.Optional(
+        Type.String({
+          description:
+            "JSON object with id, package, expectedVersion, version, summary, scopeId, role or confirm as required.",
+        }),
+      ),
+    }),
+    async execute(callId, params) {
+      await recordCall(callId, { tool: "agents", action: params.action });
+      try {
+        if (!ref.current?.manageAgents) throw new Error("Agent management unavailable");
+        const result = await ref.current.manageAgents(params.action, JSON.parse(params.input ?? "{}"));
+        return recordCoreAuthoredResult(
+          callId,
+          { tool: "agents", action: params.action },
+          text(JSON.stringify(result ?? { error: "Agent management unavailable" })),
+          false,
+        );
+      } catch (error) {
+        return recordCoreAuthoredResult(
+          callId,
+          { tool: "agents", action: params.action },
+          text(`[error] ${errMessage(error)}`),
+          true,
+        );
+      }
+    },
+  });
+  const agentPackage = defineTool({
+    name: "agent_package",
+    label: "agent package",
+    description: "Read instructions or a supporting file from the selected immutable custom agent package.",
+    parameters: Type.Object({ path: Type.String() }),
+    async execute(callId, params) {
+      await recordCall(callId, { tool: "agent_package", path: params.path });
+      try {
+        return recordCoreAuthoredResult(
+          callId,
+          { tool: "agent_package", path: params.path },
+          text((await ref.current?.readAgentPackage?.(params.path)) ?? "No custom agent selected"),
+          false,
+        );
+      } catch (error) {
+        return recordCoreAuthoredResult(callId, { tool: "agent_package" }, text(errMessage(error)), true);
+      }
+    },
+  });
   const tools = [
+    ...(ref.current === null || ref.current?.manageAgents ? [agents] : []),
+    ...(ref.current === null || ref.current?.readAgentPackage ? [agentPackage] : []),
     ...(!opts?.sandboxResources && !delegateWork ? [execute] : []),
     resourceTool("skills", {
       read: skill,
@@ -4371,12 +4442,39 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
   ];
   const mcpNames = new Set(mcpTools.map((t) => t.name));
   const active = opts?.readOnly ? tools.filter((t) => READ_ONLY_TOOL_NAMES.has(t.name) || mcpNames.has(t.name)) : tools;
-  return active.map((t) =>
+  const permitted = ref.current?.agentToolsAllowlist;
+  const restricted = permitted == null ? active : active.filter((t) => exposesAgentTool(permitted, t.name));
+  return restricted.map((t) =>
     withRetrySafety(
-      withRuntimeBarrier(withToolBodyTiming(withToolApprovalGate(t, ref, { recordCall, recordResult }), ref), ref),
+      withRuntimeBarrier(
+        withToolBodyTiming(withToolApprovalGate(withAgentPolicy(t, ref), ref, { recordCall, recordResult }), ref),
+        ref,
+      ),
       retryMarks,
     ),
   );
+}
+
+function withAgentPolicy(tool: ToolDefinition, ref: ToolContextRef): ToolDefinition {
+  const execute = tool.execute.bind(tool);
+  return {
+    ...tool,
+    async execute(...args) {
+      const params = args[1] as Record<string, unknown>;
+      if (
+        !allowsAgentTool(
+          ref.current?.agentToolsAllowlist,
+          tool.name,
+          typeof params.action === "string" ? params.action : undefined,
+        )
+      )
+        return {
+          content: [{ type: "text" as const, text: "The selected agent restricts this operation" }],
+          details: { denied: true },
+        };
+      return execute(...args);
+    },
+  };
 }
 
 const RETRY_SAFE_FIELD = "retrySafe";

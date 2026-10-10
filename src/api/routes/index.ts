@@ -1,3 +1,4 @@
+import { agentRoutes } from "./agents.ts";
 import { sandboxRoutes } from "./sandboxes.ts";
 import { mcpConnectionRoutes } from "./mcp-connections.ts";
 import { appCollaborationRoutes } from "./app-collaboration.ts";
@@ -83,6 +84,7 @@ export const rawRoutes: ReadonlyArray<Route<BaseCtx>> = [
 ];
 
 export const apiRoutes: ReadonlyArray<Route<ApiCtx>> = [
+  ...agentRoutes,
   ...browserModelRoutes,
   ...swarmRoutes,
   ...searchRoutes,

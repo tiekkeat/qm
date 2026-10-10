@@ -19,7 +19,7 @@ export interface ResourceCandidate {
 }
 export interface ResourceSearchHit {
   id: string;
-  kind: ResourceKind | "contexts";
+  kind: ResourceKind | "contexts" | "agents";
   title: string;
   snippet: string;
 }

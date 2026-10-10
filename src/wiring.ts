@@ -1,3 +1,10 @@
+import {
+  AgentError,
+  createAgentService,
+  type AgentService,
+  type CustomAgent,
+  type AgentBinding,
+} from "./agents/agent-service.ts";
 import { redactSecrets } from "./harness/redact-secrets.ts";
 import { createProjectScopeGuard } from "./projects/project-scope-guard.ts";
 import { parseScopeId } from "./types.ts";
@@ -560,6 +567,7 @@ export interface BuiltApp {
   sandbox: Sandbox;
   advisoryLock: AdvisoryLock;
   sandboxResources: SandboxResources;
+  customAgents: AgentService;
   blobTransfer: BlobTransferStore;
   files: FileArtifactStore;
   fileUploads?: DirectFileUploads;
@@ -1783,6 +1791,39 @@ export function buildApp(
   });
   const canReadScope = createCanReadScope({ managedGroups: projects, directory, identity, sessions });
   const canWriteScope = createCanWriteScope({ managedGroups: projects, directory, identity });
+  const customAgents = createAgentService({
+    agents: artifactMap<CustomAgent>("custom_agents"),
+    bindings: artifactMap<AgentBinding>("agent_bindings"),
+    bytes: fileBytes,
+    lock: advisoryLock,
+    acl,
+    audit: auditLog,
+    projects,
+    active: projectScopeGuard.active,
+    write: projectScopeGuard.write,
+    retire: (id) => runs.withdrawAgent!(id),
+    audience: async (scope) => (await currentScopeMembers(scope))?.map((member) => member.id),
+    skillSnapshot: async (actor, id) => {
+      const entry = (await app.listVisibleSkills(actor)).find((item) => item.skill?.id === id);
+      if (!entry?.skill) throw new AgentError("Skill unavailable", 404);
+      const skill = entry.skill;
+      const root = `skills/${skill.manifest.name}`;
+      return {
+        root,
+        summary: `Imported skill ${skill.manifest.name} v${skill.version}`,
+        files: [
+          {
+            path: `${root}/SKILL.md`,
+            content: `---\nname: ${skill.manifest.name}\ndescription: ${JSON.stringify(skill.manifest.description)}\n---\n\n${skill.manifest.body}`,
+          },
+          ...(skill.manifest.files ?? []).map((f) => ({ path: `${root}/${f.path}`, content: f.content })),
+        ],
+      };
+    },
+    canRead: canReadScope,
+    canWrite: canWriteScope,
+    internal: (actor) => identity.isInternal(identity.classify(actor)),
+  });
   const canManageScope = createCanManageScope({ managedGroups: projects, directory, identity, sessions });
   const managesArtifactHome = createManagesArtifactHome({ managedGroups: projects, directory }, canManageScope);
   const currentScopeMembers = createCurrentScopeMembers({ managedGroups: projects, directory, identity });
@@ -2054,6 +2095,7 @@ export function buildApp(
     files,
     sandbox,
     sandboxResources,
+    customAgents,
     swarms,
     connectorTokens,
     modelGateway,
@@ -2287,6 +2329,7 @@ export function buildApp(
       : {}),
     projects,
     sandboxResources,
+    customAgents,
     recordLifecycleError: (scope, error) =>
       errors.record(
         { category: "project", code: "cleanup_failed", message: redactSecrets(errMessage(error)), scopeLabel: scope },
@@ -2761,6 +2804,11 @@ export function buildApp(
     30 * 60_000,
     { label: "Composio consent returns", immediate: true },
   );
+  const agentDeletionSweeper = createSweeper(
+    () => leaderLease.hold("agent:deletion-recovery", () => customAgents.recoverDeletions()),
+    60_000,
+    { immediate: true },
+  );
   const blobSweeper = createSweeper(() => blobTransfer.sweep(BLOB_TTL_MS), 30 * 60_000);
   const BLOB_TRANSFER_EXPIRY_DAYS = 1;
   void blobTransfer
@@ -2821,6 +2869,7 @@ export function buildApp(
       monitorRetentionSweeper.start();
       spendSweeper?.start();
       if (config.skillSyncPollMs > 0) skillSyncEngine.start(config.skillSyncPollMs);
+      agentDeletionSweeper.start();
       blobSweeper.start();
       composioReturnSweeper.start();
       fileUploads?.start();
@@ -2855,6 +2904,7 @@ export function buildApp(
       idleSweeper?.stop(),
       keepWarmSweeper.stop(),
       deepIdleSweeper?.stop(),
+      agentDeletionSweeper.stop(),
       blobSweeper.stop(),
       composioReturnSweeper.stop(),
       fileUploads?.stop(),
@@ -3029,6 +3079,7 @@ export function buildApp(
     ...(dropResolution ? { fireDropResolution: dropResolution } : {}),
     sandbox,
     sandboxResources,
+    customAgents,
     advisoryLock,
     blobTransfer,
     files,

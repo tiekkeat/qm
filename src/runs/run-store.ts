@@ -105,6 +105,7 @@ export interface RunStore {
 
   inFlightForThread(sessionId: string): Promise<Run[]>;
 
+  withdrawAgent?(agentId: string): Promise<number>;
   withdraw(runId: string, opts?: { unstartedOnly?: boolean }): Promise<boolean>;
   steerQueued(queuedRunId: string, targetRunId: string, signal: RunSignal, signals: RunSignalStore): Promise<boolean>;
 

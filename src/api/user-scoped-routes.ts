@@ -13,6 +13,13 @@ const USER_SCOPED: Rule[] = [
   ...["GET", "PATCH", "DELETE"].map((method) =>
     pat(method, "/v1/mcp-connections/:id", { in: "query", name: "principalId" }),
   ),
+  pat("GET", "/v1/agents", { in: "query", name: "principalId" }),
+  pat("GET", "/v1/agents/binding", { in: "query", name: "principalId" }),
+  pat("GET", "/v1/agents/:id", { in: "query", name: "principalId" }),
+  pat("POST", "/v1/agents", { in: "body", name: "principalId" }),
+  pat("POST", "/v1/agents/binding", { in: "body", name: "principalId" }),
+  pat("POST", "/v1/agents/:id", { in: "body", name: "principalId" }),
+  pat("DELETE", "/v1/agents/:id", { in: "body", name: "principalId" }),
   pat("GET", "/v1/mcp-connections/:id/tools", { in: "query", name: "principalId" }),
   pat("POST", "/v1/mcp-connections/:id/test", { in: "query", name: "principalId" }),
   ...["POST", "DELETE"].flatMap((method) =>

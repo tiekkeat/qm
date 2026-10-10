@@ -4249,3 +4249,47 @@ test("background list labels jobs by purpose and retains commands and legacy fal
   assert.match(result, /Run regression tests\n {2}bg: npm test/);
   assert.match(result, /old-job[^\n]*bg: npm test/);
 });
+
+test("custom agent restrictions hide tools and enforce actions at execution time", async () => {
+  const tc = { ...fakeToolContext(), agentToolsAllowlist: ["files.read", "subagents"] };
+  const ref: ToolContextRef = { current: tc };
+  const tools = createAgentTools(ref, { controlTools: true });
+  assert.equal(
+    tools.some((t) => t.name === "execute"),
+    false,
+  );
+  assert.equal(
+    tools.some((t) => t.name === "subagents"),
+    false,
+  );
+  const files = tools.find((t) => t.name === "files")!;
+  const denied = await call(files, { action: "write", path: "forbidden.txt", data: "x" });
+  assert.match(JSON.stringify(denied), /restricts this operation/);
+  assert.doesNotMatch(
+    JSON.stringify(await call(files, { action: "read", path: "allowed.txt" })),
+    /restricts this operation/,
+  );
+  ref.current = { ...fakeToolContext(), agentToolsAllowlist: [] };
+  assert.match(JSON.stringify(await call(files, { action: "read", path: "allowed.txt" })), /restricts this operation/);
+});
+
+test("custom agent management uses the shared backend action contract", async () => {
+  let action = "";
+  let input: unknown;
+  const tc = {
+    ...fakeToolContext(),
+    manageAgents: async (a: string, p: Record<string, unknown>) => {
+      action = a;
+      input = p;
+      return { version: 1 };
+    },
+  };
+  const tool = createAgentTools({ current: tc }, { controlTools: true }).find((t) => t.name === "agents")!;
+  const result = await call(tool, {
+    action: "create",
+    input: JSON.stringify({ package: { name: "Network engineer" } }),
+  });
+  assert.equal(action, "create");
+  assert.deepEqual(input, { package: { name: "Network engineer" } });
+  assert.match(JSON.stringify(result), /version/);
+});

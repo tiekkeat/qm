@@ -121,11 +121,16 @@ export function createResourceSearchMethods(
           .slice(0, 8)
           .map((r) => resourceHit("contexts", r, query));
       };
-      const results = await Promise.allSettled([...kinds.map(search), projects()]);
+      const agents = async (): Promise<ResourceSearchHit[]> =>
+        ((await deps.customAgents?.list(principalId)) ?? [])
+          .filter((a) => !a.deleted && matchesSearchTerms(`${a.name} ${a.description}`, searchTerms(query)))
+          .slice(0, 8)
+          .map((a) => resourceHit("agents", { id: a.id, title: a.name, description: a.description }, query));
+      const results = await Promise.allSettled([...kinds.map(search), projects(), agents()]);
       return {
         hits: results.flatMap((r) => (r.status === "fulfilled" ? r.value : [])),
         limited,
-        failed: results.flatMap((r, i) => (r.status === "rejected" ? [[...kinds, "contexts"][i]!] : [])),
+        failed: results.flatMap((r, i) => (r.status === "rejected" ? [[...kinds, "contexts", "agents"][i]!] : [])),
       };
     },
   };

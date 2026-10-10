@@ -1,3 +1,4 @@
+import type { AgentService } from "../../agents/agent-service.ts";
 import type { McpConnectionService } from "../../mcp/mcp-connection-service.ts";
 import type { ExternalSlackPolicies } from "../../resolution/external-slack.ts";
 import type { RuntimeService } from "../../harness/runtime-types.ts";
@@ -88,6 +89,7 @@ export interface OrchestratorInput extends Omit<
   | "unprompted"
   | "liveActor"
 > {
+  customAgent?: import("../../agents/agent-service.ts").AgentSelection | null;
   modelAccount?: ModelAccount;
   surface?: string;
   privateSessionMessage?: true;
@@ -112,6 +114,7 @@ export interface OrchestratorInput extends Omit<
 }
 
 export interface OrchestratorDeps {
+  customAgents?: AgentService;
   externalSlackPolicies?: ExternalSlackPolicies;
   swarms?: SwarmService;
   refreshModels?: () => Promise<void>;

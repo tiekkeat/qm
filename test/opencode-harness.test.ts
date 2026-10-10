@@ -758,7 +758,7 @@ for (const surfaceTools of [false, true]) {
 
 test("OpenCode's fixed tool list includes the web-only sessions tool", () => {
   const definitions = openCodeToolDefinitions({});
-  for (const name of ["subagents", "sessions"])
+  for (const name of ["subagents", "sessions", "agents", "agent_package"])
     assert.ok(
       definitions.some((tool) => tool.name === name),
       name,

@@ -1,3 +1,4 @@
+import { renderAgents, openAgentById } from "./agents";
 import { renderMcp, openMcpById, routeMcpHistory } from "./mcp";
 import { loadMessageTranscript, messageLinkSeq } from "./message-link.ts";
 import { initializeBrowserErrors, stopBrowserErrors } from "./browser-errors";
@@ -231,6 +232,7 @@ const ICON = {
   loops: Repeat,
   memory: Brain,
   skills: Box,
+  agents: Brain,
   home: House,
   browse: LayoutGrid,
 };
@@ -762,6 +764,9 @@ export function switchView(v: View): void {
     case "memory":
       void renderMemory();
       break;
+    case "agents":
+      void renderAgents();
+      break;
     case "skills":
       void renderSkills();
       break;
@@ -832,6 +837,9 @@ function refreshActiveView(v: View): void {
       break;
     case "memory":
       void renderMemory();
+      break;
+    case "agents":
+      void renderAgents();
       break;
     case "skills":
       void renderSkills();
@@ -1202,6 +1210,7 @@ export async function boot(): Promise<void> {
     if (wanted === "crons" && wantedItem) openCronById(wantedItem);
     if (wanted === "mcp") openMcpById(wantedItem);
     if (wanted === "webhooks" && wantedItem) openWebhookById(wantedItem);
+    if (wanted === "agents" && wantedItem) openAgentById(wantedItem);
     if (wanted === "skills" && wantedItem) openSkillById(wantedItem);
     switchView(wanted as View);
     if (wanted === "inbox") routeInboxHistory(wantedItem);

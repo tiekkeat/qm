@@ -9,7 +9,7 @@ export interface ResourceHit {
 export interface ResourceSearchResponse {
   hits: Array<{
     id: string;
-    kind: "skills" | "crons" | "deploys" | "webhooks" | "contexts";
+    kind: "skills" | "crons" | "deploys" | "webhooks" | "contexts" | "agents";
     title: string;
     snippet: string;
   }>;
@@ -22,6 +22,7 @@ const labels: Record<string, string> = {
   deploys: "Apps",
   webhooks: "Webhooks",
   contexts: "Projects",
+  agents: "Agents",
 };
 
 export function resourceResults(

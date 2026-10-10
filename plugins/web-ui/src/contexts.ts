@@ -1,3 +1,4 @@
+import { setScopedSession } from "./session-scope";
 import { sandboxSection, archiveSection, projectDeletionSection, loadSandboxes, resetSandboxes } from "./sandboxes";
 import { projectMcpSection } from "./mcp";
 import { previewFile } from "./file-open.ts";
@@ -449,6 +450,16 @@ function detailTpl(c: CoreContext): TemplateResult {
           </div>
         </div>
         <div class="context-detail-actions">
+          <button
+            class="btn"
+            type="button"
+            @click=${() => {
+              setScopedSession({ scopeId: c.scopeId, sessionId: null, threadRef: null, title, crumb: null });
+              switchView("agents");
+            }}
+          >
+            Agents
+          </button>
           ${
             c.project && (!c.project.lifecycle || c.project.lifecycle === "active")
               ? html`<button class="btn context-add-member" type="button" @click=${() => toggleMemberPicker(c)}>

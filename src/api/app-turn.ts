@@ -1,3 +1,5 @@
+import { agentSelection } from "../agents/agent-actions.ts";
+import { AgentError } from "../agents/agent-service.ts";
 import { resolveIndividualAuthRouting } from "../core/individual-auth-routing.ts";
 import { externalSlackRequestAllowed } from "../resolution/external-slack.ts";
 import { availableRuntimeError, runtimeConfigBody, validateRuntimeChoice } from "./runtime-config.ts";
@@ -175,6 +177,54 @@ export function createTurnMethods(
         req.conversation.kind === "dm"
           ? scopeId("personal", actor.id)
           : scopeId(req.conversation.kind, req.conversation.channelRef ?? req.conversation.threadRef);
+      let customAgent = req.customAgent;
+      if (deps.customAgents) {
+        try {
+          const command = /^\/agent\s+(\S+)(?:\s+([\s\S]*))?$/.exec(req.text.trim());
+          const management =
+            command && ["create", "edit", "delete", "publish", "share", "list", "restore"].includes(command[1]!);
+          if (management) customAgent = null;
+          else if (command) {
+            customAgent =
+              command[1] === "default"
+                ? null
+                : await deps.customAgents.resolve(actor.id, turnRuntimeScope, command[1]!);
+            req = {
+              ...req,
+              text: command[2]?.trim() || "Briefly confirm the selected agent. Do not perform any other work.",
+            };
+          }
+          if (customAgent !== undefined) {
+            customAgent = agentSelection(customAgent);
+            if (!management)
+              await deps.customAgents.bind(
+                actor.id,
+                `selection:${req.conversation.threadRef}`,
+                turnRuntimeScope,
+                customAgent,
+              );
+          } else {
+            customAgent = await deps.customAgents.effectiveSelection(
+              actor.id,
+              turnRuntimeScope,
+              req.conversation.threadRef,
+            );
+            await deps.customAgents.bind(
+              actor.id,
+              `selection:${req.conversation.threadRef}`,
+              turnRuntimeScope,
+              customAgent,
+            );
+          }
+          if (customAgent) {
+            const audience = projectAudience ?? [actor];
+            for (const member of audience) await deps.customAgents.admit(member.id, turnRuntimeScope, customAgent);
+          }
+        } catch (error) {
+          if (error instanceof AgentError) return { status: "refused", reason: error.message };
+          throw error;
+        }
+      }
       const [storedOrgRuntime, storedTurnRuntime] = await Promise.all([
         deps.config.getRuntimeSelectionDurable(orgRuntimeScope),
         turnRuntimeScope === orgRuntimeScope ? null : deps.config.getRuntimeSelectionDurable(turnRuntimeScope),
@@ -385,6 +435,7 @@ export function createTurnMethods(
       };
 
       const input = {
+        ...(customAgent !== undefined ? { customAgent } : {}),
         surface: req.surface,
         ...(req.slackSource ? { slackSource: req.slackSource } : {}),
         ...(req.externalSlack ? { externalSlack: req.externalSlack } : {}),

@@ -1,3 +1,4 @@
+import type { AgentService } from "../agents/agent-service.ts";
 import type { SandboxResources } from "../sandbox/sandbox-resources.ts";
 import type { LoopStore } from "../loops/loop-store.ts";
 import type { MemoryService } from "../memory/memory-service.ts";
@@ -294,6 +295,7 @@ export interface SessionSearchHit {
 }
 
 export interface App {
+  customAgents?: AgentService;
   swarms?: SwarmService;
   turn(req: TurnRequest, replay?: { signalDedupKey: string }): Promise<TurnResult>;
   getApproval(requestId: string, viewer?: string): Promise<(PendingApprovalRecord & { requestId: string }) | null>;
@@ -645,6 +647,7 @@ export interface App {
 }
 
 export interface AppDeps {
+  customAgents?: AgentService;
   externalSlackPolicies?: ExternalSlackPolicies;
   admittedWork?: AdmittedWork;
   shutdown?: () => AbortSignal;
