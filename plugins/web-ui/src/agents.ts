@@ -26,6 +26,8 @@ let generation = 0;
 let editorGeneration = 0;
 let examplesText = "[]";
 let pendingId: string | null = null;
+let host: HTMLDivElement | null = null;
+let loading = false;
 export function openAgentById(id: string) {
   pendingId = id;
 }
@@ -125,6 +127,7 @@ async function open(a: AgentView) {
   grants = [];
   notice = "";
   draw();
+  if (host) host.scrollTop = 0;
   if (a.canManage) {
     try {
       await loadGrants();
@@ -235,7 +238,11 @@ async function upload(event: Event) {
 }
 function draw() {
   if (appState.currentView !== "agents" || !appState.mainEl) return;
-  if (appState.topEl) render(nothing, appState.topEl);
+  if (!host || host.parentElement !== appState.mainEl) {
+    host = document.createElement("div");
+    host.className = "agents-page";
+    appState.mainEl.replaceChildren(host);
+  }
   if (appState.listEl) render(nothing, appState.listEl);
   if (!draft) {
     const filtered = rows.filter(
@@ -244,63 +251,72 @@ function draw() {
         `${a.name} ${a.description} ${a.ownerScopeId}`.toLowerCase().includes(search.toLowerCase()),
     );
     render(
-      html`${notice ? html`<div role="alert" class="agent-notice">${notice}</div>` : nothing}${listPageTpl({
-        title: "Agents",
-        subtitle: "Create specialists, publish versions, and share with users or projects.",
-        action: {
-          label: "Create agent",
-          onClick: () => {
-            editorGeneration++;
-            busy = false;
-            current = null;
-            scope = usableScope();
-            draft = emptyPackage();
-            examplesText = "[]";
-            comparison = "";
-            draw();
+      html`<section class="agents-content">
+        ${listPageTpl({
+          title: "Agents",
+          subtitle: "Create specialists, publish versions, and share with users or projects.",
+          action: {
+            label: "Create agent",
+            onClick: () => {
+              editorGeneration++;
+              busy = false;
+              current = null;
+              scope = usableScope();
+              draft = emptyPackage();
+              examplesText = "[]";
+              comparison = "";
+              draw();
+              if (host) host.scrollTop = 0;
+            },
           },
-        },
-        search: {
-          value: search,
-          placeholder: "Search agents…",
-          onInput: (value) => {
-            search = value;
-            draw();
+          search: {
+            value: search,
+            placeholder: "Search agents…",
+            onInput: (value) => {
+              search = value;
+              draw();
+            },
           },
-        },
-        controls: html`<label
-            >Workspace
-            <select
-              aria-label="Agent workspace"
-              .value=${scope}
-              @change=${async (e: Event) => {
-                scope = (e.target as HTMLSelectElement).value;
-                await renderAgents(false);
-              }}
+          filters: html`<div class="agent-filters">
+            <label
+              >Workspace
+              <select
+                aria-label="Agent workspace"
+                .value=${scope}
+                @change=${async (e: Event) => {
+                  scope = (e.target as HTMLSelectElement).value;
+                  await renderAgents(false);
+                }}
+              >
+                <option value="">All available</option>
+                ${scopes().map((c) => html`<option value=${c.scopeId}>${c.name || c.scopeId}</option>`)}
+              </select></label
+            ><label
+              ><input
+                type="checkbox"
+                .checked=${deleted}
+                @change=${async (e: Event) => {
+                  deleted = (e.target as HTMLInputElement).checked;
+                  await renderAgents(false);
+                }}
+              />Include deleted</label
             >
-              <option value="">All available</option>
-              ${scopes().map((c) => html`<option value=${c.scopeId}>${c.name || c.scopeId}</option>`)}
-            </select></label
-          ><label
-            ><input
-              type="checkbox"
-              .checked=${deleted}
-              @change=${async (e: Event) => {
-                deleted = (e.target as HTMLInputElement).checked;
-                await renderAgents(false);
-              }}
-            />Include deleted</label
-          >`,
-        rows: filtered.map(
-          (a) =>
-            html`<button class="agent-row" @click=${() => void open(a)}>
-              <strong>${a.name}</strong><span>${a.description}</span
-              ><small>${a.ownerScopeId} · ${agentStatus(a)} · ${agentRole(a)}</small>
-            </button>`,
-        ),
-        empty: "No agents yet. Ask QM to create an agent in chat, or use Create agent.",
-      })}`,
-      appState.mainEl,
+          </div>`,
+          rows: loading
+            ? []
+            : filtered.map(
+                (a) =>
+                  html`<button class="agent-row" @click=${() => void open(a)}>
+                    <strong>${a.name}</strong><span>${a.description}</span
+                    ><small>${a.ownerScopeId} · ${agentStatus(a)} · ${agentRole(a)}</small>
+                  </button>`,
+              ),
+          empty: loading
+            ? html`<span role="status">Loading agents…</span>`
+            : "No agents yet. Ask QM to create an agent in chat, or use Create agent.",
+        })}${notice ? html`<div role="alert" class="agent-notice">${notice}</div>` : nothing}
+      </section>`,
+      host,
     );
     return;
   }
@@ -316,6 +332,7 @@ function draw() {
           draft = null;
           current = null;
           draw();
+          if (host) host.scrollTop = 0;
         }}
       >
         ← Agents
@@ -550,10 +567,11 @@ function draw() {
           : nothing
       }
     </section>`,
-    appState.mainEl,
+    host,
   );
 }
 export async function renderAgents(reset = true) {
+  if (appState.currentView !== "agents" || !appState.mainEl) return;
   const seq = ++generation;
   if (reset) {
     editorGeneration++;
@@ -563,6 +581,10 @@ export async function renderAgents(reset = true) {
     draft = null;
     notice = "";
   }
+  loading = true;
+  notice = "";
+  draw();
+  if (reset && host) host.scrollTop = 0;
   try {
     const [list, skills] = await Promise.all([
       api<{ contexts: CoreContext[] }>("/api/contexts"),
@@ -573,6 +595,7 @@ export async function renderAgents(reset = true) {
     skillOptions = skills.skills ?? [];
     await loadRows();
     if (seq !== generation) return;
+    loading = false;
     if (pendingId) {
       const id = pendingId;
       pendingId = null;
@@ -582,6 +605,8 @@ export async function renderAgents(reset = true) {
     draw();
   } catch (e) {
     if (seq === generation) {
+      loading = false;
+      rows = [];
       notice = errMessage(e);
       draw();
     }
