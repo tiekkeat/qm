@@ -19,6 +19,7 @@ import type { App, AppDeps } from "./app-types.ts";
 import type { AppHelpers } from "./app-helpers.ts";
 
 const RECORD_LEASE_WAIT_MS = 15_000;
+const RECORD_DEDUPE_SCAN = 200;
 const JUDGE_BACKDROP_ENTRIES = 12;
 const MAX_MEETING_MESSAGE_CHARS = 40_000;
 
@@ -79,16 +80,28 @@ export function createMeetingMethods(
     return member?.displayName?.trim() || undefined;
   }
 
-  async function record(session: Session, payload: OverheardEntryPayload): Promise<SessionEntry | null> {
+  async function record(
+    session: Session,
+    payload: OverheardEntryPayload,
+    messageKey: string | undefined,
+  ): Promise<SessionEntry | null> {
     const attempt = await acquireLeaseWithin(deps.sessions, session.id, "backfill", RECORD_LEASE_WAIT_MS, {
       waitFor: (heldBy) => heldBy !== "turn",
     });
     if (!attempt.lease) return null;
     try {
+      if (messageKey) {
+        const tail = await deps.sessions.getEntries(session.id, { limit: RECORD_DEDUPE_SCAN });
+        const prior = tail.find(
+          (entry) =>
+            entry.type === "user" && (entry.payload as { messageKey?: unknown } | null)?.messageKey === messageKey,
+        );
+        if (prior) return prior;
+      }
       return await appendEntryOutsideTurn(
         deps.sessions,
         attempt.lease,
-        { type: "user", payload, scopeLabel: session.scopeId },
+        { type: "user", payload: messageKey ? { ...payload, messageKey } : payload, scopeLabel: session.scopeId },
         () => renderOverheard(payload),
       );
     } finally {
@@ -264,15 +277,13 @@ export function createMeetingMethods(
         text,
         async: true,
       };
+      const messageKey = input.idempotencyKey ? `meeting:${principalId}:${input.idempotencyKey}` : undefined;
       if (wake) {
-        const turn = await app.turn({
-          ...request,
-          ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
-        });
+        const turn = await app.turn({ ...request, ...(messageKey ? { idempotencyKey: messageKey } : {}) });
         return { status: "turn", turn };
       }
 
-      const recorded = await record(session, payload);
+      const recorded = await record(session, payload, messageKey);
       if (recorded) {
         await announce(session);
         return { status: "recorded", seq: recorded.seq };

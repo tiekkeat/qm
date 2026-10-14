@@ -138,6 +138,13 @@ test("a meeting records member messages for everyone without waking the assistan
   );
   assert.equal(await transcript(meeting, "outsider"), "[]");
 
+  const first = await say(meeting, "owner", "retry me", { idempotencyKey: "k1" });
+  const retried = await say(meeting, "owner", "retry me", { idempotencyKey: "k1" });
+  assert.deepEqual(await retried.json(), await first.json());
+  const sameKeyOtherMember = await say(meeting, "member", "retry me", { idempotencyKey: "k1" });
+  assert.equal(sameKeyOtherMember.status, 201);
+  assert.equal((await transcript(meeting, "owner")).split("retry me").length - 1, 2);
+
   assert.equal((await say(meeting, "outsider", "let me in")).status, 404);
   assert.equal((await say(meeting, "member", "   ")).status, 400);
   assert.equal((await built.runs.list()).length, 0);
