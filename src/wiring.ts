@@ -400,6 +400,7 @@ import { createAdminService, bootAdminGrantSeed, type AdminService } from "./adm
 import { createAdminGrantStore, createMapAdminGrantPersistence, type AdminGrant } from "./admin/admin-grant-store.ts";
 import { createPostgresAdminGrantStore } from "./admin/postgres-admin-grant-store.ts";
 import { createProjectStore, type Project, type ProjectStore } from "./projects/project-store.ts";
+import { createMeetingStore, type Meeting, type MeetingStore } from "./meetings/meeting-store.ts";
 import { withErrorReporting, createErrorLog, type ErrorLog } from "./admin/error-log.ts";
 import { createMemoryReplayDedupe, createPostgresReplayDedupe, type ReplayDedupe } from "./auth/replay-dedupe.ts";
 import {
@@ -547,6 +548,7 @@ export interface BuiltApp {
   brokerSessions?: BrokerSessionStore;
   directory: DirectoryStore;
   projects: ProjectStore;
+  meetings: MeetingStore;
   environments: EnvironmentStore;
   processes?: ProcessRegistry;
   monitors: MonitorStore;
@@ -1687,6 +1689,7 @@ export function buildApp(
     isActiveMember: (principalId) => identity.isInternal(identity.classify(principalId)),
     advisoryLock,
   });
+  const meetings = createMeetingStore(artifactMap<Meeting>("meetings"));
   const canReadScope = createCanReadScope({ managedGroups: projects, directory, identity, sessions });
   const canWriteScope = createCanWriteScope({ managedGroups: projects, directory, identity });
   const canManageScope = createCanManageScope({ managedGroups: projects, directory, identity, sessions });
@@ -1985,6 +1988,7 @@ export function buildApp(
     isCurrentSharedScopeMember,
     currentScopeMembers: createCurrentScopeMembers({ managedGroups: projects, directory, identity }, true),
     managedGroups: projects,
+    meetings,
     ...(config.reachExecEnabled ? { reachExec: true } : {}),
     ...(config.surfaceDebugFooter ? { surfaceDebugFooter: true } : {}),
     ...(config.eagerProvisionEnabled ? { eagerProvision: true } : {}),
@@ -2149,6 +2153,7 @@ export function buildApp(
         }
       : {}),
     projects,
+    meetings,
     environments,
     deploy: deployService,
     deployAppsDomain: config.awsDeploy.appsDomain,
@@ -2859,6 +2864,7 @@ export function buildApp(
     ...(brokerSessions ? { brokerSessions } : {}),
     directory,
     projects,
+    meetings,
     environments,
     ...(processes ? { processes } : {}),
     monitors,

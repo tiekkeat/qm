@@ -8,6 +8,7 @@ import { createSessionMethods } from "./app-sessions.ts";
 import { createMessagingMethods } from "./app-messaging.ts";
 import { createDeploymentMethods } from "./app-deployments.ts";
 import { createSkillMethods } from "./app-skills.ts";
+import { createMeetingMethods } from "./app-meetings.ts";
 import { createSearchMethods } from "./app-search.ts";
 
 export type { App, AppDeps, ContextSummary, ProjectView, VisibleCron } from "./app-types.ts";
@@ -18,13 +19,15 @@ export function createApp(deps: AppDeps): App {
   const app = {} as App;
   const helpers = createAppHelpers(deps, app);
   const ambient = createAmbientHelpers(deps, app);
+  const meetings = createMeetingMethods(deps, app, helpers);
   const methods = {
     swarms: deps.swarms,
-    ...createTurnMethods(deps, helpers, ambient),
+    ...createTurnMethods(deps, helpers, ambient, meetings.intake),
     ...createSessionMethods(deps, helpers),
     ...createMessagingMethods(deps, helpers, ambient),
     ...createDeploymentMethods(deps, helpers),
     ...createSkillMethods(deps, helpers),
+    ...meetings.methods,
   };
   const turn = methods.turn;
   methods.turn = async (req, replay) => {

@@ -1,5 +1,6 @@
 import type { CandidateDestination, Cron, Monitor, Webhook } from "../../types.ts";
 import type { DirectoryChannel, DirectoryMember } from "../../directory/directory-store.ts";
+import type { Deployment } from "../../deploy/deploy-store.ts";
 
 export function deliveryMenu(candidates: CandidateDestination[], defaultKey: string | undefined): string {
   const lines = candidates
@@ -26,6 +27,39 @@ export function renderProjectHomeChannel(channelName: string): string {
     `This project is linked to the Slack channel #${name} — that channel is where the project's people follow the work.`,
     `Treat it as the default external audience: schedule deliveries there (the \`cron\` tool's \`channel: "${name}"\`), and when asked to report out or notify the team, post there with \`reach\` (\`channel: "${name}"\`).`,
     "Project membership follows the channel: everyone in the channel is a member of this project, and people joining or leaving the channel join or leave the project with it.",
+  ].join("\n");
+}
+
+export function scopeApps(
+  deployments: ReadonlyArray<
+    Pick<Deployment, "id" | "name" | "displayName" | "status" | "ownerScopeId" | "createdInScope">
+  >,
+  scopes: ReadonlySet<string>,
+): Array<{ name: string; status: string }> {
+  return deployments
+    .filter(
+      (app) =>
+        app.status !== "archived" &&
+        (scopes.has(app.ownerScopeId) || (app.createdInScope !== undefined && scopes.has(app.createdInScope))),
+    )
+    .map((app) => ({ name: app.displayName ?? app.name ?? app.id, status: app.status }));
+}
+
+export function renderMeetingBlock(prompt: string, apps: ReadonlyArray<{ name: string; status: string }> = []): string {
+  const instructions = prompt.trim();
+  return [
+    "## Project meeting",
+    "This conversation is a live meeting between this project's members. Several people speak here and each message names its author.",
+    "Messages tagged as overheard were said to the room rather than to you; treat them as context for the discussion.",
+    "During a meeting you can only consult: read this project's files with the files tool and search memory and this conversation's history. You cannot run commands, write files, publish, or change anything here.",
+    "When the discussion calls for a change, describe it as a plan the members can carry out after the meeting in a regular project conversation.",
+    ...(apps.length
+      ? [
+          "Apps this project has deployed (treat each as production):",
+          ...apps.map((app) => `- ${app.name} (${app.status})`),
+        ]
+      : []),
+    ...(instructions ? ["The member who opened the meeting set these instructions for you:", instructions] : []),
   ].join("\n");
 }
 

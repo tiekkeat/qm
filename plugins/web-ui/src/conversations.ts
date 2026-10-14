@@ -89,7 +89,10 @@ export function ensureDeliveryStream(): void {
     },
     (event) => {
       if (event.state === "metadata") {
-        void refreshSessions({ silent: true });
+        void refreshSessions({ silent: true }).then(() => {
+          for (const conv of live) conv.redraw();
+        });
+        for (const conv of live) conv.onDelivery(event.threadRef);
         return;
       }
       const { list, matched } = applySessionState(sessionsState.list, { ...event, state: event.state });

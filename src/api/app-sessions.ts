@@ -418,7 +418,11 @@ export function createSessionMethods(
       const workingThreadRefs = await workingSessionThreadRefs(deps.sessions, deps.runs, waiting);
       const sessions = all.filter(
         (s) =>
-          s.hasEntries !== false || Boolean(s.title?.trim()) || workingThreadRefs.has(s.threadRef) || waiting.has(s.id),
+          s.hasEntries !== false ||
+          Boolean(s.title?.trim()) ||
+          Boolean(s.meeting) ||
+          workingThreadRefs.has(s.threadRef) ||
+          waiting.has(s.id),
       );
       const now = Date.now();
       const jobCounts = new Map<string, number>();

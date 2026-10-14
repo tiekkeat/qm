@@ -13279,3 +13279,99 @@ body.app-edit-embed .custom-chat-shell.app-edit-chat > .chat-bottom-dock {
   white-space: pre-wrap;
   min-width: 80px;
 }
+.custom-chat-shell:has(> .meeting-bar),
+.custom-chat-shell.empty-chat:has(> .meeting-bar) {
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+}
+.custom-chat-shell.in-pane:has(> .meeting-bar),
+.custom-chat-shell.in-pane.empty-chat:has(> .meeting-bar) {
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+.meeting-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--secondary) 55%, var(--background));
+  font-size: var(--font-13);
+}
+.meeting-bar.ended {
+  color: var(--muted-foreground);
+}
+.meeting-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  color: var(--foreground);
+  white-space: nowrap;
+}
+.badge.meeting-badge {
+  font-weight: 500;
+}
+.badge.meeting-badge.ended {
+  color: var(--muted-foreground);
+}
+.meeting-bar-copy {
+  min-width: 0;
+  flex: 1 1 200px;
+  color: var(--muted-foreground);
+}
+.meeting-bar-copy.error {
+  color: var(--destructive, #c0392b);
+}
+.meeting-bar-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+.meeting-mode-select {
+  min-width: 0;
+  max-width: 100%;
+}
+.meeting-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 16px;
+}
+.meeting-dialog {
+  width: min(520px, 100%);
+}
+.meeting-dialog-copy {
+  margin: 6px 0 0;
+  color: var(--muted-foreground);
+  font-size: var(--font-13);
+  line-height: 1.5;
+}
+.meeting-outputs {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 16px 0 0;
+  padding: 0;
+  border: 0;
+}
+.meeting-output {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 32px;
+  cursor: pointer;
+}
+.meeting-output input {
+  width: 16px;
+  height: 16px;
+}
+@media (max-width: 620px) {
+  .meeting-bar {
+    padding: 8px 12px;
+  }
+  .meeting-bar-actions {
+    width: 100%;
+    margin-left: 0;
+  }
+}

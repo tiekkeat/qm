@@ -176,6 +176,7 @@ import {
   openSession,
   syncWorkingPulse,
 } from "./sessions";
+import { meetingBar, openMeetingFor } from "./meeting";
 import {
   backgroundLabel,
   clearWorking,
@@ -675,6 +676,7 @@ export function createChatSurface(
       harness,
       scopeId: chatState.scopeId,
       channelName: chatState.contextName,
+      ...(ctx.composer.sentMention() ? { mentionsAssistant: true } : {}),
     };
   }
 
@@ -1527,6 +1529,7 @@ export function createChatSurface(
           ),
         )
       : nothing;
+    const meetingSession = openMeetingFor(chatState.threadRef, chatState.sessionId);
     let content: TemplateResult;
     if (ctx.inbox) {
       content = assistantSidebar({
@@ -1570,6 +1573,7 @@ export function createChatSurface(
               : nothing
           }
           ${glanceTier || ctx.pane || editingApp ? nothing : sessionTopbar()}
+          ${glanceTier ? nothing : meetingBar(meetingSession, appState.me?.user, () => drawActiveChat())}
           ${glanceTier ? paneGlance(agent, messages, glanceTier) : nothing}
           <section class="chat-scroll" tabindex="0" aria-label="Conversation">
             ${pinnedStrip()}
@@ -1591,6 +1595,8 @@ export function createChatSurface(
       `;
     }
     render(content, chatState.host);
+    const meetingDialog = chatState.host.querySelector<HTMLDialogElement>("dialog.meeting-dialog");
+    if (meetingDialog && !meetingDialog.open) meetingDialog.showModal();
     transcriptViewport.afterRender();
     const host = chatState.host;
     requestAnimationFrame(() => {

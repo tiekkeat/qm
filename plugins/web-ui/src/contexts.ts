@@ -8,6 +8,7 @@ import {
   FolderPlus,
   Hash,
   Lock,
+  MessagesSquare,
   Plus,
   Search,
   User,
@@ -40,6 +41,7 @@ import { ambientPolicySection, loadAmbientPolicy, resetAmbientPolicy } from "./a
 import { contextModelSection, loadContextModel, resetContextModel } from "./context-model";
 import { channelHeaderSection, loadChannelHeader, resetChannelHeader } from "./channel-header";
 import { tip } from "./tooltip";
+import { openStartMeeting, startMeetingDialog } from "./meeting";
 
 interface ScopeFile {
   id: string;
@@ -439,6 +441,17 @@ function detailTpl(c: CoreContext): TemplateResult {
                 </button>`
               : nothing
           }
+          ${
+            c.project
+              ? html`<button
+                  class="btn context-new-meeting"
+                  type="button"
+                  @click=${() => openStartMeeting(c.project!.id, drawContexts)}
+                >
+                  ${icon(MessagesSquare, 15)}<span>New meeting</span>
+                </button>`
+              : nothing
+          }
           <button class="btn primary context-new-chat" type="button" @click=${() => startChatIn(c)}>
             ${icon(Plus, 15)}<span>New chat</span>
           </button>
@@ -479,6 +492,7 @@ function detailTpl(c: CoreContext): TemplateResult {
           ${contextModelSection(c.scopeId)} ${channelHeaderSection(c.scopeId)} ${ambientPolicySection(c.scopeId)}
         </aside>
       </div>
+      ${startMeetingDialog()}
     </div>
   `;
 }
@@ -1386,6 +1400,13 @@ function contextSessionRow(s: CoreSession): TemplateResult {
     <button class="context-session-row" type="button" @click=${() => void openFromContext(s)}>
       <span class="context-session-title" dir="auto">${groupDmTitle(s)}</span>
       <span class="context-session-meta">
+        ${
+          s.meeting
+            ? html`<span class="badge meeting-badge ${s.meeting.status}"
+                >${s.meeting.status === "open" ? "Meeting" : "Meeting ended"}</span
+              >`
+            : nothing
+        }
         ${surface === "slack" ? html`<span class="surface surface-slack">${slackLogo(13)}</span>` : html`<span class="badge">${surface}</span>`}
         ${readOnly ? html`<span class="ro-lock" ${tip("Read-only. Replies happen on the original surface")}>${icon(Lock, 12)}</span>` : nothing}
         <span>${relTime(activityOf(s))}</span>

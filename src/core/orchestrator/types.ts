@@ -19,6 +19,7 @@ import type { ModelAccount, OrgBranding, ScopedConfigStore } from "../../resolut
 import type { UserModelCredentialStore } from "../../model/user-model-credential-store.ts";
 import type { IsCurrentSharedScopeMember, ManagedGroupDirectory } from "../../resolution/scope-membership.ts";
 import type { DirectoryStore } from "../../directory/directory-store.ts";
+import type { MeetingStore } from "../../meetings/meeting-store.ts";
 import type { EnvironmentStore } from "../../environments/environment-store.ts";
 import type { SessionStore } from "../../sessions/session-store.ts";
 import type { SessionSyscallsFactory } from "../../sessions/session-syscalls.ts";
@@ -213,6 +214,7 @@ export interface OrchestratorDeps {
   surfaceCache?: SurfaceCache;
   slackContextSource?: "live" | "shadow" | "mirror";
   channelPolicy?: ChannelPolicyStore;
+  meetings?: Pick<MeetingStore, "get">;
   surfaceDebugFooter?: boolean;
 }
 
@@ -250,4 +252,5 @@ export interface Orchestrator {
     principalId: string,
     participantIds?: readonly string[],
   ): Promise<{ title: string | null } | null>;
+  captureTranscript(sessionId: string, actorId: string): Promise<boolean>;
 }

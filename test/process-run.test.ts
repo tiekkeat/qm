@@ -24,6 +24,9 @@ function fakeOrchestrator(handle: (input: OrchestratorInput) => Promise<TurnResu
     async regenerateTitle() {
       return null;
     },
+    async captureTranscript() {
+      return false;
+    },
   };
 }
 

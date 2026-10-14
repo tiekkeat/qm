@@ -164,6 +164,28 @@ export function visibleTitleEntryText(entry: SessionEntry): string | undefined {
   return typeof value === "string" ? value.trim() || undefined : undefined;
 }
 
+const TRANSCRIPT_CHUNK_CHARS = 30_000;
+
+export function transcriptChunks(entries: readonly SessionEntry[], maxChars = TRANSCRIPT_CHUNK_CHARS): string[] {
+  const chunks: string[] = [];
+  let current = "";
+  for (const entry of entries) {
+    if (entry.type !== "user" && entry.type !== "assistant") continue;
+    const payload = entry.payload as { name?: unknown; hidden?: unknown } | null;
+    const text = payload?.hidden === true ? undefined : visibleTitleEntryText(entry);
+    if (!text) continue;
+    const named = typeof payload?.name === "string" ? payload.name.trim() : "";
+    const line = `${entry.type === "assistant" ? "Assistant" : named || "Member"}: ${text}`;
+    if (current && current.length + line.length + 1 > maxChars) {
+      chunks.push(current);
+      current = "";
+    }
+    current = current ? `${current}\n${line}` : line;
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
 export function renderTitleTranscript(entries: SessionEntry[]): string {
   const lines: string[] = [];
   for (const e of entries) {

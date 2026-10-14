@@ -38,6 +38,7 @@ const PARTICIPANT_REHYDRATE_TIMEOUT_MS = 5_000;
 import { unscreenedNotice } from "../security/security-posture.ts";
 import type { AppHelpers } from "./app-helpers.ts";
 import type { AmbientHelpers } from "./app-ambient.ts";
+import type { MeetingIntake } from "./app-meetings.ts";
 
 export function attributedSteerText(
   steerer: { id: string; displayName?: string | undefined },
@@ -52,6 +53,7 @@ export function createTurnMethods(
   deps: AppDeps,
   h: AppHelpers,
   ambient: AmbientHelpers,
+  meetingIntake: MeetingIntake,
 ): Pick<
   App,
   | "turn"
@@ -147,6 +149,19 @@ export function createTurnMethods(
         projectName = project.name;
         projectVersion = String(project.updatedAt);
         sessionParticipantIds = [...activeMemberIds];
+        const meeting = await deps.meetings?.get(req.conversation.threadRef);
+        if (meeting?.status === "ended")
+          return { status: "refused", reason: "this meeting has ended; start a new meeting or chat to continue" };
+        if (meeting) {
+          const memberMessage = isPersonAuthored(resolveTurnOrigin(req).kind) && !req.approval && !req.proactiveOpener;
+          if (memberMessage) {
+            const outcome = await meetingIntake({ meeting, actor, request: req });
+            if (!("wake" in outcome)) return outcome;
+            actor.displayName = outcome.wake;
+          } else if (meeting.mode === "off") {
+            return { status: "refused", reason: "the assistant is switched off for this meeting" };
+          }
+        }
       } else if (req.surface === "web" && req.conversation.kind !== "dm") {
         if (!conversationRef || !(await mayUseSharedScope(req.conversation.kind, conversationRef, actor))) {
           return { status: "refused", reason: "you're not a member of that context" };

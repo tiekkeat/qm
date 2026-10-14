@@ -1619,6 +1619,60 @@ const apiRoutes: readonly WebRoute[] = [
     },
   },
   {
+    method: "POST",
+    path: "/api/projects/:id/meetings",
+    handle: async (c) => {
+      const { req, res, user } = c;
+      const p = await readJson<{ title?: unknown; mode?: unknown; prompt?: unknown }>(req, res);
+      if (!p) return;
+      return relayCore(
+        res,
+        "POST",
+        `/v1/projects/${encodeURIComponent(c.params.id!)}/meetings`,
+        JSON.stringify({
+          principalId: user,
+          ...(typeof p.title === "string" && p.title.trim() ? { title: p.title.trim().slice(0, 200) } : {}),
+          ...(p.mode !== undefined ? { mode: p.mode } : {}),
+          ...(p.prompt !== undefined ? { prompt: p.prompt } : {}),
+        }),
+      );
+    },
+  },
+  {
+    method: "PATCH",
+    path: "/api/meetings/:sessionId",
+    handle: async (c) => {
+      const { req, res, user } = c;
+      const p = await readJson<{ mode?: unknown; prompt?: unknown }>(req, res);
+      if (!p) return;
+      return relayCore(
+        res,
+        "PATCH",
+        `/v1/meetings/${encodeURIComponent(c.params.sessionId!)}`,
+        JSON.stringify({
+          principalId: user,
+          ...(p.mode !== undefined ? { mode: p.mode } : {}),
+          ...(p.prompt !== undefined ? { prompt: p.prompt } : {}),
+        }),
+      );
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/meetings/:sessionId/end",
+    handle: async (c) => {
+      const { req, res, user } = c;
+      const p = await readJson<{ outputs?: unknown }>(req, res);
+      if (!p) return;
+      return relayCore(
+        res,
+        "POST",
+        `/v1/meetings/${encodeURIComponent(c.params.sessionId!)}/end`,
+        JSON.stringify({ principalId: user, ...(p.outputs !== undefined ? { outputs: p.outputs } : {}) }),
+      );
+    },
+  },
+  {
     method: "GET",
     path: "/api/directory/resolve",
     handle: async (c) => {
@@ -2506,10 +2560,12 @@ const apiRoutes: readonly WebRoute[] = [
       const attachments: CoreAttachment[] = [];
       let approval: { requestId: string; approved: boolean; scope?: string } | undefined;
       let proactiveOpener = false;
+      let mentionsAssistant = false;
       let idempotencyKey: string | undefined;
       try {
         const p = JSON.parse(await readBody(req));
         text = String(p.text ?? "");
+        if (p.mentionsAssistant === true) mentionsAssistant = true;
         idempotencyKey = namespacedSendKey(user, p.idempotencyKey);
         if (
           !idempotencyKey &&
@@ -2571,6 +2627,7 @@ const apiRoutes: readonly WebRoute[] = [
         ...(attachments.length ? { attachments } : {}),
         ...(approval ? { approval } : {}),
         ...(proactiveOpener ? { proactiveOpener: true } : {}),
+        ...(mentionsAssistant ? { mentionsAssistant: true } : {}),
         ...(idempotencyKey ? { idempotencyKey } : {}),
       };
       return postTurnAndMint(req, res, turn, user, threadRef);

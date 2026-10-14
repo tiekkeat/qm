@@ -200,6 +200,7 @@ import {
   loadActiveBundles,
   recentPrincipalDeliveryNote,
   renderTitleTranscript,
+  transcriptChunks,
   replayableRequest,
   stripAckPrefix,
   stripTurnBoilerplate,
@@ -210,6 +211,8 @@ import {
   currentTimeBlock,
   deliveryMenu,
   renderConversationRoster,
+  renderMeetingBlock,
+  scopeApps,
   renderProjectHomeChannel,
   renderReachRoster,
   renderStandingObligations,
@@ -263,6 +266,16 @@ const DEFAULT_APPROVAL_SUMMARY_TIMEOUT_MS = 6_000;
 const CONNECTOR_HOSTS = Object.values(PROVIDERS).flatMap((p) => p.hosts);
 const INSTANCE_CACHE_MAX_ENTRIES = 5_000;
 const DIRECTORY_INDEX_CACHE_MAX_ENTRIES = 100;
+
+function untrackedCaptureContext() {
+  return {
+    id: "untracked-turn-context",
+    text: "",
+    sensitivity: "unknown" as const,
+    sources: [],
+    sourceUnknown: true,
+  };
+}
 
 export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
   if (deps.sessions.leaseTtlMs < MIN_SESSION_LEASE_TTL_MS) {
@@ -555,6 +568,45 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         fallbackEntry ? visibleTitleEntryText(fallbackEntry) : undefined,
       );
       return { title: title ?? (participantIds ? null : (session.title ?? null)) };
+    },
+
+    async captureTranscript(sessionId, actorId) {
+      const onTurnEnd = memoryStrategy.onTurnEnd?.bind(memoryStrategy);
+      if (!onTurnEnd || memoryPolicy.capture === "off") return false;
+      const session = await deps.sessions.get(sessionId);
+      if (!session) return false;
+      const chunks = transcriptChunks(await deps.sessions.getEntries(sessionId));
+      if (!chunks.length) return false;
+      try {
+        const memoryScopeId = (await resolveEnvironmentId(deps.environments, session.scopeId)) as ScopeId;
+        const conversationLabel = await conversationLabelFor(deps.directory, session.scopeId, session.channelName);
+        for (const [index, input] of chunks.entries()) {
+          await onTurnEnd({
+            scopeId: memoryScopeId,
+            conversationScopeId: session.scopeId,
+            inheritedRecords: [untrackedCaptureContext()],
+            input,
+            reply: "",
+            actorId,
+            ...(conversationLabel ? { conversationLabel } : {}),
+            sessionId,
+            idempotencyKey: `transcript:${sessionId}:${index}`,
+          });
+        }
+        return true;
+      } catch (e) {
+        deps.errors?.record(
+          {
+            category: "memory",
+            code: "capture_failed",
+            message: errMessage(e),
+            scopeLabel: session.scopeId,
+            sessionId,
+          },
+          e,
+        );
+        return false;
+      }
     },
 
     async handleTurn(input: OrchestratorInput): Promise<TurnResult> {
@@ -1121,7 +1173,12 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         };
       }
       const childFloor = delegatedSession?.spawnMeta?.readOnly === true;
-      const strictReadOnly = input.readOnly === true || input.privateSessionMessage === true || childFloor;
+      const meeting =
+        conversation.kind === "group"
+          ? await deps.meetings?.get(conversation.threadRef).catch(swallowAs("orchestrator: meeting read", null))
+          : null;
+      const consult = meeting?.status === "open";
+      const strictReadOnly = input.readOnly === true || input.privateSessionMessage === true || childFloor || consult;
       const useMemory = !external && input.skipMemory !== true;
       const environmentId = external ? scopeId : await resolveEnvironmentId(deps.environments, scopeId);
       const rwLayer = resolution.layers.find((l) => l.mode === "rw");
@@ -1339,6 +1396,13 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
               .catch(swallowAs("orchestrator: project home channel read", undefined))
           : undefined;
       if (homeChannel) systemPrompt += `\n\n${renderProjectHomeChannel(homeChannel.channelName)}`;
+      if (meeting && consult) {
+        const deployments = await deps.deploy
+          .listDeployments()
+          .catch(swallowAs("orchestrator: meeting apps read", null));
+        const apps = scopeApps(deployments ?? [], new Set([scopeId, environmentId]));
+        systemPrompt += `\n\n${renderMeetingBlock(meeting.prompt, apps)}`;
+      }
       systemPrompt += cronBlock;
       const sharedFilesBlock = sharedFilesSystemSection(resolution.grantedHandles);
       if (sharedFilesBlock) systemPrompt += `\n\n${sharedFilesBlock}`;
@@ -2165,15 +2229,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           input.overheard?.length ||
           input.attachments?.length ||
           input.inboundNotes
-            ? [
-                {
-                  id: "untracked-turn-context",
-                  text: "",
-                  sensitivity: "unknown" as const,
-                  sources: [],
-                  sourceUnknown: true,
-                },
-              ]
+            ? [untrackedCaptureContext()]
             : []),
         ];
         if (memoryContextChanged) {
@@ -3783,6 +3839,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
             documents: [...documentInputs.documents],
             ...(Object.keys(requestedRuntime).length ? { runtime: requestedRuntime } : {}),
             ...(strictReadOnly ? { readOnly: true } : {}),
+            ...(consult ? { consult: true } : {}),
             surfaceName,
             delegateWork,
             ...(input.clientTools?.length ? { clientTools: input.clientTools } : {}),
