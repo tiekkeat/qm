@@ -252,4 +252,5 @@ export interface Orchestrator {
     principalId: string,
     participantIds?: readonly string[],
   ): Promise<{ title: string | null } | null>;
+  captureTranscript(sessionId: string, actorId: string): Promise<boolean>;
 }

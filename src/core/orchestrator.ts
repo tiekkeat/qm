@@ -200,6 +200,7 @@ import {
   loadActiveBundles,
   recentPrincipalDeliveryNote,
   renderTitleTranscript,
+  transcriptChunks,
   replayableRequest,
   stripAckPrefix,
   stripTurnBoilerplate,
@@ -264,6 +265,14 @@ const DEFAULT_APPROVAL_SUMMARY_TIMEOUT_MS = 6_000;
 const CONNECTOR_HOSTS = Object.values(PROVIDERS).flatMap((p) => p.hosts);
 const INSTANCE_CACHE_MAX_ENTRIES = 5_000;
 const DIRECTORY_INDEX_CACHE_MAX_ENTRIES = 100;
+
+const UNTRACKED_CAPTURE_CONTEXT = {
+  id: "untracked-turn-context",
+  text: "",
+  sensitivity: "unknown" as const,
+  sources: [],
+  sourceUnknown: true,
+};
 
 export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
   if (deps.sessions.leaseTtlMs < MIN_SESSION_LEASE_TTL_MS) {
@@ -556,6 +565,45 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         fallbackEntry ? visibleTitleEntryText(fallbackEntry) : undefined,
       );
       return { title: title ?? (participantIds ? null : (session.title ?? null)) };
+    },
+
+    async captureTranscript(sessionId, actorId) {
+      const onTurnEnd = memoryStrategy.onTurnEnd?.bind(memoryStrategy);
+      if (!onTurnEnd || memoryPolicy.capture === "off") return false;
+      const session = await deps.sessions.get(sessionId);
+      if (!session) return false;
+      const chunks = transcriptChunks(await deps.sessions.getEntries(sessionId));
+      if (!chunks.length) return false;
+      try {
+        const memoryScopeId = (await resolveEnvironmentId(deps.environments, session.scopeId)) as ScopeId;
+        const conversationLabel = await conversationLabelFor(deps.directory, session.scopeId, session.channelName);
+        for (const [index, input] of chunks.entries()) {
+          await onTurnEnd({
+            scopeId: memoryScopeId,
+            conversationScopeId: session.scopeId,
+            inheritedRecords: [UNTRACKED_CAPTURE_CONTEXT],
+            input,
+            reply: "",
+            actorId,
+            ...(conversationLabel ? { conversationLabel } : {}),
+            sessionId,
+            idempotencyKey: `transcript:${sessionId}:${index}`,
+          });
+        }
+        return true;
+      } catch (e) {
+        deps.errors?.record(
+          {
+            category: "memory",
+            code: "capture_failed",
+            message: errMessage(e),
+            scopeLabel: session.scopeId,
+            sessionId,
+          },
+          e,
+        );
+        return false;
+      }
     },
 
     async handleTurn(input: OrchestratorInput): Promise<TurnResult> {
@@ -2180,15 +2228,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           input.overheard?.length ||
           input.attachments?.length ||
           input.inboundNotes
-            ? [
-                {
-                  id: "untracked-turn-context",
-                  text: "",
-                  sensitivity: "unknown" as const,
-                  sources: [],
-                  sourceUnknown: true,
-                },
-              ]
+            ? [UNTRACKED_CAPTURE_CONTEXT]
             : []),
         ];
         if (memoryContextChanged) {

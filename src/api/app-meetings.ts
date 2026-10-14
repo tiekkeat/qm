@@ -218,6 +218,7 @@ export function createMeetingMethods(
           scopeLabel: found.session.scopeId,
         });
         await announce(found.session);
+        await deps.orchestrator.captureTranscript(found.session.id, principalId);
       }
       return { status: "ok", meeting: ended.meeting };
     },

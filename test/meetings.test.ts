@@ -12,7 +12,8 @@ import { meetingRoutes } from "../src/api/routes/meetings.ts";
 import { isUserScoped } from "../src/api/user-scoped-routes.ts";
 import { createAgentTools } from "../src/harness/agent-tools.ts";
 import { createMeetingStore, DEFAULT_MEETING_PROMPT, type Meeting } from "../src/meetings/meeting-store.ts";
-import { projectGroupRef } from "../src/projects/project-store.ts";
+import { transcriptChunks } from "../src/core/orchestrator/turn-helpers.ts";
+import { projectGroupRef, projectScopeId } from "../src/projects/project-store.ts";
 import { buildApp } from "../src/wiring.ts";
 import { testConfig } from "./support/test-config.ts";
 
@@ -276,6 +277,49 @@ test("a message that arrives while the assistant is answering steers the live ru
   assert.equal(((await busy.json()) as { error: string }).error, "session_busy");
   await built.sessions.releaseLease(lease);
   assert.equal((await say(meeting, "member", "anyone there?")).status, 201);
+});
+
+test("ending a meeting captures the whole discussion into project memory once", async (t) => {
+  const { built, project, call, start, say } = await meetingFixture(t, "memory");
+  const scope = projectScopeId(project.id);
+  const meeting = await start({ mode: "off" });
+  assert.equal((await say(meeting, "member", "remember that the launch date is march 3")).status, 201);
+  assert.equal((await say(meeting, "owner", "remember that billing must stay untouched")).status, 201);
+  assert.doesNotMatch(await built.memory.read(scope), /launch date/);
+
+  assert.equal((await call("POST", `/v1/meetings/${meeting.sessionId}/end`, { principalId: "owner" })).status, 200);
+  const captured = await built.memory.read(scope);
+  assert.match(captured, /the launch date is march 3/);
+  assert.match(captured, /billing must stay untouched/);
+
+  assert.equal((await call("POST", `/v1/meetings/${meeting.sessionId}/end`, { principalId: "member" })).status, 200);
+  assert.equal(await built.memory.read(scope), captured);
+});
+
+test("transcript chunks name each speaker and split on message boundaries", () => {
+  const entry = (seq: number, type: "user" | "assistant" | "system", payload: unknown) => ({
+    sessionId: "s1",
+    seq,
+    parentSeq: null,
+    type,
+    payload,
+    scopeLabel: "group:web-project-p1" as const,
+    createdAt: seq,
+  });
+  const entries = [
+    entry(1, "user", { text: "ship friday", name: "Member" }),
+    entry(2, "system", { kind: "note", text: "ignored" }),
+    entry(3, "user", { text: "wake prompt", hidden: true }),
+    entry(4, "assistant", { text: "Friday works." }),
+    entry(5, "user", { text: "agreed" }),
+  ];
+  assert.deepEqual(transcriptChunks(entries), ["Member: ship friday\nAssistant: Friday works.\nMember: agreed"]);
+  assert.deepEqual(transcriptChunks(entries, 30), [
+    "Member: ship friday",
+    "Assistant: Friday works.",
+    "Member: agreed",
+  ]);
+  assert.deepEqual(transcriptChunks([]), []);
 });
 
 test("an ended meeting is locked for messages, settings, and turns", async (t) => {
