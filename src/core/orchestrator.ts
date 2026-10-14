@@ -212,6 +212,7 @@ import {
   deliveryMenu,
   renderConversationRoster,
   renderMeetingBlock,
+  scopeApps,
   renderProjectHomeChannel,
   renderReachRoster,
   renderStandingObligations,
@@ -1399,9 +1400,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         const deployments = await deps.deploy
           .listDeployments()
           .catch(swallowAs("orchestrator: meeting apps read", null));
-        const apps = (deployments ?? [])
-          .filter((app) => app.ownerScopeId === scopeId && app.status !== "archived")
-          .map((app) => ({ name: app.displayName ?? app.name ?? app.id, status: app.status }));
+        const apps = scopeApps(deployments ?? [], new Set([scopeId, environmentId]));
         systemPrompt += `\n\n${renderMeetingBlock(meeting.prompt, apps)}`;
       }
       systemPrompt += cronBlock;

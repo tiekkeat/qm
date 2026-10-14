@@ -14,6 +14,7 @@ import { createAgentTools } from "../src/harness/agent-tools.ts";
 import { meetingOutputsFolder } from "../src/meetings/meeting-outputs.ts";
 import { createMeetingStore, type Meeting } from "../src/meetings/meeting-store.ts";
 import { DEFAULT_MEETING_PROMPT } from "../plugins/chassis/src/meeting-copy.ts";
+import { renderMeetingBlock, scopeApps } from "../src/core/orchestrator/prompt-blocks.ts";
 import { transcriptChunks } from "../src/core/orchestrator/turn-helpers.ts";
 import { projectGroupRef, projectScopeId } from "../src/projects/project-store.ts";
 import type { TurnRequest } from "../src/types.ts";
@@ -370,6 +371,37 @@ test("session views carry the meeting so a client can render its state", async (
   const after = (await built.app.listSessions("owner")).find((session) => session.id === meeting.sessionId)?.meeting;
   assert.equal(after?.status, "ended");
   assert.ok(after?.followUpSessionId);
+});
+
+test("the meeting block lists the apps created in the project, whoever owns them", () => {
+  const app = (id: string, over: Record<string, unknown>) => ({
+    id,
+    status: "running" as const,
+    ownerScopeId: "personal:owner" as const,
+    ...over,
+  });
+  const apps = scopeApps(
+    [
+      app("a1", { name: "billing", createdInScope: "group:web-project-p1" }),
+      app("a2", { displayName: "Status page", name: "status", ownerScopeId: "group:web-project-p1" }),
+      app("a3", { name: "retired", status: "archived", createdInScope: "group:web-project-p1" }),
+      app("a4", { name: "elsewhere", createdInScope: "group:web-project-p2" }),
+      app("a5", { createdInScope: "group:web-project-p1", status: "stopped" }),
+    ],
+    new Set(["group:web-project-p1"]),
+  );
+  assert.deepEqual(apps, [
+    { name: "billing", status: "running" },
+    { name: "Status page", status: "running" },
+    { name: "a5", status: "stopped" },
+  ]);
+  const block = renderMeetingBlock("Stay brief.", apps);
+  assert.ok(block.includes("Apps this project has deployed (treat each as production):"));
+  assert.ok(block.includes("- billing (running)"));
+  assert.ok(block.includes("Stay brief."));
+  const bare = renderMeetingBlock("", []);
+  assert.ok(!bare.includes("Apps this project has deployed"));
+  assert.ok(!bare.includes("set these instructions"));
 });
 
 test("transcript chunks name each speaker and split on message boundaries", () => {
