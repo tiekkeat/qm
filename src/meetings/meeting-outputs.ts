@@ -42,6 +42,7 @@ export function meetingOutputsRequest(
       "The meeting above has ended. Write the documents below from that discussion and save each one with the files tool.",
       ...chosen.map((spec) => `- \`${folder}/${spec.file}\`: the ${spec.label}, covering ${spec.brief}.`),
       "Record only what the members actually said and decided. Write in the language the members used.",
+      "Then attach all of them to your reply with the attach tool so every member can open them.",
       "Do not change anything else in the project. Finish with a short summary and the saved paths.",
     ].join("\n"),
   };
