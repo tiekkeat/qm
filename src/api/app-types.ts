@@ -113,6 +113,7 @@ import type { RuntimeChoice } from "../harness/harness.ts";
 import { type ReachOpts, type ReachResolution, type ReachTarget } from "../reach/reach.ts";
 import { type Project, type ProjectStore } from "../projects/project-store.ts";
 import type { Meeting, MeetingMode, MeetingStore } from "../meetings/meeting-store.ts";
+import type { MeetingOutput } from "../meetings/meeting-outputs.ts";
 import type { SearchHit } from "../search/core-search.ts";
 
 interface DeploymentVersionView {
@@ -404,7 +405,11 @@ export interface App {
     principalId: string,
     patch: { mode?: MeetingMode; prompt?: string },
   ): Promise<MeetingMutation>;
-  endMeeting(sessionId: string, principalId: string): Promise<MeetingMutation>;
+  endMeeting(
+    sessionId: string,
+    principalId: string,
+    input?: { outputs?: readonly MeetingOutput[] },
+  ): Promise<MeetingMutation>;
   postMeetingMessage(
     sessionId: string,
     principalId: string,

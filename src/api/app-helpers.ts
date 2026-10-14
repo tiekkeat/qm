@@ -40,6 +40,7 @@ import {
   type ReachDirectory,
 } from "../reach/reach.ts";
 import { createSurfaceContextPuller } from "./surface-context-puller.ts";
+import type { Meeting } from "../meetings/meeting-store.ts";
 import {
   isProjectGroupRef,
   projectGroupRef,
@@ -298,13 +299,32 @@ export function createAppHelpers(deps: AppDeps, app: App) {
         ),
       ),
     );
-    return sessions.filter((session) => allowed.get(session.scopeId) !== false);
+    const visible = sessions.filter((session) => allowed.get(session.scopeId) !== false);
+    if (!deps.meetings || !visible.some((session) => allowed.get(session.scopeId) === true)) return visible;
+    const meetings = new Map((await deps.meetings.list()).map((meeting) => [meeting.threadRef, meeting]));
+    return visible.map((session) => withMeeting(session, meetings.get(session.threadRef)));
+  }
+
+  function withMeeting(session: Session, meeting: Meeting | null | undefined): Session {
+    if (!meeting || meeting.sessionId !== session.id) return session;
+    return {
+      ...session,
+      meeting: {
+        mode: meeting.mode,
+        status: meeting.status,
+        prompt: meeting.prompt,
+        startedBy: meeting.startedBy,
+        ...(meeting.followUpSessionId ? { followUpSessionId: meeting.followUpSessionId } : {}),
+      },
+    };
   }
 
   async function sessionForViewer(sessionId: string, principalId: string): Promise<Session | null> {
     const session = await deps.sessions.getForParticipant(sessionId, principalId);
     if (!session) return null;
-    return (await managedProjectMembership(session.scopeId, principalId)) === false ? null : session;
+    const member = await managedProjectMembership(session.scopeId, principalId);
+    if (member === false) return null;
+    return member === true ? withMeeting(session, await deps.meetings?.get(session.threadRef)) : session;
   }
 
   async function contextsFor(principalId: string): Promise<ContextSummary[]> {

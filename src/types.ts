@@ -119,8 +119,17 @@ export interface Session {
   backgroundJobs?: number;
   watches?: number;
   crons?: number;
+  meeting?: SessionMeeting;
   /** Set while a working session pursues a goal: banked active time, the running turn's start, and the floor. */
   goal?: { objective: string; activeMs: number; runningSince?: number; floor?: Record<string, number> };
+}
+
+interface SessionMeeting {
+  mode: "mention" | "judged" | "off";
+  status: "open" | "ended";
+  prompt: string;
+  startedBy: string;
+  followUpSessionId?: string;
 }
 
 export type EntryType =

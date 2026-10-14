@@ -11,6 +11,7 @@ import { createInsecureTestServer } from "../src/api/server.ts";
 import { meetingRoutes } from "../src/api/routes/meetings.ts";
 import { isUserScoped } from "../src/api/user-scoped-routes.ts";
 import { createAgentTools } from "../src/harness/agent-tools.ts";
+import { meetingOutputsFolder } from "../src/meetings/meeting-outputs.ts";
 import { createMeetingStore, DEFAULT_MEETING_PROMPT, type Meeting } from "../src/meetings/meeting-store.ts";
 import { transcriptChunks } from "../src/core/orchestrator/turn-helpers.ts";
 import { projectGroupRef, projectScopeId } from "../src/projects/project-store.ts";
@@ -301,6 +302,74 @@ test("ending a meeting captures the whole discussion into project memory once", 
 
   assert.equal((await call("POST", `/v1/meetings/${meeting.sessionId}/end`, { principalId: "member" })).status, 200);
   assert.equal(await built.memory.read(scope), captured);
+});
+
+test("ending with outputs opens a follow-up project chat that writes the chosen documents", async (t) => {
+  const { built, project, call, start, say } = await meetingFixture(t, "outputs");
+  const meeting = await start({ title: "Pricing review" });
+  assert.equal((await say(meeting, "member", "we agreed to add a team tier")).status, 201);
+
+  const bad = await call("POST", `/v1/meetings/${meeting.sessionId}/end`, { principalId: "owner", outputs: ["poem"] });
+  assert.equal(bad.status, 400);
+  assert.equal((await built.meetings.get(meeting.threadRef))?.status, "open");
+
+  const ended = await call("POST", `/v1/meetings/${meeting.sessionId}/end`, {
+    principalId: "owner",
+    outputs: ["tasks", "minutes"],
+  });
+  assert.equal(ended.status, 200);
+  const closed = ((await ended.json()) as { meeting: Meeting }).meeting;
+  assert.deepEqual(closed.outputs, ["tasks", "minutes"]);
+  assert.ok(closed.followUpSessionId);
+
+  const followUp = await built.sessions.get(closed.followUpSessionId!);
+  assert.equal(followUp?.scopeId, projectScopeId(project.id));
+  assert.equal(followUp?.title, "Pricing review outcomes");
+  assert.equal(await built.meetings.get(followUp!.threadRef), null);
+  assert.match(
+    JSON.stringify((await built.app.getSessionForViewer(followUp!.id, "member"))?.entries),
+    /we agreed to add a team tier/,
+  );
+
+  const [run] = (await built.runs.list()).filter((candidate) => candidate.sessionId === followUp!.threadRef);
+  assert.ok(run);
+  assert.equal(run.request.actor.id, "owner");
+  assert.equal(run.request.displayText, "Generate from this meeting: meeting minutes, task checklist.");
+  const folder = meetingOutputsFolder(meeting.sessionId, closed.endedAt!);
+  assert.ok(run.request.text.includes(`\`${folder}/minutes.md\``));
+  assert.ok(run.request.text.includes(`\`${folder}/tasks.md\``));
+  assert.ok(!run.request.text.includes("action-plan.md"));
+
+  const again = await call("POST", `/v1/meetings/${meeting.sessionId}/end`, {
+    principalId: "member",
+    outputs: ["action_plan"],
+  });
+  assert.equal(((await again.json()) as { meeting: Meeting }).meeting.followUpSessionId, closed.followUpSessionId);
+  assert.equal((await built.runs.list()).length, 1);
+});
+
+test("session views carry the meeting so a client can render its state", async (t) => {
+  const { built, call, start } = await meetingFixture(t, "views");
+  const meeting = await start({ mode: "judged", prompt: "Stay brief." });
+  const plain = await built.app.spawnSession("owner", {
+    scopeId: (await built.sessions.get(meeting.sessionId))!.scopeId,
+  });
+  assert.ok(plain);
+
+  const listed = await built.app.listSessions("member");
+  assert.deepEqual(listed.find((session) => session.id === meeting.sessionId)?.meeting, {
+    mode: "judged",
+    status: "open",
+    prompt: "Stay brief.",
+    startedBy: "owner",
+  });
+  assert.equal(listed.find((session) => session.id === plain.session.id)?.meeting, undefined);
+  assert.equal((await built.app.getSessionForViewer(meeting.sessionId, "member"))?.session.meeting?.mode, "judged");
+
+  await call("POST", `/v1/meetings/${meeting.sessionId}/end`, { principalId: "member", outputs: ["minutes"] });
+  const after = (await built.app.listSessions("owner")).find((session) => session.id === meeting.sessionId)?.meeting;
+  assert.equal(after?.status, "ended");
+  assert.ok(after?.followUpSessionId);
 });
 
 test("transcript chunks name each speaker and split on message boundaries", () => {

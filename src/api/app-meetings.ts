@@ -1,5 +1,11 @@
 import { orgId as orgIdOf } from "../config.ts";
 import { renderOverheard, type OverheardEntryPayload } from "../harness/replay.ts";
+import {
+  isMeetingOutput,
+  meetingOutputsFolder,
+  meetingOutputsRequest,
+  type MeetingOutput,
+} from "../meetings/meeting-outputs.ts";
 import { isMeetingMode, MAX_MEETING_PROMPT_CHARS, type Meeting } from "../meetings/meeting-store.ts";
 import { projectGroupRef, projectIdFromGroupRef, projectScopeId } from "../projects/project-store.ts";
 import { resolveBranding } from "../resolution/branding.ts";
@@ -150,6 +156,34 @@ export function createMeetingMethods(
     return decision.act;
   }
 
+  async function startOutputs(
+    session: Session,
+    meeting: Meeting,
+    principalId: string,
+    outputs: readonly MeetingOutput[],
+  ): Promise<Meeting | null> {
+    const parsed = parseScopeId(session.scopeId);
+    const forked = await app.forkSession(session.id, principalId);
+    if (!forked || !parsed.ref || !deps.meetings) return null;
+    const title = session.title?.trim();
+    await deps.sessions.updateTitle(forked.session.id, title ? `${title} outcomes` : "Meeting outcomes");
+    const request = meetingOutputsRequest(outputs, meetingOutputsFolder(session.id, meeting.endedAt ?? Date.now()));
+    const name = await speakerName(principalId);
+    const turn = await app.turn({
+      surface: "web",
+      actor: { externalId: principalId, ...(name ? { displayName: name } : {}) },
+      conversation: { kind: "group", threadRef: forked.session.threadRef, channelRef: parsed.ref },
+      text: request.text,
+      displayText: request.display,
+      spawned: true,
+      async: true,
+      idempotencyKey: `meeting-outputs:${session.id}`,
+    });
+    if (turn.status === "refused")
+      console.error(`[meetings] outputs turn refused for ${session.id}: ${turn.reason ?? "no reason"}`);
+    return deps.meetings.attachFollowUp(session.threadRef, forked.session.id, outputs);
+  }
+
   return {
     async startMeeting(projectId, principalId, input) {
       if (!deps.meetings || !deps.projects) return { status: "not_found" };
@@ -217,23 +251,26 @@ export function createMeetingMethods(
       return { status: "ok", meeting };
     },
 
-    async endMeeting(sessionId, principalId) {
+    async endMeeting(sessionId, principalId, input) {
       const found = await meetingForViewer(sessionId, principalId);
       if (!found || !deps.meetings) return { status: "not_found" };
+      const outputs = input?.outputs ?? [];
+      if (!outputs.every(isMeetingOutput)) return { status: "invalid", message: "unknown output" };
       const ended = await deps.meetings.end(found.session.threadRef, principalId);
       if (!ended) return { status: "not_found" };
-      if (ended.changed) {
-        deps.auditLog.record({
-          at: Date.now(),
-          principalId,
-          action: "meeting.end",
-          resource: ended.meeting.sessionId,
-          scopeLabel: found.session.scopeId,
-        });
-        await announce(found.session);
-        await deps.orchestrator.captureTranscript(found.session.id, principalId);
-      }
-      return { status: "ok", meeting: ended.meeting };
+      if (!ended.changed) return { status: "ok", meeting: ended.meeting };
+      deps.auditLog.record({
+        at: Date.now(),
+        principalId,
+        action: "meeting.end",
+        resource: ended.meeting.sessionId,
+        scopeLabel: found.session.scopeId,
+        detail: JSON.stringify({ outputs }),
+      });
+      await deps.orchestrator.captureTranscript(found.session.id, principalId);
+      const followUp = outputs.length ? await startOutputs(found.session, ended.meeting, principalId, outputs) : null;
+      await announce(found.session);
+      return { status: "ok", meeting: followUp ?? ended.meeting };
     },
 
     async postMeetingMessage(sessionId, principalId, input) {

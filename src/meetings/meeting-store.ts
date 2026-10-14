@@ -1,5 +1,6 @@
 import { orgId as configOrgId } from "../config.ts";
 import { createMemoryMap, type DurableMap } from "../persistence/durable-map.ts";
+import type { MeetingOutput } from "./meeting-outputs.ts";
 
 const MEETING_MODES = ["mention", "judged", "off"] as const;
 export type MeetingMode = (typeof MEETING_MODES)[number];
@@ -29,6 +30,8 @@ export interface Meeting {
   updatedAt: number;
   endedBy?: string;
   endedAt?: number;
+  outputs?: MeetingOutput[];
+  followUpSessionId?: string;
 }
 
 export interface MeetingStore {
@@ -45,6 +48,12 @@ export interface MeetingStore {
   listForProject(projectId: string): Promise<Meeting[]>;
   update(threadRef: string, patch: { mode?: MeetingMode; prompt?: string }): Promise<Meeting | null>;
   end(threadRef: string, endedBy: string): Promise<{ meeting: Meeting; changed: boolean } | null>;
+  attachFollowUp(
+    threadRef: string,
+    followUpSessionId: string,
+    outputs: readonly MeetingOutput[],
+  ): Promise<Meeting | null>;
+  list(): Promise<Meeting[]>;
 }
 
 export function isMeetingMode(value: unknown): value is MeetingMode {
@@ -109,6 +118,13 @@ export function createMeetingStore(
       });
       const meeting = own(updated);
       return meeting ? { meeting, changed } : null;
+    },
+    async attachFollowUp(threadRef, followUpSessionId, outputs) {
+      if (!own(await backing.get(threadRef))) return null;
+      return backing.merge(threadRef, { followUpSessionId, outputs: [...outputs] });
+    },
+    async list() {
+      return (await backing.all()).filter((meeting) => meeting.orgId === configOrgId());
     },
   };
 }

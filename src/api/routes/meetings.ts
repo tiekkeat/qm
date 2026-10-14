@@ -1,3 +1,4 @@
+import { isMeetingOutput, MEETING_OUTPUTS } from "../../meetings/meeting-outputs.ts";
 import { isMeetingMode, type MeetingMode } from "../../meetings/meeting-store.ts";
 import { sendJson } from "../http.ts";
 import { isObj } from "./shared.ts";
@@ -72,7 +73,13 @@ async function updateMeeting(ctx: ApiCtx): Promise<void> {
 async function endMeeting(ctx: ApiCtx): Promise<void> {
   const request = bodyPrincipal(ctx);
   if (!request) return;
-  return respond(ctx, await ctx.app.endMeeting(ctx.params.sessionId!, request.principalId));
+  const outputs = request.body.outputs ?? [];
+  if (!Array.isArray(outputs) || !outputs.every(isMeetingOutput))
+    return sendJson(ctx.res, 400, {
+      error: "bad_request",
+      message: `outputs must be a list drawn from ${MEETING_OUTPUTS.join(", ")}`,
+    });
+  return respond(ctx, await ctx.app.endMeeting(ctx.params.sessionId!, request.principalId, { outputs }));
 }
 
 async function postMeetingMessage(ctx: ApiCtx): Promise<void> {
