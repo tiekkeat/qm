@@ -19,14 +19,15 @@ export function createApp(deps: AppDeps): App {
   const app = {} as App;
   const helpers = createAppHelpers(deps, app);
   const ambient = createAmbientHelpers(deps, app);
+  const meetings = createMeetingMethods(deps, app, helpers);
   const methods = {
     swarms: deps.swarms,
-    ...createTurnMethods(deps, helpers, ambient),
+    ...createTurnMethods(deps, helpers, ambient, meetings.intake),
     ...createSessionMethods(deps, helpers),
     ...createMessagingMethods(deps, helpers, ambient),
     ...createDeploymentMethods(deps, helpers),
     ...createSkillMethods(deps, helpers),
-    ...createMeetingMethods(deps, app, helpers),
+    ...meetings.methods,
   };
   const turn = methods.turn;
   methods.turn = async (req, replay) => {

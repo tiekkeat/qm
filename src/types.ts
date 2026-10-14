@@ -723,6 +723,7 @@ export interface TurnRequest {
   skipMemory?: boolean;
   surfaceTools?: boolean;
   addressed?: boolean;
+  mentionsAssistant?: boolean;
   envelopeWrapped?: boolean;
   displayText?: string;
   turnWallClockMs?: number;

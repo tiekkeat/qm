@@ -7,7 +7,7 @@ import {
   type MeetingOutput,
 } from "../meetings/meeting-outputs.ts";
 import { isMeetingMode, MAX_MEETING_PROMPT_CHARS, type Meeting } from "../meetings/meeting-store.ts";
-import { projectGroupRef, projectIdFromGroupRef, projectScopeId } from "../projects/project-store.ts";
+import { projectGroupRef, projectScopeId } from "../projects/project-store.ts";
 import { resolveBranding } from "../resolution/branding.ts";
 import { isTerminal } from "../runs/run-store.ts";
 import { acquireLeaseWithin, appendEntryOutsideTurn } from "../sessions/session-store.ts";
@@ -18,7 +18,15 @@ import {
   type AmbientDecision,
 } from "../surface-cache/ambient-judge.ts";
 import type { CachedMessage } from "../surface-cache/surface-cache.ts";
-import { parseScopeId, scopeId, type Session, type SessionEntry, type TurnRequest } from "../types.ts";
+import {
+  parseScopeId,
+  scopeId,
+  type Principal,
+  type Session,
+  type SessionEntry,
+  type TurnRequest,
+  type TurnResult,
+} from "../types.ts";
 import { reportFailureAs, swallowAs } from "../util/errors.ts";
 
 import type { App, AppDeps } from "./app-types.ts";
@@ -47,11 +55,20 @@ function entryAsCachedMessage(entry: SessionEntry, container: string): CachedMes
   };
 }
 
+export type MeetingIntake = (input: {
+  meeting: Meeting;
+  actor: Principal;
+  request: TurnRequest;
+}) => Promise<"wake" | TurnResult>;
+
 export function createMeetingMethods(
   deps: AppDeps,
   app: App,
   h: AppHelpers,
-): Pick<App, "startMeeting" | "listMeetings" | "updateMeeting" | "endMeeting" | "postMeetingMessage"> {
+): {
+  methods: Pick<App, "startMeeting" | "listMeetings" | "updateMeeting" | "endMeeting">;
+  intake: MeetingIntake;
+} {
   const { sessionForViewer } = h;
 
   async function isProjectMember(projectId: string, principalId: string): Promise<boolean> {
@@ -184,7 +201,63 @@ export function createMeetingMethods(
     return deps.meetings.attachFollowUp(session.threadRef, forked.session.id, outputs);
   }
 
-  return {
+  const intake: MeetingIntake = async ({ meeting, actor, request }) => {
+    if (meeting.mode !== "off" && request.mentionsAssistant === true) return "wake";
+    const session = await deps.sessions.getByThread(meeting.threadRef);
+    if (!session || session.id !== meeting.sessionId)
+      return { status: "refused", reason: "this meeting's conversation is unavailable" };
+    if (request.attachments?.length)
+      return { status: "refused", reason: "mention the assistant to share a file in a meeting" };
+    const text = request.text.trim();
+    if (!text) return { status: "refused", reason: "a meeting message needs text" };
+    if (text.length > MAX_MEETING_MESSAGE_CHARS)
+      return { status: "refused", reason: `a meeting message is capped at ${MAX_MEETING_MESSAGE_CHARS} characters` };
+
+    const at = Date.now();
+    const name = actor.displayName?.trim() || (await speakerName(actor.id));
+    const payload: OverheardEntryPayload = {
+      overheard: true,
+      ts: messageTs(at, Math.floor(Math.random() * 1000)),
+      text,
+      ...(name ? { name } : {}),
+    };
+    if (
+      meeting.mode === "judged" &&
+      (await shouldEngage(session, meeting, {
+        container: session.threadRef,
+        ts: payload.ts,
+        text,
+        createdAt: at,
+        authorId: actor.id,
+        ...(name ? { authorName: name } : {}),
+      }))
+    )
+      return "wake";
+
+    const messageKey = request.idempotencyKey ? `meeting:${actor.id}:${request.idempotencyKey}` : undefined;
+    if (await record(session, payload, messageKey)) {
+      await announce(session);
+      return { status: "silent", sessionId: session.id };
+    }
+    const live = await deps.runs.activeForThread(session.threadRef);
+    if (live && !isTerminal(live.status)) {
+      const attributed = name ? { ...request, actor: { ...request.actor, displayName: name } } : request;
+      const steer = await app.signalRun(
+        live.id,
+        { kind: "steer", text, ts: payload.ts, request: attributed },
+        actor.id,
+      );
+      if (steer.accepted || steer.replayed)
+        return { status: "queued", runId: live.id, steered: true, sessionId: session.id };
+    }
+    return {
+      status: "refused",
+      refusalKind: "session_busy",
+      reason: "the meeting is busy; send the message again",
+    };
+  };
+
+  const methods: Pick<App, "startMeeting" | "listMeetings" | "updateMeeting" | "endMeeting"> = {
     async startMeeting(projectId, principalId, input) {
       if (!deps.meetings || !deps.projects) return { status: "not_found" };
       if (input.mode !== undefined && !isMeetingMode(input.mode)) return { status: "invalid", message: "unknown mode" };
@@ -272,65 +345,6 @@ export function createMeetingMethods(
       await announce(found.session);
       return { status: "ok", meeting: followUp ?? ended.meeting };
     },
-
-    async postMeetingMessage(sessionId, principalId, input) {
-      const found = await meetingForViewer(sessionId, principalId);
-      if (!found) return { status: "not_found" };
-      const { session, meeting } = found;
-      if (meeting.status !== "open") return { status: "ended" };
-      const text = input.text.trim();
-      if (!text) return { status: "invalid", message: "text required" };
-      if (text.length > MAX_MEETING_MESSAGE_CHARS)
-        return { status: "invalid", message: `message is capped at ${MAX_MEETING_MESSAGE_CHARS} characters` };
-      const parsed = parseScopeId(session.scopeId);
-      if (parsed.kind !== "group" || projectIdFromGroupRef(parsed.ref) !== meeting.projectId)
-        return { status: "not_found" };
-
-      const at = Date.now();
-      const name = await speakerName(principalId);
-      const payload: OverheardEntryPayload = {
-        overheard: true,
-        ts: messageTs(at, Math.floor(Math.random() * 1000)),
-        text,
-        ...(name ? { name } : {}),
-      };
-      const wake =
-        meeting.mode !== "off" &&
-        (input.mentionsAssistant === true ||
-          (meeting.mode === "judged" &&
-            (await shouldEngage(session, meeting, {
-              container: session.threadRef,
-              ts: payload.ts,
-              text,
-              createdAt: at,
-              authorId: principalId,
-              ...(name ? { authorName: name } : {}),
-            }))));
-
-      const request: TurnRequest = {
-        surface: "web",
-        actor: { externalId: principalId, ...(name ? { displayName: name } : {}) },
-        conversation: { kind: "group", threadRef: session.threadRef, channelRef: parsed.ref },
-        text,
-        async: true,
-      };
-      const messageKey = input.idempotencyKey ? `meeting:${principalId}:${input.idempotencyKey}` : undefined;
-      if (wake) {
-        const turn = await app.turn({ ...request, ...(messageKey ? { idempotencyKey: messageKey } : {}) });
-        return { status: "turn", turn };
-      }
-
-      const recorded = await record(session, payload, messageKey);
-      if (recorded) {
-        await announce(session);
-        return { status: "recorded", seq: recorded.seq };
-      }
-      const live = await deps.runs.activeForThread(session.threadRef);
-      if (live && !isTerminal(live.status)) {
-        const steer = await app.signalRun(live.id, { kind: "steer", text, ts: payload.ts, request }, principalId);
-        if (steer.accepted || steer.replayed) return { status: "steered", runId: live.id };
-      }
-      return { status: "busy" };
-    },
   };
+  return { methods, intake };
 }

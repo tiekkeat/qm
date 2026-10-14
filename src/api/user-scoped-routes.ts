@@ -70,7 +70,6 @@ const USER_SCOPED: Rule[] = [
   pat("POST", "/v1/projects/:id/meetings", { in: "body", name: "principalId" }),
   pat("PATCH", "/v1/meetings/:sessionId", { in: "body", name: "principalId" }),
   pat("POST", "/v1/meetings/:sessionId/end", { in: "body", name: "principalId" }),
-  pat("POST", "/v1/meetings/:sessionId/messages", { in: "body", name: "principalId" }),
   pat("GET", "/v1/scope-resources", { in: "query", name: "principalId" }),
   pat("GET", "/v1/memory", { in: "query", name: "principalId" }),
   pat("PUT", "/v1/memory", { in: "body", name: "principalId" }),

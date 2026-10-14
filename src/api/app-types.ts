@@ -218,13 +218,6 @@ type MeetingMutation =
   | { status: "not_found" | "forbidden" | "ended" }
   | { status: "invalid"; message: string };
 
-type MeetingMessageResult =
-  | { status: "recorded"; seq: number }
-  | { status: "turn"; turn: TurnResult }
-  | { status: "steered"; runId: string }
-  | { status: "not_found" | "ended" | "busy" }
-  | { status: "invalid"; message: string };
-
 interface DeploymentGitUrl {
   url: string;
   permission: "read" | "write";
@@ -410,11 +403,6 @@ export interface App {
     principalId: string,
     input?: { outputs?: readonly MeetingOutput[] },
   ): Promise<MeetingMutation>;
-  postMeetingMessage(
-    sessionId: string,
-    principalId: string,
-    input: { text: string; mentionsAssistant?: boolean; idempotencyKey?: string },
-  ): Promise<MeetingMessageResult>;
   updateSession(
     sessionId: string,
     principalId: string,

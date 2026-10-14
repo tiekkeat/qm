@@ -82,36 +82,9 @@ async function endMeeting(ctx: ApiCtx): Promise<void> {
   return respond(ctx, await ctx.app.endMeeting(ctx.params.sessionId!, request.principalId, { outputs }));
 }
 
-async function postMeetingMessage(ctx: ApiCtx): Promise<void> {
-  const request = bodyPrincipal(ctx);
-  if (!request) return;
-  const { body, principalId } = request;
-  if (typeof body.text !== "string")
-    return sendJson(ctx.res, 400, { error: "bad_request", message: "text (string) required" });
-  const result = await ctx.app.postMeetingMessage(ctx.params.sessionId!, principalId, {
-    text: body.text,
-    ...(body.mentionsAssistant === true ? { mentionsAssistant: true } : {}),
-    ...(typeof body.idempotencyKey === "string" && body.idempotencyKey ? { idempotencyKey: body.idempotencyKey } : {}),
-  });
-  if (result.status === "recorded") return sendJson(ctx.res, 201, { status: "recorded", seq: result.seq });
-  if (result.status === "steered") return sendJson(ctx.res, 202, { status: "steered", runId: result.runId });
-  if (result.status === "turn") {
-    if (result.turn.status === "refused")
-      return sendJson(ctx.res, 409, { error: "refused", message: result.turn.reason ?? "the turn was refused" });
-    return sendJson(ctx.res, 202, { status: "turn", turn: result.turn });
-  }
-  if (result.status === "busy")
-    return sendJson(ctx.res, 409, { error: "session_busy", message: "the meeting is busy; send the message again" });
-  if (result.status === "invalid") return sendJson(ctx.res, 400, { error: "bad_request", message: result.message });
-  if (result.status === "ended")
-    return sendJson(ctx.res, 409, { error: "meeting_ended", message: "this meeting has ended" });
-  return sendJson(ctx.res, 404, { error: "not_found" });
-}
-
 export const meetingRoutes: ReadonlyArray<Route<ApiCtx>> = [
   { method: "GET", path: "/v1/projects/:id/meetings", auth: "source", handle: listMeetings },
   { method: "POST", path: "/v1/projects/:id/meetings", auth: "source", handle: startMeeting },
   { method: "PATCH", path: "/v1/meetings/:sessionId", auth: "source", handle: updateMeeting },
   { method: "POST", path: "/v1/meetings/:sessionId/end", auth: "source", handle: endMeeting },
-  { method: "POST", path: "/v1/meetings/:sessionId/messages", auth: "source", handle: postMeetingMessage },
 ];

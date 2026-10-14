@@ -15,6 +15,7 @@ import { meetingOutputsFolder } from "../src/meetings/meeting-outputs.ts";
 import { createMeetingStore, DEFAULT_MEETING_PROMPT, type Meeting } from "../src/meetings/meeting-store.ts";
 import { transcriptChunks } from "../src/core/orchestrator/turn-helpers.ts";
 import { projectGroupRef, projectScopeId } from "../src/projects/project-store.ts";
+import type { TurnRequest } from "../src/types.ts";
 import { buildApp } from "../src/wiring.ts";
 import { testConfig } from "./support/test-config.ts";
 
@@ -46,8 +47,15 @@ async function meetingFixture(t: { after: (fn: () => Promise<void>) => void }, n
     assert.equal(response.status, 201);
     return ((await response.json()) as { meeting: Meeting }).meeting;
   };
-  const say = (meeting: Meeting, principalId: string, text: string, extra: Record<string, unknown> = {}) =>
-    call("POST", `/v1/meetings/${meeting.sessionId}/messages`, { principalId, text, ...extra });
+  const say = (meeting: Meeting, principalId: string, text: string, extra: Partial<TurnRequest> = {}) =>
+    built.app.turn({
+      surface: "web",
+      actor: { externalId: principalId },
+      conversation: { kind: "group", channelRef: projectGroupRef(project.id), threadRef: meeting.threadRef },
+      text,
+      async: true,
+      ...extra,
+    });
   const transcript = async (meeting: Meeting, viewer: string) =>
     JSON.stringify((await built.app.getSessionForViewer(meeting.sessionId, viewer))?.entries ?? []);
   return { built, project, call, start, say, transcript };
@@ -126,9 +134,10 @@ test("a meeting records member messages for everyone without waking the assistan
   );
   assert.equal((await call("GET", `/v1/projects/${project.id}/meetings?principalId=outsider`)).status, 404);
 
-  const recorded = await say(meeting, "member", "  we should ship on friday  ");
-  assert.equal(recorded.status, 201);
-  assert.equal(((await recorded.json()) as { status: string }).status, "recorded");
+  assert.deepEqual(await say(meeting, "member", "  we should ship on friday  "), {
+    status: "silent",
+    sessionId: meeting.sessionId,
+  });
   assert.equal((await built.runs.list()).length, 0);
   const seenByOwner = await transcript(meeting, "owner");
   assert.match(seenByOwner, /we should ship on friday/);
@@ -139,15 +148,17 @@ test("a meeting records member messages for everyone without waking the assistan
   );
   assert.equal(await transcript(meeting, "outsider"), "[]");
 
-  const first = await say(meeting, "owner", "retry me", { idempotencyKey: "k1" });
-  const retried = await say(meeting, "owner", "retry me", { idempotencyKey: "k1" });
-  assert.deepEqual(await retried.json(), await first.json());
-  const sameKeyOtherMember = await say(meeting, "member", "retry me", { idempotencyKey: "k1" });
-  assert.equal(sameKeyOtherMember.status, 201);
+  assert.equal((await say(meeting, "owner", "retry me", { idempotencyKey: "k1" })).status, "silent");
+  assert.equal((await say(meeting, "owner", "retry me", { idempotencyKey: "k1" })).status, "silent");
+  assert.equal((await say(meeting, "member", "retry me", { idempotencyKey: "k1" })).status, "silent");
   assert.equal((await transcript(meeting, "owner")).split("retry me").length - 1, 2);
 
-  assert.equal((await say(meeting, "outsider", "let me in")).status, 404);
-  assert.equal((await say(meeting, "member", "   ")).status, 400);
+  assert.equal((await say(meeting, "outsider", "let me in")).status, "refused");
+  assert.equal((await say(meeting, "member", "   ")).status, "refused");
+  const withFile = await say(meeting, "member", "see attached", {
+    attachments: [{ name: "plan.pdf", mimetype: "application/pdf", sizeBytes: 1, blobId: "b1" }],
+  });
+  assert.match(withFile.reason ?? "", /mention the assistant to share a file/);
   assert.equal((await built.runs.list()).length, 0);
 });
 
@@ -155,13 +166,12 @@ test("a mention wakes the assistant with the meeting instructions and the overhe
   const { built, call, start, say, transcript } = await meetingFixture(t, "mention");
   const meeting = await start({ prompt: "Flag anything that touches the billing app." });
 
-  assert.equal((await say(meeting, "member", "the billing app needs a new plan tier")).status, 201);
+  assert.equal((await say(meeting, "member", "the billing app needs a new plan tier")).status, "silent");
   const woken = await say(meeting, "owner", "!sysprompt", { mentionsAssistant: true });
-  assert.equal(woken.status, 202);
-  const runId = ((await woken.json()) as { turn: { runId: string } }).turn.runId;
+  assert.equal(woken.status, "queued");
   built.runtime.start();
   try {
-    const finished = await built.runs.waitFor(runId, 10_000);
+    const finished = await built.runs.waitFor(woken.runId!, 10_000);
     assert.equal(finished.result?.status, "ok");
     assert.match(finished.result?.reply ?? "", /## Project meeting/);
     assert.match(finished.result?.reply ?? "", /Flag anything that touches the billing app\./);
@@ -188,14 +198,9 @@ test("a mention wakes the assistant with the meeting instructions and the overhe
 });
 
 test("an open meeting limits the assistant to consulting the project", async (t) => {
-  const { built, project, start } = await meetingFixture(t, "consult");
+  const { start, say } = await meetingFixture(t, "consult");
   const meeting = await start();
-  const conversation = {
-    kind: "group" as const,
-    channelRef: projectGroupRef(project.id),
-    threadRef: meeting.threadRef,
-  };
-  const ask = (text: string) => built.app.turn({ surface: "web", actor: { externalId: "owner" }, conversation, text });
+  const ask = (text: string) => say(meeting, "owner", text, { mentionsAssistant: true, async: false });
 
   const prompt = await ask("!sysprompt");
   assert.match(prompt.reply ?? "", /During a meeting you can only consult/);
@@ -225,8 +230,8 @@ test("an open meeting limits the assistant to consulting the project", async (t)
   assert.ok(names({ controlTools: true, consult: true }).includes("execute"));
 });
 
-test("switching the assistant off records every message and refuses turns", async (t) => {
-  const { built, project, call, start, say, transcript } = await meetingFixture(t, "off");
+test("switching the assistant off records every message and refuses other turns", async (t) => {
+  const { built, call, start, say, transcript } = await meetingFixture(t, "off");
   const meeting = await start();
 
   const switched = await call("PATCH", `/v1/meetings/${meeting.sessionId}`, { principalId: "member", mode: "off" });
@@ -234,45 +239,44 @@ test("switching the assistant off records every message and refuses turns", asyn
   assert.equal(((await switched.json()) as { meeting: Meeting }).meeting.mode, "off");
 
   const mentioned = await say(meeting, "owner", "assistant, are you there?", { mentionsAssistant: true });
-  assert.equal(mentioned.status, 201);
+  assert.equal(mentioned.status, "silent");
   assert.equal((await built.runs.list()).length, 0);
   assert.match(await transcript(meeting, "member"), /assistant, are you there\?/);
 
-  const direct = await built.app.turn({
-    surface: "web",
-    actor: { externalId: "owner" },
-    conversation: { kind: "group", channelRef: projectGroupRef(project.id), threadRef: meeting.threadRef },
-    text: "answer anyway",
-  });
-  assert.equal(direct.status, "refused");
-  assert.match(direct.reason ?? "", /switched off/);
+  const automated = await say(meeting, "owner", "scheduled check-in", { triggered: true });
+  assert.equal(automated.status, "refused");
+  assert.match(automated.reason ?? "", /switched off/);
+  assert.doesNotMatch(await transcript(meeting, "member"), /scheduled check-in/);
 });
 
 test("judged mode wakes the assistant only when the judge engages", async (t) => {
-  const { built, start, say } = await meetingFixture(t, "judged");
+  const { built, start, say, transcript } = await meetingFixture(t, "judged");
   const meeting = await start({ mode: "judged" });
 
-  const ignored = await say(meeting, "member", "lunch at noon?");
-  assert.equal(ignored.status, 201);
+  assert.equal((await say(meeting, "member", "lunch at noon?")).status, "silent");
   assert.equal((await built.runs.list()).length, 0);
 
   const engaged = await say(meeting, "member", "!engage the plan breaks production");
-  assert.equal(engaged.status, 202);
-  assert.equal(((await engaged.json()) as { status: string }).status, "turn");
+  assert.equal(engaged.status, "queued");
+  assert.ok(engaged.runId);
   assert.equal((await built.runs.list()).length, 1);
+  assert.doesNotMatch(await transcript(meeting, "owner"), /the plan breaks production/);
 });
 
 test("a message that arrives while the assistant is answering steers the live run", async (t) => {
   const { built, start, say } = await meetingFixture(t, "steer");
   const meeting = await start();
   const woken = await say(meeting, "owner", "draft the rollout plan", { mentionsAssistant: true });
-  const runId = ((await woken.json()) as { turn: { runId: string } }).turn.runId;
+  const runId = woken.runId!;
   const { lease } = await built.sessions.acquireLease(meeting.sessionId, "turn");
   assert.ok(lease);
 
-  const steered = await say(meeting, "member", "include the rollback step");
-  assert.equal(steered.status, 202);
-  assert.deepEqual(await steered.json(), { status: "steered", runId });
+  assert.deepEqual(await say(meeting, "member", "include the rollback step"), {
+    status: "queued",
+    runId,
+    steered: true,
+    sessionId: meeting.sessionId,
+  });
   const [signal] = await built.signals.takePending(runId);
   assert.equal(signal?.kind, "steer");
   assert.equal(signal?.text, "Member: include the rollback step");
@@ -281,18 +285,18 @@ test("a message that arrives while the assistant is answering steers the live ru
 
   await built.runs.withdraw(runId);
   const busy = await say(meeting, "member", "anyone there?");
-  assert.equal(busy.status, 409);
-  assert.equal(((await busy.json()) as { error: string }).error, "session_busy");
+  assert.equal(busy.status, "refused");
+  assert.equal(busy.refusalKind, "session_busy");
   await built.sessions.releaseLease(lease);
-  assert.equal((await say(meeting, "member", "anyone there?")).status, 201);
+  assert.equal((await say(meeting, "member", "anyone there?")).status, "silent");
 });
 
 test("ending a meeting captures the whole discussion into project memory once", async (t) => {
   const { built, project, call, start, say } = await meetingFixture(t, "memory");
   const scope = projectScopeId(project.id);
   const meeting = await start({ mode: "off" });
-  assert.equal((await say(meeting, "member", "remember that the launch date is march 3")).status, 201);
-  assert.equal((await say(meeting, "owner", "remember that billing must stay untouched")).status, 201);
+  assert.equal((await say(meeting, "member", "remember that the launch date is march 3")).status, "silent");
+  assert.equal((await say(meeting, "owner", "remember that billing must stay untouched")).status, "silent");
   assert.doesNotMatch(await built.memory.read(scope), /launch date/);
 
   assert.equal((await call("POST", `/v1/meetings/${meeting.sessionId}/end`, { principalId: "owner" })).status, 200);
@@ -307,7 +311,7 @@ test("ending a meeting captures the whole discussion into project memory once", 
 test("ending with outputs opens a follow-up project chat that writes the chosen documents", async (t) => {
   const { built, project, call, start, say } = await meetingFixture(t, "outputs");
   const meeting = await start({ title: "Pricing review" });
-  assert.equal((await say(meeting, "member", "we agreed to add a team tier")).status, 201);
+  assert.equal((await say(meeting, "member", "we agreed to add a team tier")).status, "silent");
 
   const bad = await call("POST", `/v1/meetings/${meeting.sessionId}/end`, { principalId: "owner", outputs: ["poem"] });
   assert.equal(bad.status, 400);
@@ -399,9 +403,9 @@ test("transcript chunks name each speaker and split on message boundaries", () =
 });
 
 test("an ended meeting is locked for messages, settings, and turns", async (t) => {
-  const { built, project, call, start, say, transcript } = await meetingFixture(t, "ended");
+  const { call, start, say, transcript } = await meetingFixture(t, "ended");
   const meeting = await start();
-  assert.equal((await say(meeting, "member", "final decision: ship it")).status, 201);
+  assert.equal((await say(meeting, "member", "final decision: ship it")).status, "silent");
 
   assert.equal((await call("POST", `/v1/meetings/${meeting.sessionId}/end`, { principalId: "outsider" })).status, 404);
   const ended = await call("POST", `/v1/meetings/${meeting.sessionId}/end`, { principalId: "member" });
@@ -412,18 +416,15 @@ test("an ended meeting is locked for messages, settings, and turns", async (t) =
   const again = await call("POST", `/v1/meetings/${meeting.sessionId}/end`, { principalId: "owner" });
   assert.equal(((await again.json()) as { meeting: Meeting }).meeting.endedBy, "member");
 
-  assert.equal((await say(meeting, "owner", "one more thing")).status, 409);
   assert.equal(
     (await call("PATCH", `/v1/meetings/${meeting.sessionId}`, { principalId: "owner", mode: "judged" })).status,
     409,
   );
-  const direct = await built.app.turn({
-    surface: "web",
-    actor: { externalId: "owner" },
-    conversation: { kind: "group", channelRef: projectGroupRef(project.id), threadRef: meeting.threadRef },
-    text: "reopen this",
-  });
-  assert.equal(direct.status, "refused");
-  assert.match(direct.reason ?? "", /meeting has ended/);
+  for (const extra of [{}, { mentionsAssistant: true }, { triggered: true }]) {
+    const refused = await say(meeting, "owner", "reopen this", extra);
+    assert.equal(refused.status, "refused");
+    assert.match(refused.reason ?? "", /meeting has ended/);
+  }
   assert.match(await transcript(meeting, "owner"), /final decision: ship it/);
+  assert.doesNotMatch(await transcript(meeting, "owner"), /reopen this/);
 });
