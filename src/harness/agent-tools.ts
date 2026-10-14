@@ -333,6 +333,7 @@ export interface AgentToolsOptions {
   controlTools?: boolean;
   sandboxResources?: boolean;
   readOnly?: boolean;
+  consult?: boolean;
   surfaceTools?: boolean;
   delegateWork?: boolean;
   surfaceName?: string;
@@ -341,7 +342,7 @@ export interface AgentToolsOptions {
 
 export type CoreToolOptions = Omit<
   AgentToolsOptions,
-  "readOnly" | "surfaceTools" | "surfaceName" | "delegateWork" | "clientTools"
+  "readOnly" | "consult" | "surfaceTools" | "surfaceName" | "delegateWork" | "clientTools"
 >;
 
 export function coreToolOptions(config: Config): CoreToolOptions {
@@ -4365,7 +4366,10 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
     ...clientTools,
   ];
   const mcpNames = new Set(mcpTools.map((t) => t.name));
-  const active = opts?.readOnly ? tools.filter((t) => READ_ONLY_TOOL_NAMES.has(t.name) || mcpNames.has(t.name)) : tools;
+  const consultTools = opts?.consult ? [resourceTool("files", { read })] : [];
+  const active = opts?.readOnly
+    ? [...consultTools, ...tools.filter((t) => READ_ONLY_TOOL_NAMES.has(t.name) || mcpNames.has(t.name))]
+    : tools;
   return active.map((t) =>
     withRetrySafety(
       withRuntimeBarrier(withToolBodyTiming(withToolApprovalGate(t, ref, { recordCall, recordResult }), ref), ref),

@@ -10,6 +10,7 @@ import { test } from "node:test";
 import { createInsecureTestServer } from "../src/api/server.ts";
 import { meetingRoutes } from "../src/api/routes/meetings.ts";
 import { isUserScoped } from "../src/api/user-scoped-routes.ts";
+import { createAgentTools } from "../src/harness/agent-tools.ts";
 import { createMeetingStore, DEFAULT_MEETING_PROMPT, type Meeting } from "../src/meetings/meeting-store.ts";
 import { projectGroupRef } from "../src/projects/project-store.ts";
 import { buildApp } from "../src/wiring.ts";
@@ -175,6 +176,44 @@ test("a mention wakes the assistant with the meeting instructions and the overhe
     prompt: "Keep answers short.",
   });
   assert.equal(((await promptByOwner.json()) as { meeting: Meeting }).meeting.prompt, "Keep answers short.");
+});
+
+test("an open meeting limits the assistant to consulting the project", async (t) => {
+  const { built, project, start } = await meetingFixture(t, "consult");
+  const meeting = await start();
+  const conversation = {
+    kind: "group" as const,
+    channelRef: projectGroupRef(project.id),
+    threadRef: meeting.threadRef,
+  };
+  const ask = (text: string) => built.app.turn({ surface: "web", actor: { externalId: "owner" }, conversation, text });
+
+  const prompt = await ask("!sysprompt");
+  assert.match(prompt.reply ?? "", /During a meeting you can only consult/);
+  for (const attempt of ["!run touch changed-by-the-meeting", "!write notes.txt changed-by-the-meeting"]) {
+    assert.match((await ask(attempt)).reply ?? "", /read-only posture: that tool is unavailable/);
+  }
+  assert.match((await ask("still here?")).reply ?? "", /^You said: still here\?/);
+
+  const names = (opts: Parameters<typeof createAgentTools>[1]) =>
+    createAgentTools({ current: null }, opts)
+      .map((tool) => tool.name)
+      .sort();
+  const consult = createAgentTools({ current: null }, { controlTools: true, readOnly: true, consult: true });
+  assert.deepEqual(consult.map((tool) => tool.name).sort(), [
+    "files",
+    "finish_silently",
+    "history",
+    "memory",
+    "runtime",
+    "subagents",
+  ]);
+  const files = consult.find((tool) => tool.name === "files")!;
+  assert.deepEqual((files.parameters as { properties: { action: { anyOf: unknown[] } } }).properties.action.anyOf, [
+    { const: "read", type: "string" },
+  ]);
+  assert.ok(!names({ controlTools: true, readOnly: true }).includes("files"));
+  assert.ok(names({ controlTools: true, consult: true }).includes("execute"));
 });
 
 test("switching the assistant off records every message and refuses turns", async (t) => {

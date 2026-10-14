@@ -29,12 +29,20 @@ export function renderProjectHomeChannel(channelName: string): string {
   ].join("\n");
 }
 
-export function renderMeetingBlock(prompt: string): string {
+export function renderMeetingBlock(prompt: string, apps: ReadonlyArray<{ name: string; status: string }> = []): string {
   const instructions = prompt.trim();
   return [
     "## Project meeting",
     "This conversation is a live meeting between this project's members. Several people speak here and each message names its author.",
     "Messages tagged as overheard were said to the room rather than to you; treat them as context for the discussion.",
+    "During a meeting you can only consult: read this project's files with the files tool and search memory and this conversation's history. You cannot run commands, write files, publish, or change anything here.",
+    "When the discussion calls for a change, describe it as a plan the members can carry out after the meeting in a regular project conversation.",
+    ...(apps.length
+      ? [
+          "Apps this project has deployed (treat each as production):",
+          ...apps.map((app) => `- ${app.name} (${app.status})`),
+        ]
+      : []),
     ...(instructions ? ["The member who opened the meeting set these instructions for you:", instructions] : []),
   ].join("\n");
 }

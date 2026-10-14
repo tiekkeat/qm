@@ -1122,7 +1122,12 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         };
       }
       const childFloor = delegatedSession?.spawnMeta?.readOnly === true;
-      const strictReadOnly = input.readOnly === true || input.privateSessionMessage === true || childFloor;
+      const meeting =
+        conversation.kind === "group"
+          ? await deps.meetings?.get(conversation.threadRef).catch(swallowAs("orchestrator: meeting read", null))
+          : null;
+      const consult = meeting?.status === "open";
+      const strictReadOnly = input.readOnly === true || input.privateSessionMessage === true || childFloor || consult;
       const useMemory = !external && input.skipMemory !== true;
       const environmentId = external ? scopeId : await resolveEnvironmentId(deps.environments, scopeId);
       const rwLayer = resolution.layers.find((l) => l.mode === "rw");
@@ -1340,11 +1345,15 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
               .catch(swallowAs("orchestrator: project home channel read", undefined))
           : undefined;
       if (homeChannel) systemPrompt += `\n\n${renderProjectHomeChannel(homeChannel.channelName)}`;
-      const meeting =
-        conversation.kind === "group"
-          ? await deps.meetings?.get(conversation.threadRef).catch(swallowAs("orchestrator: meeting read", null))
-          : null;
-      if (meeting?.status === "open") systemPrompt += `\n\n${renderMeetingBlock(meeting.prompt)}`;
+      if (meeting && consult) {
+        const deployments = await deps.deploy
+          .listDeployments()
+          .catch(swallowAs("orchestrator: meeting apps read", null));
+        const apps = (deployments ?? [])
+          .filter((app) => app.ownerScopeId === scopeId && app.status !== "archived")
+          .map((app) => ({ name: app.displayName ?? app.name ?? app.id, status: app.status }));
+        systemPrompt += `\n\n${renderMeetingBlock(meeting.prompt, apps)}`;
+      }
       systemPrompt += cronBlock;
       const sharedFilesBlock = sharedFilesSystemSection(resolution.grantedHandles);
       if (sharedFilesBlock) systemPrompt += `\n\n${sharedFilesBlock}`;
@@ -3789,6 +3798,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
             documents: [...documentInputs.documents],
             ...(Object.keys(requestedRuntime).length ? { runtime: requestedRuntime } : {}),
             ...(strictReadOnly ? { readOnly: true } : {}),
+            ...(consult ? { consult: true } : {}),
             surfaceName,
             delegateWork,
             ...(input.clientTools?.length ? { clientTools: input.clientTools } : {}),
