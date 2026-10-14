@@ -505,6 +505,7 @@ export function createComposerSurface(ctx: ConvCtx, options: ComposerOptions = {
   }
 
   function composerForm(agent: Agent, header: TemplateResult | typeof nothing = nothing): TemplateResult {
+    if (openMeetingFor(ctx.chat.state.threadRef, ctx.chat.state.sessionId)?.meeting?.status === "ended") return html``;
     const activeRuntimeConfig = getRuntimeConfig(scopeKey());
     const selectedModel = currentModelOption();
     if (!selectedModel) {

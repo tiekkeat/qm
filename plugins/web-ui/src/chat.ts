@@ -1558,8 +1558,8 @@ export function createChatSurface(
       content = html`
         <div
           class="custom-chat-shell ${editingApp ? "app-edit-chat" : ""} ${ctx.pane ? "in-pane" : ""} ${ctx.composer.state.dragging ? "dragging" : ""} ${
-            emptyChat && !glanceTier && !editingApp && !meetingSession ? "empty-chat" : ""
-          } ${meetingSession && !glanceTier ? "has-meeting" : ""}"
+            emptyChat && !glanceTier && !editingApp ? "empty-chat" : ""
+          }"
           @dragenter=${(e: DragEvent) => ctx.composer.onDragEnter(e)}
           @dragover=${(e: DragEvent) => ctx.composer.onDragOver(e)}
           @dragleave=${(e: DragEvent) => ctx.composer.onDragLeave(e)}
@@ -1588,8 +1588,7 @@ export function createChatSurface(
           </section>
           <div class="chat-bottom-dock">
             ${goalStrip(agent)} ${ctx.composer.queuedStrip(agent)} ${subagentStrip()}
-            ${swarmUi.strip(chatState.sessionId)} ${backgroundActivityStrip()}
-            ${meetingSession?.meeting?.status === "ended" ? nothing : ctx.composer.composerForm(agent)}
+            ${swarmUi.strip(chatState.sessionId)} ${backgroundActivityStrip()} ${ctx.composer.composerForm(agent)}
             ${ctx.pane ? nothing : suggestions}
           </div>
         </div>

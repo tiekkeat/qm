@@ -13279,10 +13279,12 @@ body.app-edit-embed .custom-chat-shell.app-edit-chat > .chat-bottom-dock {
   white-space: pre-wrap;
   min-width: 80px;
 }
-.custom-chat-shell.has-meeting {
+.custom-chat-shell:has(> .meeting-bar),
+.custom-chat-shell.empty-chat:has(> .meeting-bar) {
   grid-template-rows: auto auto minmax(0, 1fr) auto;
 }
-.custom-chat-shell.in-pane.has-meeting {
+.custom-chat-shell.in-pane:has(> .meeting-bar),
+.custom-chat-shell.in-pane.empty-chat:has(> .meeting-bar) {
   grid-template-rows: auto minmax(0, 1fr) auto;
 }
 .meeting-bar {

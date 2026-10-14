@@ -141,7 +141,7 @@ test("queued turns carry the staged attachments; attachment-only queues are real
   assert.match(fn, /if \(\(!text && !staged\.length\) \|\| !threadRef\) return;/);
   assert.match(fn, /await uploadAttachments\(staged\)/);
   assert.match(fn, /enqueueTurn\(agent, threadRef, text, uploaded, queuedFilesKey\(sendable\)\)/);
-  assert.match(bridge, /attachments: CoreAttachment\[\] = \[\],\n\): Promise<QueuedRun>/);
+  assert.match(bridge, /attachments: CoreAttachment\[\] = \[\],\n\): Promise<QueuedRun \| null>/);
 });
 
 test("Stop pressed before the run id arrives still stops core's run", () => {

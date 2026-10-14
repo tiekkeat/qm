@@ -39,7 +39,7 @@ test("the queue lives in core, not in the browser", () => {
   );
   assert.match(
     bridge,
-    /export async function queueTurn\([\s\S]{0,600}?api<\{ status\?: string; runId\?: string; reason\?: string \}>\("\/api\/turn"/,
+    /export async function queueTurn\([\s\S]{0,600}?api<\{ status\?: string; runId\?: string; reason\?: string; steered\?: boolean \}>\(\s*"\/api\/turn"/,
     "queuing is an ordinary turn submission; core enqueues it behind the live run",
   );
 });
