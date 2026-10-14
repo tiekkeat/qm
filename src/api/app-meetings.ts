@@ -66,7 +66,7 @@ export function createMeetingMethods(
   app: App,
   h: AppHelpers,
 ): {
-  methods: Pick<App, "startMeeting" | "listMeetings" | "updateMeeting" | "endMeeting">;
+  methods: Pick<App, "startMeeting" | "updateMeeting" | "endMeeting">;
   intake: MeetingIntake;
 } {
   const { sessionForViewer } = h;
@@ -257,7 +257,7 @@ export function createMeetingMethods(
     };
   };
 
-  const methods: Pick<App, "startMeeting" | "listMeetings" | "updateMeeting" | "endMeeting"> = {
+  const methods: Pick<App, "startMeeting" | "updateMeeting" | "endMeeting"> = {
     async startMeeting(projectId, principalId, input) {
       if (!deps.meetings || !deps.projects) return { status: "not_found" };
       if (input.mode !== undefined && !isMeetingMode(input.mode)) return { status: "invalid", message: "unknown mode" };
@@ -289,11 +289,6 @@ export function createMeetingMethods(
         detail: JSON.stringify({ mode: meeting.mode }),
       });
       return { status: "ok", meeting };
-    },
-
-    async listMeetings(projectId, principalId) {
-      if (!deps.meetings || !(await isProjectMember(projectId, principalId))) return null;
-      return deps.meetings.listForProject(projectId);
     },
 
     async updateMeeting(sessionId, principalId, patch) {

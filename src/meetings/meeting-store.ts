@@ -45,7 +45,6 @@ export interface MeetingStore {
     prompt?: string;
   }): Promise<Meeting>;
   get(threadRef: string): Promise<Meeting | null>;
-  listForProject(projectId: string): Promise<Meeting[]>;
   update(threadRef: string, patch: { mode?: MeetingMode; prompt?: string }): Promise<Meeting | null>;
   end(threadRef: string, endedBy: string): Promise<{ meeting: Meeting; changed: boolean } | null>;
   attachFollowUp(
@@ -86,11 +85,6 @@ export function createMeetingStore(
     },
     async get(threadRef) {
       return own(await backing.get(threadRef));
-    },
-    async listForProject(projectId) {
-      return (await backing.all())
-        .filter((meeting) => meeting.orgId === configOrgId() && meeting.projectId === projectId)
-        .sort((a, b) => b.startedAt - a.startedAt);
     },
     async update(threadRef, patch) {
       if (!backing.update) throw new Error("meeting store requires DurableMap.update");

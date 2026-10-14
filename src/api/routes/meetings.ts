@@ -42,13 +42,6 @@ function respond(ctx: ApiCtx, result: MeetingOutcome, okStatus = 200): void {
   return sendJson(ctx.res, 404, { error: "not_found" });
 }
 
-async function listMeetings(ctx: ApiCtx): Promise<void> {
-  const principalId = principalOf(ctx, (ctx.url.searchParams.get("principalId") ?? "").trim());
-  if (principalId === null) return;
-  const meetings = await ctx.app.listMeetings(ctx.params.id!, principalId);
-  return meetings ? sendJson(ctx.res, 200, { meetings }) : sendJson(ctx.res, 404, { error: "not_found" });
-}
-
 async function startMeeting(ctx: ApiCtx): Promise<void> {
   const request = bodyPrincipal(ctx);
   if (!request) return;
@@ -83,7 +76,6 @@ async function endMeeting(ctx: ApiCtx): Promise<void> {
 }
 
 export const meetingRoutes: ReadonlyArray<Route<ApiCtx>> = [
-  { method: "GET", path: "/v1/projects/:id/meetings", auth: "source", handle: listMeetings },
   { method: "POST", path: "/v1/projects/:id/meetings", auth: "source", handle: startMeeting },
   { method: "PATCH", path: "/v1/meetings/:sessionId", auth: "source", handle: updateMeeting },
   { method: "POST", path: "/v1/meetings/:sessionId/end", auth: "source", handle: endMeeting },

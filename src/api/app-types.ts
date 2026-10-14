@@ -392,7 +392,6 @@ export interface App {
     principalId: string,
     input: { title?: string; mode?: MeetingMode; prompt?: string },
   ): Promise<MeetingMutation>;
-  listMeetings(projectId: string, principalId: string): Promise<Meeting[] | null>;
   updateMeeting(
     sessionId: string,
     principalId: string,

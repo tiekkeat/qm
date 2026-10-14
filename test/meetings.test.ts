@@ -88,10 +88,9 @@ test("MeetingStore keeps per-meeting settings and locks an ended meeting", async
   assert.equal((await meetings.update(first.threadRef, { mode: "judged" }))?.mode, "judged");
   assert.equal((await meetings.get(second.threadRef))?.mode, "off");
   assert.deepEqual(
-    (await meetings.listForProject("p1")).map((meeting) => meeting.sessionId),
-    ["s2", "s1"],
+    (await meetings.list()).map((meeting) => meeting.sessionId),
+    ["s1", "s2"],
   );
-  assert.deepEqual(await meetings.listForProject("other"), []);
 
   const ended = await meetings.end(first.threadRef, "member");
   assert.equal(ended?.changed, true);
@@ -125,14 +124,6 @@ test("a meeting records member messages for everyone without waking the assistan
   assert.equal(meeting.prompt, DEFAULT_MEETING_PROMPT);
   assert.equal(meeting.projectId, project.id);
   assert.equal((await built.sessions.get(meeting.sessionId))?.title, "Kickoff");
-
-  const listed = await call("GET", `/v1/projects/${project.id}/meetings?principalId=member`);
-  assert.equal(listed.status, 200);
-  assert.deepEqual(
-    ((await listed.json()) as { meetings: Meeting[] }).meetings.map((m) => m.sessionId),
-    [meeting.sessionId],
-  );
-  assert.equal((await call("GET", `/v1/projects/${project.id}/meetings?principalId=outsider`)).status, 404);
 
   assert.deepEqual(await say(meeting, "member", "  we should ship on friday  "), {
     status: "silent",
