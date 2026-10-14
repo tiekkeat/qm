@@ -149,6 +149,13 @@ export interface CoreSession {
   forkBoundarySeq?: number;
   parentSessionId?: string;
   surface?: string;
+  meeting?: {
+    mode: "mention" | "judged" | "off";
+    status: "open" | "ended";
+    prompt: string;
+    startedBy: string;
+    followUpSessionId?: string;
+  };
 }
 
 export function inheritedTranscript(
@@ -518,6 +525,7 @@ export interface TurnOptions {
   harness?: string;
   scopeId?: string | null;
   channelName?: string | null;
+  mentionsAssistant?: boolean;
 }
 
 export interface ActiveRun {
@@ -961,15 +969,16 @@ export async function queueTurn(
   getTurnOptions?: () => TurnOptions,
   idempotencyKey?: string,
   attachments: CoreAttachment[] = [],
-): Promise<QueuedRun> {
-  const submit = await api<{ status?: string; runId?: string; reason?: string }>("/api/turn", {
+): Promise<QueuedRun | null> {
+  const submit = await api<{ status?: string; runId?: string; reason?: string; steered?: boolean }>("/api/turn", {
     method: "POST",
     body: JSON.stringify(
       turnRequestBody(threadRef, text, agent.state.model, agent, getTurnOptions, { idempotencyKey, attachments }),
     ),
   });
   if (submit.status === "pending_approval") throw new Error(submit.reason ?? PENDING_APPROVAL_REASON);
-  if (!submit.runId) throw new Error("Could not queue the message.");
+  if (submit.status === "silent" || submit.steered === true) return null;
+  if (!submit.runId) throw new Error(submit.reason ?? "Could not queue the message.");
   return { runId: submit.runId, text, ...(attachments.length ? { hasAttachments: true } : {}) };
 }
 
@@ -1149,6 +1158,7 @@ function turnRequestBody(
     ...(timezone ? { timezone } : {}),
     ...(turnOptions.scopeId ? { scopeId: turnOptions.scopeId } : {}),
     ...(turnOptions.channelName ? { channelName: turnOptions.channelName } : {}),
+    ...(turnOptions.mentionsAssistant ? { mentionsAssistant: true } : {}),
     ...(attachments.length ? { attachments } : {}),
     ...(idempotencyKey ? { idempotencyKey } : {}),
   };

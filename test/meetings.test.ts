@@ -12,7 +12,8 @@ import { meetingRoutes } from "../src/api/routes/meetings.ts";
 import { isUserScoped } from "../src/api/user-scoped-routes.ts";
 import { createAgentTools } from "../src/harness/agent-tools.ts";
 import { meetingOutputsFolder } from "../src/meetings/meeting-outputs.ts";
-import { createMeetingStore, DEFAULT_MEETING_PROMPT, type Meeting } from "../src/meetings/meeting-store.ts";
+import { createMeetingStore, type Meeting } from "../src/meetings/meeting-store.ts";
+import { DEFAULT_MEETING_PROMPT } from "../plugins/chassis/src/meeting-copy.ts";
 import { transcriptChunks } from "../src/core/orchestrator/turn-helpers.ts";
 import { projectGroupRef, projectScopeId } from "../src/projects/project-store.ts";
 import type { TurnRequest } from "../src/types.ts";
@@ -171,6 +172,10 @@ test("a mention wakes the assistant with the meeting instructions and the overhe
   }
   const history = await transcript(meeting, "member");
   assert.ok(history.indexOf("new plan tier") < history.indexOf("!sysprompt"));
+  const named = (await built.app.getSessionForViewer(meeting.sessionId, "member"))!.entries
+    .filter((entry) => entry.type === "user")
+    .map((entry) => (entry.payload as { name?: string }).name);
+  assert.deepEqual(named, ["Member", "Owner"]);
   const modelRequest = (await built.sessions.listLlmRequests(meeting.sessionId)).at(-1)!.promptEnvelope as {
     messages?: unknown[];
   };

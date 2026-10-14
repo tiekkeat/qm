@@ -156,7 +156,8 @@ export function createTurnMethods(
           const memberMessage = isPersonAuthored(resolveTurnOrigin(req).kind) && !req.approval && !req.proactiveOpener;
           if (memberMessage) {
             const outcome = await meetingIntake({ meeting, actor, request: req });
-            if (outcome !== "wake") return outcome;
+            if (!("wake" in outcome)) return outcome;
+            actor.displayName = outcome.wake;
           } else if (meeting.mode === "off") {
             return { status: "refused", reason: "the assistant is switched off for this meeting" };
           }

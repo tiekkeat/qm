@@ -70,6 +70,9 @@ import {
 } from "./composer-loadout";
 
 import { createModelPicker } from "./model-picker";
+import { loadMeetingMembers, meetingComposerHint, mentionCandidates, openMeetingFor } from "./meeting";
+import { carriesMention, insertMention, mentionQuery, type MentionCandidate } from "./mention";
+import { brandName } from "./ui";
 
 export type ComposerMenu = "effort" | "model" | "settings" | "loadout";
 
@@ -249,6 +252,8 @@ export function createComposerSurface(ctx: ConvCtx, options: ComposerOptions = {
     openMenu: null as ComposerMenu | null,
     menuQuery: "",
     slashDismissed: false,
+    mentionDismissed: false,
+    mentionsAssistant: false,
     get effortLevel(): EffortLevel {
       const selected = currentModelOption();
       const effort =
@@ -327,6 +332,8 @@ export function createComposerSurface(ctx: ConvCtx, options: ComposerOptions = {
   });
   let skillsLoading = false;
   let slashActiveIndex = 0;
+  let mentionActiveIndex = 0;
+  let lastSendMention = false;
   function effectiveFastMode(): boolean {
     return composerState.fastMode === true;
   }
@@ -341,6 +348,9 @@ export function createComposerSurface(ctx: ConvCtx, options: ComposerOptions = {
     composerState.openMenu = null;
     slashActiveIndex = 0;
     composerState.slashDismissed = false;
+    mentionActiveIndex = 0;
+    composerState.mentionDismissed = false;
+    composerState.mentionsAssistant = false;
   }
 
   function scopeKey(): string | null {
@@ -538,6 +548,7 @@ export function createComposerSurface(ctx: ConvCtx, options: ComposerOptions = {
     const attachingDisabled = inputBlocked;
     let placeholder =
       options.placeholder ??
+      meetingComposerHint(openMeetingFor(ctx.chat.state.threadRef, ctx.chat.state.sessionId)) ??
       (appEditSlug(ctx.chat.state.threadRef, appState.me?.user) ? "Describe a change…" : "Ask anything");
     if (inputBlocked) placeholder = runtimePending ? "Loading runtime…" : "Approve or deny to continue";
     else if (agent.state.isStreaming) placeholder = "Queue a message for after this turn…";
@@ -565,7 +576,7 @@ export function createComposerSurface(ctx: ConvCtx, options: ComposerOptions = {
         @submit=${(e: Event) => submitComposer(e, agent)}
         @keydown=${(e: KeyboardEvent) => composerShortcut(e, agent, inputBlocked)}
       >
-        ${header} ${slashMenu(agent)}
+        ${header} ${slashMenu(agent)} ${mentionMenu(agent)}
         ${
           !options.prepareSubmit && activeRuntimeConfig?.upgradeAvailable
             ? html`<div class="runtime-upgrade">
@@ -1183,6 +1194,55 @@ export function createComposerSurface(ctx: ConvCtx, options: ComposerOptions = {
     ctx.chat.drawActiveChat(agent);
   }
 
+  function currentMentionMenu(): MentionCandidate[] {
+    if (composerState.mentionDismissed) return [];
+    const query = mentionQuery(composerState.draft);
+    if (query === null) return [];
+    const session = openMeetingFor(ctx.chat.state.threadRef, ctx.chat.state.sessionId);
+    if (!session) return [];
+    loadMeetingMembers(session.scopeId, () => ctx.chat.drawActiveChat());
+    return mentionCandidates(session, query);
+  }
+
+  function acceptMention(candidate: MentionCandidate, agent: Agent): void {
+    composerState.draft = insertMention(composerState.draft, candidate.name);
+    if (candidate.assistant) composerState.mentionsAssistant = true;
+    persistDraft();
+    mentionActiveIndex = 0;
+    ctx.chat.drawActiveChat(agent);
+    focusComposerEnd();
+  }
+
+  function noteSendMention(text: string): void {
+    lastSendMention = composerState.mentionsAssistant && carriesMention(text, brandName());
+  }
+
+  function mentionMenu(agent: Agent): TemplateResult | typeof nothing {
+    const candidates = currentMentionMenu();
+    if (!candidates.length) return nothing;
+    const active = Math.min(mentionActiveIndex, candidates.length - 1);
+    return html`
+      <div class="slash-popover mention-popover" role="listbox" aria-label="Mention">
+        <div class="menu-title">Mention</div>
+        ${candidates.map(
+          (candidate, i) => html`
+            <button
+              type="button"
+              role="option"
+              aria-selected=${i === active ? "true" : "false"}
+              class="slash-option ${i === active ? "active" : ""}"
+              @mousedown=${(e: Event) => e.preventDefault()}
+              @click=${() => acceptMention(candidate, agent)}
+            >
+              <span class="slash-name"><b>${candidate.name}</b></span>
+              <span class="slash-desc">${candidate.assistant ? "Assistant: answers this message" : "Member"}</span>
+            </button>
+          `,
+        )}
+      </div>
+    `;
+  }
+
   function slashMenu(agent: Agent): TemplateResult | typeof nothing {
     const slash = currentSlashMenu();
     if (!slash.open) return nothing;
@@ -1243,11 +1303,14 @@ export function createComposerSurface(ctx: ConvCtx, options: ComposerOptions = {
     composerState.error = "";
     composerState.slashDismissed = false;
     slashActiveIndex = 0;
+    composerState.mentionDismissed = false;
+    mentionActiveIndex = 0;
     const armed = slashQuery(composerState.draft) !== null;
     if (armed && skillsCache === null && !skillsLoading) void loadSkills(agent);
     const popoverShown = Boolean(ctx.chat.state.host?.querySelector(".slash-popover"));
     if (
       armed ||
+      mentionQuery(composerState.draft) !== null ||
       popoverShown ||
       hadError ||
       (Boolean(appState.me?.suggestedActivities?.length) && wasEmpty !== !composerState.draft)
@@ -1295,6 +1358,24 @@ export function createComposerSurface(ctx: ConvCtx, options: ComposerOptions = {
     // conversion — it must never send. Safari reports composition Enter with
     // keyCode 229 and may fire after compositionend, so check both.
     if (e.isComposing || e.keyCode === 229) return;
+    const mentions = currentMentionMenu();
+    if (mentions.length) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        composerState.mentionDismissed = true;
+        return ctx.chat.drawActiveChat(agent);
+      }
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        const step = e.key === "ArrowDown" ? 1 : mentions.length - 1;
+        mentionActiveIndex = (Math.min(mentionActiveIndex, mentions.length - 1) + step) % mentions.length;
+        return ctx.chat.drawActiveChat(agent);
+      }
+      if (!e.shiftKey && (e.key === "Enter" || e.key === "Tab")) {
+        e.preventDefault();
+        return acceptMention(mentions[Math.min(mentionActiveIndex, mentions.length - 1)]!, agent);
+      }
+    }
     const slash = currentSlashMenu();
     if (slash.open) {
       if (e.key === "Escape") {
@@ -1356,6 +1437,8 @@ export function createComposerSurface(ctx: ConvCtx, options: ComposerOptions = {
     const text = composerState.draft.trim();
     const staged = composerState.attachments;
     if ((!text && !staged.length) || !threadRef) return;
+    noteSendMention(text);
+    composerState.mentionsAssistant = false;
     clearActiveDraft();
     composerState.draft = "";
     composerState.attachments = [];
@@ -1402,7 +1485,8 @@ export function createComposerSurface(ctx: ConvCtx, options: ComposerOptions = {
     try {
       const queued = await queueTurn(threadRef, text, agent, ctx.chat.currentTurnOptions, idempotencyKey, attachments);
       failedQueueSend = null;
-      setQueuedRuns(threadRef, [...queuedRunsFor(threadRef).filter((r) => r.runId !== queued.runId), queued]);
+      if (queued)
+        setQueuedRuns(threadRef, [...queuedRunsFor(threadRef).filter((r) => r.runId !== queued.runId), queued]);
       bumpSessionActivity(threadRef);
       return true;
     } catch (err) {
@@ -1516,6 +1600,7 @@ export function createComposerSurface(ctx: ConvCtx, options: ComposerOptions = {
     if (agent.state.isStreaming) return queueDraft(agent);
     const text = composerState.draft.trim();
     if (!text && composerState.attachments.length === 0) return;
+    noteSendMention(text);
     const submit = options.prepareSubmit?.();
     if (submit) {
       const selected = currentModelOption()!;
@@ -2065,6 +2150,7 @@ export function createComposerSurface(ctx: ConvCtx, options: ComposerOptions = {
     },
     resizeComposer,
     currentModelOption,
+    sentMention: () => lastSendMention,
     carryModelPick,
     refreshRuntimeSelection,
     onDragEnter,

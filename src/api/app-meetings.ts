@@ -59,7 +59,7 @@ export type MeetingIntake = (input: {
   meeting: Meeting;
   actor: Principal;
   request: TurnRequest;
-}) => Promise<"wake" | TurnResult>;
+}) => Promise<{ wake: string } | TurnResult>;
 
 export function createMeetingMethods(
   deps: AppDeps,
@@ -202,7 +202,8 @@ export function createMeetingMethods(
   }
 
   const intake: MeetingIntake = async ({ meeting, actor, request }) => {
-    if (meeting.mode !== "off" && request.mentionsAssistant === true) return "wake";
+    const name = actor.displayName?.trim() || (await speakerName(actor.id)) || actor.id;
+    if (meeting.mode !== "off" && request.mentionsAssistant === true) return { wake: name };
     const session = await deps.sessions.getByThread(meeting.threadRef);
     if (!session || session.id !== meeting.sessionId)
       return { status: "refused", reason: "this meeting's conversation is unavailable" };
@@ -214,12 +215,11 @@ export function createMeetingMethods(
       return { status: "refused", reason: `a meeting message is capped at ${MAX_MEETING_MESSAGE_CHARS} characters` };
 
     const at = Date.now();
-    const name = actor.displayName?.trim() || (await speakerName(actor.id));
     const payload: OverheardEntryPayload = {
       overheard: true,
       ts: messageTs(at, Math.floor(Math.random() * 1000)),
       text,
-      ...(name ? { name } : {}),
+      name,
     };
     if (
       meeting.mode === "judged" &&
@@ -229,10 +229,10 @@ export function createMeetingMethods(
         text,
         createdAt: at,
         authorId: actor.id,
-        ...(name ? { authorName: name } : {}),
+        authorName: name,
       }))
     )
-      return "wake";
+      return { wake: name };
 
     const messageKey = request.idempotencyKey ? `meeting:${actor.id}:${request.idempotencyKey}` : undefined;
     if (await record(session, payload, messageKey)) {
@@ -241,10 +241,14 @@ export function createMeetingMethods(
     }
     const live = await deps.runs.activeForThread(session.threadRef);
     if (live && !isTerminal(live.status)) {
-      const attributed = name ? { ...request, actor: { ...request.actor, displayName: name } } : request;
       const steer = await app.signalRun(
         live.id,
-        { kind: "steer", text, ts: payload.ts, request: attributed },
+        {
+          kind: "steer",
+          text,
+          ts: payload.ts,
+          request: { ...request, actor: { ...request.actor, displayName: name } },
+        },
         actor.id,
       );
       if (steer.accepted || steer.replayed)

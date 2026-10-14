@@ -1,20 +1,13 @@
 import { orgId as configOrgId } from "../config.ts";
+import { DEFAULT_MEETING_PROMPT, MEETING_MODES, type MeetingMode } from "../../plugins/chassis/src/meeting-copy.ts";
 import { createMemoryMap, type DurableMap } from "../persistence/durable-map.ts";
 import type { MeetingOutput } from "./meeting-outputs.ts";
 
-const MEETING_MODES = ["mention", "judged", "off"] as const;
-export type MeetingMode = (typeof MEETING_MODES)[number];
+export type { MeetingMode };
 type MeetingSurface = "web" | "slack";
 
 const DEFAULT_MEETING_MODE: MeetingMode = "mention";
 export const MAX_MEETING_PROMPT_CHARS = 20_000;
-
-export const DEFAULT_MEETING_PROMPT = [
-  "You are the moderator of this project meeting.",
-  "Ground every suggestion in what this project already has: its files, documents, architecture, memory, and deployed apps.",
-  "Combine the members' ideas into feasible plans that do not break anything already running in production.",
-  "If a proposal would break a production app or require a major architecture change, say so plainly and repeat the warning until the members acknowledge it.",
-].join("\n");
 
 export interface Meeting {
   threadRef: string;

@@ -176,6 +176,7 @@ import {
   openSession,
   syncWorkingPulse,
 } from "./sessions";
+import { meetingBar, openMeetingFor } from "./meeting";
 import {
   backgroundLabel,
   clearWorking,
@@ -675,6 +676,7 @@ export function createChatSurface(
       harness,
       scopeId: chatState.scopeId,
       channelName: chatState.contextName,
+      ...(ctx.composer.sentMention() ? { mentionsAssistant: true } : {}),
     };
   }
 
@@ -1527,6 +1529,7 @@ export function createChatSurface(
           ),
         )
       : nothing;
+    const meetingSession = openMeetingFor(chatState.threadRef, chatState.sessionId);
     let content: TemplateResult;
     if (ctx.inbox) {
       content = assistantSidebar({
@@ -1555,8 +1558,8 @@ export function createChatSurface(
       content = html`
         <div
           class="custom-chat-shell ${editingApp ? "app-edit-chat" : ""} ${ctx.pane ? "in-pane" : ""} ${ctx.composer.state.dragging ? "dragging" : ""} ${
-            emptyChat && !glanceTier && !editingApp ? "empty-chat" : ""
-          }"
+            emptyChat && !glanceTier && !editingApp && !meetingSession ? "empty-chat" : ""
+          } ${meetingSession && !glanceTier ? "has-meeting" : ""}"
           @dragenter=${(e: DragEvent) => ctx.composer.onDragEnter(e)}
           @dragover=${(e: DragEvent) => ctx.composer.onDragOver(e)}
           @dragleave=${(e: DragEvent) => ctx.composer.onDragLeave(e)}
@@ -1570,6 +1573,7 @@ export function createChatSurface(
               : nothing
           }
           ${glanceTier || ctx.pane || editingApp ? nothing : sessionTopbar()}
+          ${glanceTier ? nothing : meetingBar(meetingSession, appState.me?.user, () => drawActiveChat())}
           ${glanceTier ? paneGlance(agent, messages, glanceTier) : nothing}
           <section class="chat-scroll" tabindex="0" aria-label="Conversation">
             ${pinnedStrip()}
@@ -1584,13 +1588,16 @@ export function createChatSurface(
           </section>
           <div class="chat-bottom-dock">
             ${goalStrip(agent)} ${ctx.composer.queuedStrip(agent)} ${subagentStrip()}
-            ${swarmUi.strip(chatState.sessionId)} ${backgroundActivityStrip()} ${ctx.composer.composerForm(agent)}
+            ${swarmUi.strip(chatState.sessionId)} ${backgroundActivityStrip()}
+            ${meetingSession?.meeting?.status === "ended" ? nothing : ctx.composer.composerForm(agent)}
             ${ctx.pane ? nothing : suggestions}
           </div>
         </div>
       `;
     }
     render(content, chatState.host);
+    const meetingDialog = chatState.host.querySelector<HTMLDialogElement>("dialog.meeting-dialog");
+    if (meetingDialog && !meetingDialog.open) meetingDialog.showModal();
     transcriptViewport.afterRender();
     const host = chatState.host;
     requestAnimationFrame(() => {

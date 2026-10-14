@@ -121,6 +121,8 @@ interface ComposerState {
   dragging: boolean;
   openMenu: ComposerMenu | null;
   slashDismissed: boolean;
+  mentionDismissed: boolean;
+  mentionsAssistant: boolean;
   effortLevel: EffortLevel;
   fastMode: boolean | undefined;
   pasteView: { id: string; text: string; initial: string; dirty: boolean } | null;
@@ -142,6 +144,7 @@ export interface ComposerSurface {
   sendSuggestedPrompt(prompt: string, agent: Agent): Promise<void>;
   resizeComposer(): void;
   currentModelOption(): ModelOption | undefined;
+  sentMention(): boolean;
   carryModelPick(fromThreadRef: string | null, toThreadRef: string): void;
   refreshRuntimeSelection(scopeId: string | null, agent?: Agent, refresh?: boolean): Promise<void>;
   onDragEnter(e: DragEvent): void;

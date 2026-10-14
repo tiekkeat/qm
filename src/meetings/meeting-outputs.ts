@@ -1,5 +1,7 @@
-export const MEETING_OUTPUTS = ["minutes", "action_plan", "tasks"] as const;
-export type MeetingOutput = (typeof MEETING_OUTPUTS)[number];
+import { MEETING_OUTPUTS, type MeetingOutput } from "../../plugins/chassis/src/meeting-copy.ts";
+
+export { MEETING_OUTPUTS };
+export type { MeetingOutput };
 
 const OUTPUT_SPECS: Record<MeetingOutput, { file: string; label: string; brief: string }> = {
   minutes: {
