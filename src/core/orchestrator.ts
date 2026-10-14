@@ -266,13 +266,15 @@ const CONNECTOR_HOSTS = Object.values(PROVIDERS).flatMap((p) => p.hosts);
 const INSTANCE_CACHE_MAX_ENTRIES = 5_000;
 const DIRECTORY_INDEX_CACHE_MAX_ENTRIES = 100;
 
-const UNTRACKED_CAPTURE_CONTEXT = {
-  id: "untracked-turn-context",
-  text: "",
-  sensitivity: "unknown" as const,
-  sources: [],
-  sourceUnknown: true,
-};
+function untrackedCaptureContext() {
+  return {
+    id: "untracked-turn-context",
+    text: "",
+    sensitivity: "unknown" as const,
+    sources: [],
+    sourceUnknown: true,
+  };
+}
 
 export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
   if (deps.sessions.leaseTtlMs < MIN_SESSION_LEASE_TTL_MS) {
@@ -581,7 +583,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           await onTurnEnd({
             scopeId: memoryScopeId,
             conversationScopeId: session.scopeId,
-            inheritedRecords: [UNTRACKED_CAPTURE_CONTEXT],
+            inheritedRecords: [untrackedCaptureContext()],
             input,
             reply: "",
             actorId,
@@ -2228,7 +2230,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           input.overheard?.length ||
           input.attachments?.length ||
           input.inboundNotes
-            ? [UNTRACKED_CAPTURE_CONTEXT]
+            ? [untrackedCaptureContext()]
             : []),
         ];
         if (memoryContextChanged) {
