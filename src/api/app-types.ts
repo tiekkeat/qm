@@ -112,6 +112,7 @@ import type { ModelProviderAvailability } from "../model/pi-models.ts";
 import type { RuntimeChoice } from "../harness/harness.ts";
 import { type ReachOpts, type ReachResolution, type ReachTarget } from "../reach/reach.ts";
 import { type Project, type ProjectStore } from "../projects/project-store.ts";
+import type { Meeting, MeetingMode, MeetingStore } from "../meetings/meeting-store.ts";
 import type { SearchHit } from "../search/core-search.ts";
 
 interface DeploymentVersionView {
@@ -210,6 +211,18 @@ export type ProjectView = Project & {
 type ProjectViewMutation =
   | { status: "ok"; project: ProjectView; changed: boolean }
   | { status: "not_found" | "forbidden" | "invalid_member" | "invalid_name" | "invalid_channel" | "channel_in_use" };
+
+type MeetingMutation =
+  | { status: "ok"; meeting: Meeting }
+  | { status: "not_found" | "forbidden" | "ended" }
+  | { status: "invalid"; message: string };
+
+type MeetingMessageResult =
+  | { status: "recorded"; seq: number }
+  | { status: "turn"; turn: TurnResult }
+  | { status: "steered"; runId: string }
+  | { status: "not_found" | "ended" | "busy" }
+  | { status: "invalid"; message: string };
 
 interface DeploymentGitUrl {
   url: string;
@@ -380,6 +393,23 @@ export interface App {
   removeProjectMember(id: string, principalId: string, memberId: string): Promise<ProjectViewMutation>;
   setProjectSlackChannel(id: string, principalId: string, channel: string | null): Promise<ProjectViewMutation>;
   renameProject(id: string, principalId: string, name: string): Promise<ProjectViewMutation>;
+  startMeeting(
+    projectId: string,
+    principalId: string,
+    input: { title?: string; mode?: MeetingMode; prompt?: string },
+  ): Promise<MeetingMutation>;
+  listMeetings(projectId: string, principalId: string): Promise<Meeting[] | null>;
+  updateMeeting(
+    sessionId: string,
+    principalId: string,
+    patch: { mode?: MeetingMode; prompt?: string },
+  ): Promise<MeetingMutation>;
+  endMeeting(sessionId: string, principalId: string): Promise<MeetingMutation>;
+  postMeetingMessage(
+    sessionId: string,
+    principalId: string,
+    input: { text: string; mentionsAssistant?: boolean; idempotencyKey?: string },
+  ): Promise<MeetingMessageResult>;
   updateSession(
     sessionId: string,
     principalId: string,
@@ -661,6 +691,7 @@ export interface AppDeps {
   directory: DirectoryStore;
   emailAuthMembers?: DirectoryMember[];
   projects?: ProjectStore;
+  meetings?: MeetingStore;
   deploy: DeployService;
   deployAppsDomain?: string;
   deploymentLayer?: DeploymentLayerRuntime;

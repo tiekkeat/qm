@@ -147,6 +147,11 @@ export function createTurnMethods(
         projectName = project.name;
         projectVersion = String(project.updatedAt);
         sessionParticipantIds = [...activeMemberIds];
+        const meeting = await deps.meetings?.get(req.conversation.threadRef);
+        if (meeting?.status === "ended")
+          return { status: "refused", reason: "this meeting has ended; start a new meeting or chat to continue" };
+        if (meeting?.mode === "off")
+          return { status: "refused", reason: "the assistant is switched off for this meeting" };
       } else if (req.surface === "web" && req.conversation.kind !== "dm") {
         if (!conversationRef || !(await mayUseSharedScope(req.conversation.kind, conversationRef, actor))) {
           return { status: "refused", reason: "you're not a member of that context" };

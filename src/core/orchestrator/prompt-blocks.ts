@@ -29,6 +29,16 @@ export function renderProjectHomeChannel(channelName: string): string {
   ].join("\n");
 }
 
+export function renderMeetingBlock(prompt: string): string {
+  const instructions = prompt.trim();
+  return [
+    "## Project meeting",
+    "This conversation is a live meeting between this project's members. Several people speak here and each message names its author.",
+    "Messages tagged as overheard were said to the room rather than to you; treat them as context for the discussion.",
+    ...(instructions ? ["The member who opened the meeting set these instructions for you:", instructions] : []),
+  ].join("\n");
+}
+
 const OBLIGATIONS_CAP = 10;
 function cronSchedulePromptLabel(c: Cron): string {
   const schedule = c.schedule;

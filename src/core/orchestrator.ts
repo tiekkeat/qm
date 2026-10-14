@@ -210,6 +210,7 @@ import {
   currentTimeBlock,
   deliveryMenu,
   renderConversationRoster,
+  renderMeetingBlock,
   renderProjectHomeChannel,
   renderReachRoster,
   renderStandingObligations,
@@ -1339,6 +1340,11 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
               .catch(swallowAs("orchestrator: project home channel read", undefined))
           : undefined;
       if (homeChannel) systemPrompt += `\n\n${renderProjectHomeChannel(homeChannel.channelName)}`;
+      const meeting =
+        conversation.kind === "group"
+          ? await deps.meetings?.get(conversation.threadRef).catch(swallowAs("orchestrator: meeting read", null))
+          : null;
+      if (meeting?.status === "open") systemPrompt += `\n\n${renderMeetingBlock(meeting.prompt)}`;
       systemPrompt += cronBlock;
       const sharedFilesBlock = sharedFilesSystemSection(resolution.grantedHandles);
       if (sharedFilesBlock) systemPrompt += `\n\n${sharedFilesBlock}`;
