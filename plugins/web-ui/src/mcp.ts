@@ -686,9 +686,9 @@ function draw() {
                     >Access<select
                       .value=${filter}
                       @change=${(event: Event) => {
-                      filter = (event.target as HTMLSelectElement).value;
-                      draw();
-                    }}
+                        filter = (event.target as HTMLSelectElement).value;
+                        draw();
+                      }}
                     >
                       <option value="all">All</option>
                       <option value="mine">Mine</option>
@@ -700,9 +700,9 @@ function draw() {
                     >Project<select
                       .value=${projectFilter}
                       @change=${(event: Event) => {
-                      projectFilter = (event.target as HTMLSelectElement).value;
-                      draw();
-                    }}
+                        projectFilter = (event.target as HTMLSelectElement).value;
+                        draw();
+                      }}
                     >
                       <option value="">All projects</option>
                       ${inventory.projects.map((project) => html`<option value=${project.scopeId}>${project.name}</option>`)}
