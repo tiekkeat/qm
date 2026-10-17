@@ -32,7 +32,6 @@ function writeJsonAtomically(path: string, value: JsonObject): void {
   }
 }
 
-/** Atomically replace a Codex auth.json with 0600 permissions. */
 export function writeCodexOAuthAuthFile(path: string, auth: JsonObject): void {
   writeJsonAtomically(path, auth);
 }

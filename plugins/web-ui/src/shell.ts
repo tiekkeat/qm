@@ -45,10 +45,12 @@ import {
   type CoreSession,
   type PendingApproval,
   type TranscriptPage,
+  loadChatPrefs,
 } from "./core-bridge";
 import { seedRuntimeConfig } from "./runtime-config-store";
 import { errMessage, swallow } from "../../chassis/src/errors";
-import { brandMark, brandName, icon } from "./ui";
+import { brandMark, brandName } from "./ui";
+import { icon } from "./icons";
 import { PHONE_MAX_WIDTH, trackVisualViewport } from "./viewport";
 import { markConnectorConnected } from "./chat";
 import { clearSkillsCache, resyncModelSelection } from "./composer";
@@ -1111,6 +1113,7 @@ export async function boot(): Promise<void> {
   const runtimeConfigFetch = fetchRuntimeConfig();
   const remoteSplitFetch = fetchRemoteSplit();
   const openNewChatFetch = loadOpenNewChat();
+  void loadChatPrefs();
 
   let r: Response;
   try {
@@ -1249,3 +1252,7 @@ export async function boot(): Promise<void> {
     mainConversation().newChat();
   }
 }
+
+window.addEventListener("qm:prepare-update", (event) => {
+  (event as CustomEvent<{ ready: boolean }>).detail.ready = true;
+});

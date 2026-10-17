@@ -7,13 +7,14 @@ import type { ScopeId } from "../types.ts";
 import { orgScope } from "../config.ts";
 import {
   defaultModelForHarness,
+  harnessIdOrPi,
   isHarnessId,
   modelProviderAvailabilityFor,
   modelSupportedByHarness,
   serviceableModelIds,
   ALL_PROVIDERS_AVAILABLE,
   fastModeModelIds,
-  safeModelMetadata,
+  modelCatalogFor,
   modelOfferedInWebui,
   modelUnavailableReason,
   thinkingLevelsForHarness,
@@ -39,7 +40,7 @@ export type RuntimeDeps = Partial<
 > & { baseModelDefault?: string };
 
 export function runtimeFallback(ctx: { deps: RuntimeDeps }): { harnessId: HarnessId; modelId: string } {
-  const harnessId = isHarnessId(ctx.deps.harnessId) ? ctx.deps.harnessId : "pi";
+  const harnessId = harnessIdOrPi(ctx.deps.harnessId);
   const gatewayIds = gatewayModelCatalog(true).map((model) => model.id);
   const providers =
     gatewayIds.length && ctx.deps.providerKeys
@@ -249,12 +250,7 @@ export async function runtimeConfigBody(
     }
   }
   const advertisedModelIds = new Set(Object.values(modelsByHarness).flat());
-  const modelCatalog = Object.fromEntries(
-    [...advertisedModelIds].flatMap((id) => {
-      const metadata = safeModelMetadata(id);
-      return metadata ? [[id, metadata]] : [];
-    }),
-  );
+  const modelCatalog = modelCatalogFor(advertisedModelIds);
   return {
     scopeId: scope,
     ...(purpose ? { executionPurpose: purpose } : {}),

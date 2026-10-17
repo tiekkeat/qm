@@ -233,9 +233,10 @@ test("reachExec OFF: the execute scope never accepts a room", () => {
   const [scratchOnly] = createAgentTools(ref, { scratchExec: true });
   const scopeSchema = (scratchOnly as unknown as { parameters: { properties: { scope?: { anyOf?: unknown[] } } } })
     .parameters.properties.scope;
-  assert.ok(
-    Array.isArray(scopeSchema?.anyOf),
-    "scratch-only scope is a closed union (scratch|scoped), not a free room string",
+  assert.equal(
+    scopeSchema,
+    undefined,
+    "scratch selection is handled by sandbox_id rather than a legacy scope parameter",
   );
 });
 
@@ -244,6 +245,7 @@ test("reachExec ON (no scratch): scope is a free string; a room routes to reachT
   const [execute] = createAgentTools({ current: tc }, { reachExec: true });
   assert.deepEqual(schemaProps(execute!), [
     "command",
+    "background",
     "sandbox_id",
     "purpose",
     "timeout_seconds",
@@ -251,13 +253,13 @@ test("reachExec ON (no scratch): scope is a free string; a room routes to reachT
     "scope",
     "retrySafe",
   ]);
-  await call(execute, { command: "cat x", scope: "#project-alpha" });
+  await call(execute, { command: "cat x", scope: "#project-alpha", purpose: "Run test command" });
   assert.deepEqual(seen.at(-1)!.opts, { reachTarget: "#project-alpha" });
-  await call(execute, { command: "echo hi" });
+  await call(execute, { command: "echo hi", purpose: "Run test command" });
   assert.deepEqual(seen.at(-1)!.opts, undefined, "omitted scope = the scoped box");
-  await call(execute, { command: "echo hi", scope: "scoped" });
+  await call(execute, { command: "echo hi", scope: "scoped", purpose: "Run test command" });
   assert.deepEqual(seen.at(-1)!.opts, undefined);
-  const err = textOf(await call(execute, { command: "x", scope: "scratch" }));
+  const err = textOf(await call(execute, { command: "x", scope: "scratch", purpose: "Run test command" }));
   assert.match(err, /scratch box isn't available here/);
 });
 
@@ -266,6 +268,7 @@ test("reachExec ON + scratchExec ON: scope accepts scoped, scratch, AND a room",
   const [execute] = createAgentTools({ current: tc }, { reachExec: true, scratchExec: true });
   assert.deepEqual(schemaProps(execute!), [
     "command",
+    "background",
     "sandbox_id",
     "purpose",
     "timeout_seconds",
@@ -274,24 +277,24 @@ test("reachExec ON + scratchExec ON: scope accepts scoped, scratch, AND a room",
     "durable",
     "retrySafe",
   ]);
-  await call(execute, { command: "x", scope: "scratch" });
+  await call(execute, { command: "x", scope: "scratch", purpose: "Run test command" });
   assert.deepEqual(seen.at(-1)!.opts, { scratch: true });
-  await call(execute, { command: "x", scope: "#ops" });
+  await call(execute, { command: "x", scope: "#ops", purpose: "Run test command" });
   assert.deepEqual(seen.at(-1)!.opts, { reachTarget: "#ops" });
-  await call(execute, { command: "x" });
+  await call(execute, { command: "x", purpose: "Run test command" });
   assert.deepEqual(seen.at(-1)!.opts, undefined);
-  const e = textOf(await call(execute, { command: "x", scope: "scratch", durable: true }));
+  const e = textOf(await call(execute, { command: "x", scope: "scratch", durable: true, purpose: "Run test command" }));
   assert.match(e, /scratch box cannot be made durable/);
 });
 
 test("reachExec ON: the scoped/scratch keywords match case-insensitively, never routed as a room", async () => {
   const { tc, seen } = sinkToolContext();
   const [execute] = createAgentTools({ current: tc }, { reachExec: true, scratchExec: true });
-  await call(execute, { command: "x", scope: "Scoped" });
+  await call(execute, { command: "x", scope: "Scoped", purpose: "Run test command" });
   assert.deepEqual(seen.at(-1)!.opts, undefined, '"Scoped" is the scoped box, not a reach target');
-  await call(execute, { command: "x", scope: "SCRATCH" });
+  await call(execute, { command: "x", scope: "SCRATCH", purpose: "Run test command" });
   assert.deepEqual(seen.at(-1)!.opts, { scratch: true }, '"SCRATCH" is the scratch box, not a reach target');
-  await call(execute, { command: "x", scope: "#project-alpha" });
+  await call(execute, { command: "x", scope: "#project-alpha", purpose: "Run test command" });
   assert.deepEqual(
     seen.at(-1)!.opts,
     { reachTarget: "#project-alpha" },
@@ -318,7 +321,7 @@ test("Trap 1: a reach result prefixes provenance and keeps the SESSION scope lab
     orgScopeId: scopeId("org", "default-org"),
   };
   const [execute] = createAgentTools(ref, { reachExec: true });
-  const r = await call(execute, { command: "cat x", scope: "#project-alpha" });
+  const r = await call(execute, { command: "cat x", scope: "#project-alpha", purpose: "Run test command" });
   assert.match(textOf(r), /\[ran on #project-alpha's computer\]/);
   const toolResult = emitted.find((e) => e.type === "tool_result")!;
   assert.equal(
@@ -341,8 +344,8 @@ async function roomApp() {
   await built.directory.replaceChannels([{ channelId: "C-ph", name: "project-alpha" }]);
   const room = scopeId("channel", "C-ph");
   const resources = built.sandboxResources.forTurn({ actorId: "U1", scopeId: room, isCurrent: async () => true });
-  const record = await resources.create("U1", room, resources.defaultBackend(), "project-alpha", "room-ph");
-  await resources.setDefault("U1", room, record.id);
+  const record = await resources.create("admin-alice", room, resources.defaultBackend(), "project-alpha", "room-ph");
+  await resources.setDefault("admin-alice", room, record.id);
   return built;
 }
 
@@ -389,7 +392,6 @@ test("reach preserves a durable workspace even without a login-probe cache", asy
 
 test("reach teardown keeps (does not destroy) a room with its own computer", async () => {
   const built = await roomApp();
-  await built.livenessCache.put({ scopeId: scopeId("channel", "C-ph"), checkedAt: 1, connectors: {} });
   await built.app.turn(dm("!reach #project-alpha echo hi"));
   assert.ok(
     fakeSprites.names().some((n) => n.startsWith("qm-sandbox-room-ph-")),

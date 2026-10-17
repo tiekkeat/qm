@@ -75,7 +75,10 @@ test("shared Codex grants target the selected principal and reload their status"
   };
   await state.load("org:test");
   await state.setGrant("USER@EXAMPLE.COM", true);
-  assert.deepEqual(calls.find(([method]) => method === "PUT"), ["PUT", "/api/shared-codex/grants/USER%40EXAMPLE.COM"]);
+  assert.deepEqual(
+    calls.find(([method]) => method === "PUT"),
+    ["PUT", "/api/shared-codex/grants/USER%40EXAMPLE.COM"],
+  );
   assert.deepEqual(state.shared.grantees, ["user@example.com"]);
   await state.setGrant("user@example.com", false);
   assert.deepEqual(state.shared.grantees, []);

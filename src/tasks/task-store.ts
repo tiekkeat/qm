@@ -1,6 +1,4 @@
-export const TASK_STATUSES = ["pending", "in_progress", "completed", "skipped", "failed"] as const;
-
-export type TaskStatus = (typeof TASK_STATUSES)[number];
+export type TaskStatus = "pending" | "in_progress" | "completed" | "skipped" | "failed";
 export type TaskEventType = "created" | "status_changed";
 
 export interface Task {

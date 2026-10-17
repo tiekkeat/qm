@@ -3,7 +3,7 @@ export interface AgentSelection {
   version: number;
   test?: true;
 }
-export interface AgentFile {
+interface AgentFile {
   path: string;
   content: string;
   encoding?: "base64";

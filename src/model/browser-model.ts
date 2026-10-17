@@ -19,9 +19,10 @@ export async function resolveBrowserModel(input: {
   if (account === "shared-openai") {
     const available = await input.credentials?.hasSharedGrant(input.actorId);
     const status = available ? await input.credentials?.sharedStatus() : undefined;
-    const credential = status?.connected && !status.needsReconnect
-      ? ({ provider: "openai", kind: "oauth", oauth: {}, updatedAt: 0 } as const)
-      : null;
+    const credential =
+      status?.connected && !status.needsReconnect
+        ? ({ provider: "openai", kind: "oauth", oauth: {}, updatedAt: 0 } as const)
+        : null;
     const routing = resolveIndividualAuthRouting(null, credential, requested, "pi");
     return { account, model: routing?.model, routing };
   }

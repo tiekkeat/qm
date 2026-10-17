@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   image:
-    if: github.ref == 'refs/heads/main'
+    if: github.repository == 'yc-software/qm' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

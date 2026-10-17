@@ -4,8 +4,20 @@ import { spawnDockerExec, type DockerExec } from "../sandbox/docker-exec.ts";
 import { errMessage } from "../util/errors.ts";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { redactSecrets } from "../harness/redact-secrets.ts";
+import {
+  appBoot,
+  appGone,
+  appLogs,
+  appReporter,
+  recentAppChecks,
+  waitAppReady,
+  type AppErrorSink,
+  type Exec,
+} from "./shared-deploy-provider.ts";
 
 const APP_PORT = 8080;
+const APP_READY_WINDOW_SEC = 60;
+const RUN_TIMEOUT_MS = 300_000;
 const LEGACY_NETWORK = "agent-deploynet";
 const DAEMON_PROBE_TIMEOUT_MS = 10_000;
 const APP_READY_TIMEOUT_MS = 30_000;
@@ -17,6 +29,7 @@ export interface DockerDeployProviderOptions {
   dockerExec?: DockerExec;
   coreContainer?: string;
   fetchImpl?: typeof fetch;
+  onError?: AppErrorSink;
 }
 
 export interface DockerDaemonProbeOptions {
@@ -39,7 +52,7 @@ export async function dockerDaemonFailure(opts: DockerDaemonProbeOptions = {}): 
 
 export function createDockerDeployProvider(opts: DockerDeployProviderOptions = {}): DeployProvider {
   const docker = opts.docker ?? "docker";
-  const image = opts.image ?? "node:24-alpine";
+  const image = opts.image ?? "node:24";
   let nextPort = opts.basePort ?? 9200;
   const ports = new Map<string, number>();
   const freed: number[] = [];
@@ -62,6 +75,11 @@ export function createDockerDeployProvider(opts: DockerDeployProviderOptions = {
   const fetchImpl = opts.fetchImpl ?? fetch;
 
   const name = (d: Deployment) => `agent-deploy-${d.id.slice(0, 12)}`;
+  const execIn =
+    (d: Deployment): Exec =>
+    (script, timeoutSec) =>
+      dexec(["exec", name(d), "sh", "-c", script], timeoutSec * 1000);
+  const checked = recentAppChecks();
   const network = (d: Deployment) => `${name(d)}-net`;
   const dataVolume = (d: Deployment) => `${name(d)}-data`;
   const endpoint = (d: Deployment, hostPort: number): DeployEndpoint =>
@@ -85,9 +103,12 @@ export function createDockerDeployProvider(opts: DockerDeployProviderOptions = {
     }
     const snapshot = resolve(snapshotDir);
     const mount = mounts
-      .filter((candidate) =>
-        candidate.Source && candidate.Destination && isAbsolute(candidate.Source) &&
-        (snapshot === candidate.Destination || snapshot.startsWith(`${candidate.Destination}${sep}`)),
+      .filter(
+        (candidate) =>
+          candidate.Source &&
+          candidate.Destination &&
+          isAbsolute(candidate.Source) &&
+          (snapshot === candidate.Destination || snapshot.startsWith(`${candidate.Destination}${sep}`)),
       )
       .sort((a, b) => b.Destination!.length - a.Destination!.length)[0];
     if (!mount) throw new Error(`deployment snapshot ${snapshotDir} is outside the core container's Docker mounts`);
@@ -103,20 +124,31 @@ export function createDockerDeployProvider(opts: DockerDeployProviderOptions = {
   };
   const waitReady = async (container: string, address: DeployEndpoint): Promise<void> => {
     const deadline = Date.now() + APP_READY_TIMEOUT_MS;
+    let lastProbeError: unknown;
     while (Date.now() < deadline) {
       if (!(await running(container))) {
         const logs = await dexec(["logs", "--tail", "30", container]);
-        throw new Error(`deployment ${container} exited during startup: ${redactSecrets(`${logs.stdout}${logs.stderr}`.trim())}`);
+        throw new Error(
+          `deployment ${container} exited during startup: ${redactSecrets(`${logs.stdout}${logs.stderr}`.trim())}`,
+        );
       }
       try {
-        const response = await fetchImpl(`http://${address.host}:${address.port}/`, { signal: AbortSignal.timeout(2_000) });
+        const response = await fetchImpl(`http://${address.host}:${address.port}/`, {
+          signal: AbortSignal.timeout(2_000),
+        });
         await response.body?.cancel();
         return;
-      } catch {
+      } catch (error) {
+        lastProbeError = error;
         await new Promise((done) => setTimeout(done, 500));
       }
     }
-    throw new Error(`deployment ${container} did not listen on port ${APP_PORT} within ${APP_READY_TIMEOUT_MS / 1000}s`);
+    const logs = await dexec(["logs", "--tail", "30", container]);
+    const detail = redactSecrets(`${logs.stdout}${logs.stderr}`.trim()).slice(-16_384);
+    throw new Error(
+      `deployment ${container} did not listen on port ${APP_PORT} within ${APP_READY_TIMEOUT_MS / 1000}s${detail ? `: ${detail}` : ""}`,
+      { cause: new Error(redactSecrets(errMessage(lastProbeError))) },
+    );
   };
   const ensureNetwork = async (net: string): Promise<string> => {
     if ((await dexec(["network", "inspect", net])).code !== 0) {
@@ -173,41 +205,53 @@ export function createDockerDeployProvider(opts: DockerDeployProviderOptions = {
       const hostPort = opts.coreContainer ? 0 : allocPort(name(d));
       const address = endpoint(d, hostPort);
       const envArgs = Object.entries(version.env ?? {}).flatMap(([k, v]) => ["-e", `${k}=${v}`]);
-      const r = await dexec([
-        "run",
-        "-d",
-        "--name",
-        name(d),
-        "--network",
-        net,
-        "--memory",
-        "512m",
-        "--cpus",
-        "1",
-        "--pids-limit",
-        "256",
-        ...(!opts.coreContainer ? ["-p", `127.0.0.1:${hostPort}:${APP_PORT}`] : []),
-        "-v",
-        `${snapshotDir}:/app:ro`,
-        "-v",
-        `${dataVolume(d)}:/data`,
-        "-w",
-        "/app",
-        ...envArgs,
-        "-e",
-        `PORT=${APP_PORT}`,
-        "-e",
-        "DATA_DIR=/data",
-        image,
-        "sh",
-        "-c",
-        version.entrypoint,
-      ]);
-      if (r.code !== 0) {
+      const r = await dexec(
+        [
+          "run",
+          "-d",
+          "--restart",
+          "unless-stopped",
+          "--name",
+          name(d),
+          "--network",
+          net,
+          "--memory",
+          "512m",
+          "--cpus",
+          "1",
+          "--pids-limit",
+          "256",
+          ...(!opts.coreContainer ? ["-p", `127.0.0.1:${hostPort}:${APP_PORT}`] : []),
+          "-v",
+          `${snapshotDir}:/app:ro`,
+          "-v",
+          `${dataVolume(d)}:/data`,
+          "-e",
+          "DATA_DIR=/data",
+          "-w",
+          "/app",
+          "-e",
+          `PORT=${APP_PORT}`,
+          ...envArgs,
+          image,
+          "sh",
+          "-c",
+          appBoot(`cd /app; ${version.entrypoint}`, APP_PORT),
+        ],
+        RUN_TIMEOUT_MS,
+      );
+      try {
+        if (r.code !== 0) throw new Error(`deploy run failed: ${r.stderr.trim()}`);
+        await waitAppReady(execIn(d), {
+          appPort: APP_PORT,
+          windowSec: APP_READY_WINDOW_SEC,
+          report: appReporter(opts.onError, d, version.env),
+        });
+      } catch (e) {
         await dexec(["rm", "-f", name(d)]);
         await dexec(["network", "rm", net]);
         freePort(name(d));
-        throw new Error(`deploy run failed: ${r.stderr.trim()}`);
+        throw e;
       }
       await connectCore(net);
       await waitReady(name(d), address);
@@ -215,10 +259,8 @@ export function createDockerDeployProvider(opts: DockerDeployProviderOptions = {
     },
 
     async logs(d: Deployment, opts: { tailLines: number }): Promise<string | null> {
-      const lines = Math.max(1, Math.min(2000, Math.floor(opts.tailLines)));
-      const r = await dexec(["logs", "--tail", String(lines), name(d)]);
-      if (r.code !== 0) return null;
-      return `${r.stdout}${r.stderr}`;
+      if (!(await migrateTarget(name(d)))) return null;
+      return appLogs(execIn(d), opts.tailLines);
     },
 
     async destroy(d: Deployment): Promise<void> {
@@ -228,8 +270,13 @@ export function createDockerDeployProvider(opts: DockerDeployProviderOptions = {
       freePort(name(d));
     },
 
-    async resolveEndpoint(d): Promise<DeployEndpoint | null> {
-      return (await migrateTarget(name(d))) ? endpoint(d, d.endpoint?.port ?? 0) : null;
+    async resolveEndpoint(d, version): Promise<DeployEndpoint | null> {
+      if (!(await migrateTarget(name(d)))) return null;
+      if (checked.has(d.id)) return endpoint(d, d.endpoint?.port ?? 0);
+      const report = appReporter(opts.onError, d, version.env);
+      if (await appGone(execIn(d), { appPort: APP_PORT, report })) return null;
+      checked.set(d.id, true);
+      return endpoint(d, d.endpoint?.port ?? 0);
     },
   };
 }

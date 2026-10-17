@@ -40,21 +40,12 @@ export function createProjectScopeGuard(projects: ProjectStore, lock: AdvisoryLo
   const memory = (store: MemoryService): MemoryService => ({
     ...store,
     ...(store.withDisclosure ? { withDisclosure: (access) => memory(store.withDisclosure!(access)) } : {}),
-    recall: async (scope, context) => ((await active(scope)) ? store.recall(scope, context) : ""),
+    recall: async (scope, context) => ((await active(scope)) ? store.recall(scope, context) : []),
     query: async (scope, query, limit, context) =>
       (await active(scope)) ? store.query(scope, query, limit, context) : [],
     capture: (scope, ...args) => write([scope], () => store.capture(scope, ...args)),
-    replace: (scope, ...args) => write([scope], () => store.replace(scope, ...args)),
-    ...(store.replaceIfRevision
-      ? { replaceIfRevision: (scope, ...args) => write([scope], () => store.replaceIfRevision!(scope, ...args)) }
-      : {}),
-    ...(store.replaceRecordsIfRevision
-      ? {
-          replaceRecordsIfRevision: (scope, ...args) =>
-            write([scope], () => store.replaceRecordsIfRevision!(scope, ...args)),
-        }
-      : {}),
-    ...(store.restore ? { restore: (scope, ...args) => write([scope], () => store.restore!(scope, ...args)) } : {}),
+    ...(store.edit ? { edit: (scope, ...args) => write([scope], () => store.edit!(scope, ...args)) } : {}),
+    ...(store.delete ? { delete: (scope, ...args) => write([scope], () => store.delete!(scope, ...args)) } : {}),
   });
   const skills = (store: SkillStore): SkillStore => {
     const change = async <T>(id: string, action: () => Promise<T>, target?: ScopeId): Promise<T> => {

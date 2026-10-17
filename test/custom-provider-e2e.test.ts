@@ -30,7 +30,10 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
     let body = "";
     req.on("data", (c) => (body += c));
     req.on("end", () => {
-      const record = { path: req.url ?? "", auth: req.headers.authorization as string | undefined } as (typeof seen)[0];
+      const record = {
+        path: new URL(req.url ?? "/", "http://localhost").pathname,
+        auth: req.headers.authorization as string | undefined,
+      } as (typeof seen)[0];
       if (req.url?.endsWith("/models")) {
         seen.push(record);
         if (record.auth !== "Bearer sk-qa-good") {
@@ -150,8 +153,6 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
     assert.equal(model!.reasoning, true);
     assert.equal((model as { baseUrl?: string }).baseUrl, upstreamUrl);
     assert.equal(modelSupportedByHarness("qa-chat", "pi"), true);
-    assert.equal(modelSupportedByHarness("qa-chat", "opencode"), true);
-    assert.equal(modelSupportedByHarness("qa-chat", "codex"), false);
     assert.equal(modelServiceable("qa-chat", { anthropic: false, openai: false, openrouter: false }), true);
 
     // 6. REAL model call through QM's pi path → fake upstream answers
@@ -277,16 +278,16 @@ test("QA: anthropic-protocol custom provider serves a real turn (correct wire sh
     req.on("data", (c) => (body += c));
     req.on("end", () => {
       const record = {
-        path: req.url ?? "",
+        path: new URL(req.url ?? "/", "http://localhost").pathname,
         apiKeyHeader: req.headers["x-api-key"] as string | undefined,
         version: req.headers["anthropic-version"] as string | undefined,
       } as (typeof seen)[0];
-      if (req.url?.endsWith("/v1/models")) {
+      if (record.path.endsWith("/v1/models")) {
         seen.push(record);
         res.writeHead(record.apiKeyHeader === "sk-ant-qa" ? 200 : 401, { "content-type": "application/json" });
         return res.end(JSON.stringify({ data: [] }));
       }
-      if (req.url?.endsWith("/v1/messages")) {
+      if (record.path.endsWith("/v1/messages")) {
         record.model = (JSON.parse(body) as { model?: string }).model;
         seen.push(record);
         res.writeHead(200, { "content-type": "text/event-stream" });

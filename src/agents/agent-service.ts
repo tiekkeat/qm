@@ -23,7 +23,7 @@ export interface AgentPackage {
   requiredTools: string[];
   examples: Array<{ task: string; expected: string }>;
 }
-export interface AgentRevision {
+interface AgentRevision {
   version: number;
   blobKey: string;
   hash: string;

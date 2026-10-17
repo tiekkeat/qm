@@ -87,9 +87,6 @@ export function resolveIndividualAuthRouting(
       };
     }
     if (preferredHarness === "pi") {
-      // pi-on-ChatGPT: the org runs the pi harness, so serve the
-      // subscription through pi-ai's Codex provider instead of switching
-      // the person onto the codex harness.
       return {
         kind: "oauth",
         provider: "openai",

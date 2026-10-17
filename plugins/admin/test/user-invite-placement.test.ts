@@ -15,7 +15,7 @@ test("teammate invitation form stays in Users and preserves draft through async 
   );
   assert.deepEqual(
     [...f.root.querySelectorAll("h2")].map((e) => e.textContent),
-    ["Users", "Invitations", "Company access"],
+    ["Sign-in methods", "Users", "Invitations", "Company access"],
   );
   const invite = f.root.querySelector<HTMLButtonElement>('[aria-label="Invite teammate"]')!;
   invite.click();

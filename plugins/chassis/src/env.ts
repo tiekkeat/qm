@@ -14,7 +14,4 @@ export function portFromEnv(fallback: number): number {
   return Number(process.env.PORT ?? fallback);
 }
 
-export function isMissingOrPlaceholder(value: string | undefined): boolean {
-  const candidate = value?.trim();
-  return !candidate || /^(replace-me|placeholder|changeme|todo)$/i.test(candidate);
-}
+export { isMissingOrPlaceholder } from "./config-values.ts";

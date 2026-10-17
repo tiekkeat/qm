@@ -6,6 +6,8 @@ import { agentApiMatches } from "../src/api/agent-api-catalog.ts";
 import { OAUTH_CONSENT_AUD, CREDENTIAL_BROKER_AUD, BROWSER_MODEL_AUD } from "../src/auth/capability-token.ts";
 
 const PUBLIC_ROUTES = new Set<string>([
+  "GET /v1/mcp-oauth/client-metadata",
+  "GET /v1/mcp-oauth/callback",
   "POST /v1/slack/managed/installation",
   "DELETE /v1/slack/managed/installation",
   "POST /v1/slack/managed/events",
@@ -75,6 +77,7 @@ test("raw routes keep their declared auth contracts (front enforces capability a
   const pins: Array<[string, string, RouteAuth]> = [
     ["GET", "/healthz", "public"],
     ["GET", "/readyz", "public"],
+    ["GET", "/v1/spend/export", "public"],
     ["GET", "/v1/credentials/git/gitlab/acme/repo.git/info/refs", { aud: CREDENTIAL_BROKER_AUD }],
     ["POST", "/v1/credentials/git/gitlab/acme/repo.git/git-upload-pack", { aud: CREDENTIAL_BROKER_AUD }],
   ];

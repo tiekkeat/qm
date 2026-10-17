@@ -279,7 +279,10 @@ test("snapshot authorization checks mixed tenure bounds without reading transcri
     { sessions: { participantWindowsOf: async () => [window] } } as unknown as Parameters<
       typeof createSessionMethods
     >[0],
-    { sessionForViewer: async () => (allowed ? {} : null) } as unknown as Parameters<typeof createSessionMethods>[1],
+    {
+      sessionForViewer: async () => (allowed ? { scopeId: "personal:alice" } : null),
+      principalCanWriteScope: async () => true,
+    } as unknown as Parameters<typeof createSessionMethods>[1],
   );
   const bounds = { minSeq: 2, maxSeq: 9, minCreatedAt: 50, maxCreatedAt: 499 };
   assert.equal(await methods.canViewSessionSnapshot("s1", "alice", bounds), true);

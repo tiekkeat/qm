@@ -29,7 +29,9 @@ async function getStatus(ctx: ApiCtx): Promise<void> {
   const individualModelAuth = (await ctx.deps.config?.getIndividualModelAuthDurable(principal)) ?? false;
   const account = (await ctx.deps.config?.getModelAccountDurable(principal)) ?? "company";
   const shared = await ctx.deps.userModelCredentials?.sharedStatus();
-  const sharedAvailable = shared?.connected === true && !shared.needsReconnect &&
+  const sharedAvailable =
+    shared?.connected === true &&
+    !shared.needsReconnect &&
     (await ctx.deps.userModelCredentials?.hasSharedGrant(principal)) === true;
   return sendJson(ctx.res, 200, { individualModelAuth, required, account, connections, sharedAvailable });
 }
@@ -50,9 +52,17 @@ async function setAccount(ctx: ApiCtx): Promise<void> {
   if (account === "shared-openai") {
     const shared = await ctx.deps.userModelCredentials.sharedStatus();
     if (!shared.connected || shared.needsReconnect || !(await ctx.deps.userModelCredentials.hasSharedGrant(principal)))
-      return sendJson(ctx.res, 403, { error: "shared_codex_unavailable", message: "Shared Codex access is unavailable." });
+      return sendJson(ctx.res, 403, {
+        error: "shared_codex_unavailable",
+        message: "Shared Codex access is unavailable.",
+      });
     await ctx.deps.config.setSharedModelAuth(principal);
-    audit(ctx.deps, { principalId: principal, action: "user-model-auth.account", resource: account, scopeLabel: principal });
+    audit(ctx.deps, {
+      principalId: principal,
+      action: "user-model-auth.account",
+      resource: account,
+      scopeLabel: principal,
+    });
     return getStatus(ctx);
   }
   const provider = bodyObj(ctx).provider;
@@ -113,9 +123,6 @@ async function putApiKey(ctx: ApiCtx): Promise<void> {
   return sendJson(ctx.res, 200, { ok: true });
 }
 
-// ChatGPT device-code login is delegated to the vendored Codex binary's own
-// login RPCs (supported, version-matched surface) rather than a hand-rolled
-// flow against undocumented endpoints.
 const codexDeviceLogin = createCodexDeviceLogin();
 
 async function chatgptStart(ctx: ApiCtx): Promise<void> {

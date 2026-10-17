@@ -12,7 +12,7 @@ import { sendJson } from "../http.ts";
 import { activePrincipal, audit, authorizeAdmin, isObj, orgScope } from "./shared.ts";
 import type { ApiCtx, Route } from "./route.ts";
 
-export async function passwordAccountActive(ctx: ApiCtx, email: string): Promise<boolean> {
+async function passwordAccountActive(ctx: ApiCtx, email: string): Promise<boolean> {
   const { deps } = ctx;
   if (!deps.identity) return false;
   await deps.identity.refresh(true);
@@ -191,7 +191,7 @@ async function accounts(ctx: ApiCtx): Promise<void> {
   }
   return sendJson(res, 404, { error: "not_found" });
 }
-export async function setLoginPolicy(ctx: ApiCtx): Promise<void> {
+async function setLoginPolicy(ctx: ApiCtx): Promise<void> {
   const actor = await authorizeAdmin(ctx, orgScope());
   if (!actor) return;
   if (ctx.capability) return sendJson(ctx.res, 403, { error: "forbidden" });
@@ -216,7 +216,7 @@ export async function setLoginPolicy(ctx: ApiCtx): Promise<void> {
   });
   return sendJson(ctx.res, 200, { policy });
 }
-export async function adminPasswordReset(ctx: ApiCtx): Promise<void> {
+async function adminPasswordReset(ctx: ApiCtx): Promise<void> {
   const actor = await authorizeAdmin(ctx, orgScope());
   if (!actor) return;
   if (ctx.capability) return sendJson(ctx.res, 403, { error: "forbidden" });

@@ -41,6 +41,7 @@ test("runtime defaults are shared while pane choices and editor drafts remain lo
   let fail = false;
   let gets = 0;
   globalThis.fetch = async (input, init) => {
+    if (String(input).startsWith("/api/agents")) return Response.json({ agents: [], binding: null });
     const scope = new URL(String(input), "http://localhost").searchParams.get("scopeId") ?? "personal:owner";
     if (init?.method === "PUT") {
       const change = JSON.parse(String(init.body));
@@ -84,6 +85,7 @@ test("runtime defaults are shared while pane choices and editor drafts remain lo
           state: { scopeId, threadRef: `thread-${i}`, sessionId: `session-${i}`, agent, resolvingApprovals: new Set() },
           activePendingApprovals: () => [],
           hasUnresolvedApproval: () => false,
+          turnRuntime: () => null,
           isStopping: () => false,
           drawActiveChat: () => render(composer.composerForm(agent), host),
         },

@@ -129,7 +129,8 @@ export async function nativeBrowserCompletion(
         ? routing.apiKey
         : (selection.account === "shared-openai"
             ? await input.credentials?.sharedOAuth(input.actorId)
-            : await input.credentials?.derivedOAuth(input.actorId, "openai"))?.accessToken;
+            : await input.credentials?.derivedOAuth(input.actorId, "openai")
+          )?.accessToken;
     if (!auth) throw new BrowserCompletionError("Reconnect your selected AI account in Settings", 409);
     keys = { [routing.kind === "apikey" ? routing.provider : CODEX_SUBSCRIPTION_PROVIDER]: auth };
   }

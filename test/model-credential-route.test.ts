@@ -94,6 +94,7 @@ test("admin model credentials are encrypted, write-only, live, and removable", a
         { id: "claude-opus-4-8", name: "Claude Opus 4.8", provider: "anthropic" },
         { id: "claude-sonnet-5-5", name: "Claude Sonnet 5.5", provider: "anthropic" },
         { id: "claude-sonnet-5", name: "Claude Sonnet 5", provider: "anthropic" },
+        { id: "claude-haiku-5-5", name: "Claude Haiku 5.5", provider: "anthropic" },
         { id: "claude-haiku-4-5", name: "Claude Haiku 4.5", provider: "anthropic" },
         { id: "gpt-5.6-sol", name: "GPT-5.6 Sol", provider: "openai" },
         { id: "gpt-5.6-terra", name: "GPT-5.6 Terra", provider: "openai" },
@@ -101,6 +102,7 @@ test("admin model credentials are encrypted, write-only, live, and removable", a
         { id: "gpt-6-astra", name: "GPT-6 Astra", provider: "openai" },
         { id: "gpt-6-astra-ultrafast", name: "GPT-6 Astra · Ultrafast (6× cost)", provider: "openai" },
         { id: "gpt-6.1-sol", name: "GPT-6.1 Sol", provider: "openai" },
+        { id: "gpt-6.1-sol-ultrafast", name: "GPT-6.1 Sol · Ultrafast (6× cost)", provider: "openai" },
         { id: "gpt-6-sol", name: "GPT-6 Sol", provider: "openai" },
         { id: "gpt-6-luna", name: "GPT-6 Luna", provider: "openai" },
         { id: "openrouter/auto", name: "OpenRouter Auto", provider: "openrouter" },
@@ -397,7 +399,7 @@ test("web turns keep a persisted OpenRouter model enabled when the refreshed cat
     });
     const arbitrary = await turn("web:alice:arbitrary-openrouter-model", "openai/gpt-oss-20b:free");
     assert.equal(arbitrary.status, "refused");
-    assert.match(arbitrary.reason ?? "", /not enabled for the web UI/);
+    assert.match(arbitrary.reason ?? "", /runtime choice/);
   } finally {
     await srv.close();
   }
@@ -448,7 +450,6 @@ test("admin scope keeps the selected runtime model visible when its provider is 
         id: "claude-opus-5",
         name: "Claude Opus 5",
         provider: "anthropic",
-        effortLevels: ["auto", "default", "adaptive", "low", "medium", "high", "xhigh", "max", "ultracode"],
       },
     ]);
   } finally {
@@ -484,9 +485,8 @@ test("managed provider keys advertise supported OpenCode and browser models", as
 });
 
 test("web turns gate the requested and scope-selected harness against its real key source", async () => {
-  const srv = start({ harness: "pi" });
+  const srv = start({ harness: "pi", openaiApiKey: "deployment-openai-key" });
   try {
-    await srv.built.modelCredentials.set("openai", "managed-openai-key", "admin-alice");
     srv.built.config.setApprovedHarnesses(["pi", "opencode"]);
     const turn = (threadRef: string, overrides: { harness?: string; model?: string } = {}) =>
       srv.built.app.turn({
@@ -600,8 +600,8 @@ test("surface-config respects an admin-disabled environment provider", async () 
   }
 });
 
-test("surface-config reports Codex ChatGPT OAuth without making it a Pi credential", async () => {
-  const srv = start({ harness: "codex", codexAuthFile: "/tmp/codex-auth.json" });
+test("surface-config reports company ChatGPT OAuth without making it a Pi API credential", async () => {
+  const srv = start({ harness: "pi", codexAuthFile: "/tmp/codex-auth.json" });
   try {
     const surface = await fetch(`${srv.base}/v1/surface-config`);
     assert.equal(surface.status, 200);

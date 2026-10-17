@@ -1,12 +1,9 @@
 import "./agent-picker";
+import { emojiCompletion } from "./emoji-completion";
+import { reportHandledError } from "./browser-errors.ts";
 import { appEditSlug } from "./app-edit";
-import {
-  runtimeConfigKey,
-  getRuntimeConfig,
-  loadRuntimeConfig,
-  saveRuntimeConfig,
-  subscribeRuntimeConfig,
-} from "./runtime-config-store";
+import { runtimeConfigKey, loadRuntimeConfig, saveRuntimeConfig, subscribeRuntimeConfig } from "./runtime-config-store";
+import { getRuntimeConfig } from "./runtime-config-cache.ts";
 import type { Agent, AgentMessage } from "@earendil-works/pi-agent-core";
 import { createFileDragState } from "./file-drag";
 import type { Attachment } from "@earendil-works/pi-web-ui";
@@ -34,9 +31,12 @@ import {
   type CoreAttachment,
   type PendingApproval,
   type QueuedRun,
+  alwaysSteer,
+  switchedDefault,
 } from "./core-bridge";
 import { errMessage } from "../../chassis/src/errors";
-import { browserRenderableImage, fieldSelect, icon } from "./ui";
+import { browserRenderableImage, fieldSelect } from "./ui";
+import { icon } from "./icons";
 import {
   defaultEffortForModel,
   defaultModelValue,
@@ -57,7 +57,7 @@ import { tip } from "./tooltip";
 import { isPhone } from "./viewport";
 import {
   LOADOUT_CAP,
-  ULTRAFAST_MODEL_ID,
+  isUltrafastModel,
   presetModelId,
   ultrafastChoice,
   loadLoadout,
@@ -121,7 +121,7 @@ function forgetThreadPick(threadRef: string): void {
   persistPreference(THREAD_PICKS_STORAGE_KEY, JSON.stringify([...threadModelPicks]));
 }
 
-export function carryModelPick(fromThreadRef: string | null, toThreadRef: string): void {
+function carryModelPick(fromThreadRef: string | null, toThreadRef: string): void {
   const pick = fromThreadRef ? threadModelPicks.get(fromThreadRef) : undefined;
   if (pick) rememberThreadPick(toThreadRef, pick);
 }
@@ -170,7 +170,7 @@ export function clearSkillsCache(): void {
 
 const SLASH_TOKEN = /(^|\s)\/([a-zA-Z0-9_-]*)$/;
 
-export function slashQuery(draft: string): string | null {
+function slashQuery(draft: string): string | null {
   const m = SLASH_TOKEN.exec(draft);
   return m ? (m[2] ?? "") : null;
 }
@@ -353,6 +353,18 @@ export function createComposerSurface(ctx: ConvCtx, options: ComposerOptions = {
     return modelOptionFor(picked ?? defaultModelValue(scopeKey()), scopeKey());
   }
 
+  function followsDefault(): boolean {
+    const selected = currentModelOption();
+    const threadRef = ctx.chat.state.threadRef;
+    return (
+      !!selected &&
+      !(threadRef && threadModelPicks.has(threadRef)) &&
+      effortOverride === undefined &&
+      fastModeOverride === undefined &&
+      restoredLoadout?.value !== selected.value
+    );
+  }
+
   async function refreshRuntimeSelection(scopeId: string | null, agent?: Agent, refresh = false): Promise<void> {
     const request = ++runtimeRequest;
     const actualScope = runtimeScopeKey(scopeId);
@@ -480,10 +492,7 @@ export function createComposerSurface(ctx: ConvCtx, options: ComposerOptions = {
           effortSelectionRevision === effortRevision &&
           fastSelectionRevision === fastRevision
         ) {
-          if (ctx.chat.state.threadRef) forgetThreadPick(ctx.chat.state.threadRef);
-          effortOverride = undefined;
-          fastModeOverride = undefined;
-          restoredLoadout = undefined;
+          clearChatSelection();
         }
       }
       syncRuntimeSelection(agent);
@@ -559,7 +568,14 @@ export function createComposerSurface(ctx: ConvCtx, options: ComposerOptions = {
     }
 
     const compact = Boolean(ctx.pane) || isPhone();
-    const runtimeControls = modelPicker.render(agent, selectedModel, inputBlocked);
+    const turnRuntime = ctx.chat.turnRuntime();
+    const routed =
+      turnRuntime?.change &&
+      !switchedDefault(turnRuntime) &&
+      (turnRuntime.harnessId !== selectedModel.harnessId || turnRuntime.modelId !== selectedModel.model.id)
+        ? turnRuntime
+        : undefined;
+    const runtimeControls = modelPicker.render(agent, selectedModel, inputBlocked, routed);
     return html`
       <form
         class="composer-wrap ${compact ? "compact" : ""}"
@@ -660,6 +676,7 @@ export function createComposerSurface(ctx: ConvCtx, options: ComposerOptions = {
                 <textarea
                   class="composer-input"
                   dir="auto"
+                  ${emojiCompletion(composerState.draft)}
                   rows="1"
                   placeholder=${placeholder}
                   ?disabled=${inputBlocked}
@@ -691,11 +708,15 @@ export function createComposerSurface(ctx: ConvCtx, options: ComposerOptions = {
               ${icon(Paperclip, 18)}
             </button>
             ${runtimeControls}
-            <qm-agent-picker
-              .scopeId=${ctx.chat.state.scopeId ?? `personal:${appState.me?.user}`}
-              .threadRef=${ctx.chat.state.threadRef ?? ""}
-              .disabled=${inputBlocked}
-            ></qm-agent-picker>
+            ${
+              !ctx.inbox && !options.prepareSubmit && ctx.chat.state.threadRef
+                ? html`<qm-agent-picker
+                    .scopeId=${ctx.chat.state.scopeId ?? `personal:${appState.me?.user}`}
+                    .threadRef=${ctx.chat.state.threadRef ?? ""}
+                    .disabled=${inputBlocked}
+                  ></qm-agent-picker>`
+                : nothing
+            }
           </div>
           <div class="composer-right">${sendControls(agent)}</div>
         </div>
@@ -799,34 +820,34 @@ export function createComposerSurface(ctx: ConvCtx, options: ComposerOptions = {
         ${icon(ArrowUp, 16)}
       </button>`;
     }
+    const label = alwaysSteer() && canSteer(agent) ? "Steer the running task" : "Queue for after this turn";
     return html`
       <button class="stop-btn" type="button" aria-label="Stop" ${tip("Stop")} @click=${() => stopStreaming(agent)}>
         ${icon(Square, 16)}
       </button>
-      <button
-        class="send-btn"
-        type="submit"
-        ${tip("Queue for after this turn")}
-        aria-label="Queue for after this turn"
-        ?disabled=${!composerCanSend()}
-      >
+      <button class="send-btn" type="submit" ${tip(label)} aria-label=${label} ?disabled=${!composerCanSend()}>
         ${icon(ArrowUp, 16)}
       </button>
     `;
   }
 
-  function queuedStrip(agent: Agent): TemplateResult | typeof nothing {
-    const queued = [...queuedRunsFor(ctx.chat.state.threadRef)];
-    if (queuedEdit?.threadRef === ctx.chat.state.threadRef && !queued.some((q) => q.runId === queuedEdit?.runId))
-      queued.push({ runId: queuedEdit.runId, text: queuedEdit.original });
-    const threadRef = ctx.chat.state.threadRef;
-    const steering = steeringRunsFor(threadRef, agent);
-    if (!queued.length && !steering.length) return nothing;
-    const steerable =
+  function canSteer(agent: Agent): boolean {
+    return (
       agent.state.isStreaming &&
       !ctx.chat.isStopping() &&
       ctx.chat.hasLiveRun() &&
-      harnessSupportsSteer(currentModelOption()?.harnessId ?? "");
+      harnessSupportsSteer(currentModelOption()?.harnessId ?? "")
+    );
+  }
+
+  function queuedStrip(agent: Agent): TemplateResult | typeof nothing {
+    const threadRef = ctx.chat.state.threadRef;
+    const steering = steeringRunsFor(threadRef, agent);
+    const queued = queuedRunsFor(threadRef).filter((q) => !pendingSteers.has(q.runId));
+    if (queuedEdit?.threadRef === ctx.chat.state.threadRef && !queued.some((q) => q.runId === queuedEdit?.runId))
+      queued.push({ runId: queuedEdit.runId, text: queuedEdit.original });
+    if (!queued.length && !steering.length) return nothing;
+    const steerable = canSteer(agent);
     const steerTip = (): string => {
       if (steerable) return "Steer the running task with this instead of waiting";
       return "Nothing running can take this. It will go out as its own turn";
@@ -848,6 +869,7 @@ export function createComposerSurface(ctx: ConvCtx, options: ComposerOptions = {
             ? html` <div class="queued-chip queued-editing" role="listitem">
                 <textarea
                   class="queued-edit-input"
+                  ${emojiCompletion(queuedEdit.text)}
                   aria-label="Edit queued message"
                   rows="3"
                   .value=${live(queuedEdit.text)}
@@ -1010,14 +1032,16 @@ export function createComposerSurface(ctx: ConvCtx, options: ComposerOptions = {
     redraw: () => ctx.chat.drawActiveChat(),
     scopeKey,
     state: composerState,
-    entries: seededLoadout,
-    activeEntry: activeLoadoutEntry,
-    saveEntries: (entries) => {
-      loadout = entries;
-      saveLoadout(entries, loadoutKey);
+    presets: {
+      entries: seededLoadout,
+      save: (entries) => {
+        loadout = entries;
+        saveLoadout(entries, loadoutKey);
+      },
+      add: addLoadoutEntry,
     },
+    activeEntry: activeLoadoutEntry,
     apply: applyLoadout,
-    add: addLoadoutEntry,
     selectEffort,
     selectHarness,
     toggleFastMode,
@@ -1378,7 +1402,8 @@ export function createComposerSurface(ctx: ConvCtx, options: ComposerOptions = {
       if (stillHere()) restoreStagedOnFailure(text, sendable, composerState.error || "Could not queue the files.");
       return ctx.chat.drawActiveChat(agent);
     }
-    if (!(await enqueueTurn(agent, threadRef, text, uploaded, queuedFilesKey(sendable)))) {
+    const steer = alwaysSteer() && canSteer(agent);
+    if (!(await enqueueTurn(agent, threadRef, text, uploaded, queuedFilesKey(sendable), steer))) {
       if (stillHere()) restoreStagedOnFailure(text, sendable, composerState.error);
     } else if (transientIds.size && stillHere()) {
       restageAttachments(
@@ -1403,13 +1428,15 @@ export function createComposerSurface(ctx: ConvCtx, options: ComposerOptions = {
     text: string,
     attachments: CoreAttachment[] = [],
     filesKey = "",
+    steer = false,
   ): Promise<boolean> {
     const idempotencyKey = queueSendKey(threadRef, text, filesKey);
     try {
       const queued = await queueTurn(threadRef, text, agent, ctx.chat.currentTurnOptions, idempotencyKey, attachments);
       failedQueueSend = null;
-      setQueuedRuns(threadRef, [...queuedRunsFor(threadRef).filter((r) => r.runId !== queued.runId), queued]);
       bumpSessionActivity(threadRef);
+      if (steer && canSteer(agent) && threadRef === ctx.chat.state.threadRef) void steerQueued(agent, queued, true);
+      else addQueuedRun(threadRef, queued);
       return true;
     } catch (err) {
       failedQueueSend = { threadRef, text, filesKey, idempotencyKey };
@@ -1472,21 +1499,41 @@ export function createComposerSurface(ctx: ConvCtx, options: ComposerOptions = {
 
   const pendingSteers = new Set<string>();
 
-  async function steerQueued(agent: Agent, queued: QueuedRun): Promise<void> {
+  function addQueuedRun(threadRef: string, queued: QueuedRun): void {
+    setQueuedRuns(threadRef, [...queuedRunsFor(threadRef).filter((r) => r.runId !== queued.runId), queued]);
+  }
+
+  function markSteering(threadRef: string, queued: QueuedRun): void {
+    steeringRuns.set(threadRef, [
+      ...(steeringRuns.get(threadRef) ?? []).filter((run) => run.runId !== queued.runId),
+      { ...queued, ts: `queued-steer:${threadRef}:${queued.runId}` },
+    ]);
+  }
+
+  function unmarkSteering(threadRef: string, runId: string): void {
+    const rest = (steeringRuns.get(threadRef) ?? []).filter((run) => run.runId !== runId);
+    if (rest.length) steeringRuns.set(threadRef, rest);
+    else steeringRuns.delete(threadRef);
+  }
+
+  async function steerQueued(agent: Agent, queued: QueuedRun, fresh = false): Promise<void> {
     const threadRef = ctx.chat.state.threadRef;
-    if (!threadRef || !ctx.chat.hasLiveRun() || pendingSteers.has(queued.runId)) return;
+    if (!threadRef || !ctx.chat.hasLiveRun() || pendingSteers.has(queued.runId)) {
+      if (fresh && threadRef) addQueuedRun(threadRef, queued);
+      return;
+    }
     pendingSteers.add(queued.runId);
     composerState.error = "";
+    markSteering(threadRef, queued);
+    let steered = false;
+    let fallBackToQueue = fresh;
     try {
       const outcome = await ctx.chat.signalLiveRun("steer", queued.text, queued.runId);
+      steered = outcome.ok;
       if (outcome.ok || outcome.replayed) {
+        fallBackToQueue = false;
         forgetQueuedRun(threadRef, queued.runId);
         bumpSessionActivity(threadRef);
-        if (outcome.ok)
-          steeringRuns.set(threadRef, [
-            ...(steeringRuns.get(threadRef) ?? []).filter((run) => run.runId !== queued.runId),
-            { ...queued, ts: `queued-steer:${threadRef}:${queued.runId}` },
-          ]);
         if (
           !outcome.ok &&
           outcome.replayed &&
@@ -1499,24 +1546,57 @@ export function createComposerSurface(ctx: ConvCtx, options: ComposerOptions = {
             timestamp: Date.now(),
           } as unknown as AgentMessage);
         }
-      } else if (outcome.reason === "queued_changed") {
-        if (agent === ctx.chat.state.agent && threadRef === ctx.chat.state.threadRef)
-          composerState.error = "The queued message changed. Try steering it again.";
       } else if (outcome.reason === "queued_started" || outcome.reason === "not_found") {
+        fallBackToQueue = false;
         forgetQueuedRun(threadRef, queued.runId);
+      } else {
+        reportHandledError("web:steer_refused", new Error(outcome.reason ?? "steer refused"));
+        if (
+          outcome.reason === "queued_changed" &&
+          agent === ctx.chat.state.agent &&
+          threadRef === ctx.chat.state.threadRef
+        )
+          composerState.error = "The queued message changed. Try steering it again.";
       }
     } catch (err) {
+      reportHandledError("web:steer_queued", err);
       if (agent === ctx.chat.state.agent && threadRef === ctx.chat.state.threadRef)
         composerState.error = errMessage(err, "Could not confirm steering. Try again.");
     } finally {
       pendingSteers.delete(queued.runId);
+      if (!steered) unmarkSteering(threadRef, queued.runId);
     }
+    if (fallBackToQueue) addQueuedRun(threadRef, queued);
     if (agent !== ctx.chat.state.agent || threadRef !== ctx.chat.state.threadRef) return;
     ctx.chat.drawActiveChat(agent);
     ctx.chat.resumeIfIdle();
   }
 
+  let pendingSubmissions = 0;
+  let disposed = false;
+  const preventUnsafeUpdate = (event: Event): void => {
+    if (
+      pendingSubmissions ||
+      composerState.attachments.length ||
+      composerState.processingFiles ||
+      composerState.pasteView
+    ) {
+      event.preventDefault();
+    }
+  };
+  window.addEventListener("qm:prepare-update", preventUnsafeUpdate);
+
   async function sendPrompt(agent: Agent): Promise<void> {
+    pendingSubmissions++;
+    try {
+      await sendPromptNow(agent);
+    } finally {
+      pendingSubmissions--;
+      if (disposed && !pendingSubmissions) window.removeEventListener("qm:prepare-update", preventUnsafeUpdate);
+    }
+  }
+
+  async function sendPromptNow(agent: Agent): Promise<void> {
     if (!composerCanSend()) return;
     if (composerState.pasteView) closePasteView(agent);
     if (agent.state.isStreaming) return queueDraft(agent);
@@ -1864,6 +1944,18 @@ export function createComposerSurface(ctx: ConvCtx, options: ComposerOptions = {
     ctx.chat.drawActiveChat(agent);
   }
 
+  function clearChatSelection(): void {
+    if (ctx.chat.state.threadRef) forgetThreadPick(ctx.chat.state.threadRef);
+    effortOverride = undefined;
+    fastModeOverride = undefined;
+    restoredLoadout = undefined;
+  }
+
+  async function followScopeDefault(agent: Agent): Promise<void> {
+    clearChatSelection();
+    await refreshRuntimeSelection(ctx.chat.state.scopeId, agent, true);
+  }
+
   function selectModel(value: string, agent: Agent): void {
     const option = getModelOptions(scopeKey()).find((candidate) => candidate.value === value);
     if (!option) return;
@@ -1905,7 +1997,7 @@ export function createComposerSurface(ctx: ConvCtx, options: ComposerOptions = {
   function toggleFastMode(agent: Agent): void {
     const selected = currentModelOption();
     if (ctx.chat.hasUnresolvedApproval() || ctx.chat.state.resolvingApprovals.size > 0) return;
-    if (selected?.model.id === ULTRAFAST_MODEL_ID) {
+    if (selected && isUltrafastModel(selected.model.id)) {
       const target = ultrafastChoice(getModelOptions(scopeKey()), selected);
       if (target) applyLoadout({ ...activeLoadoutEntry(selected), value: target.value, fast: true }, agent);
       return;
@@ -1974,6 +2066,8 @@ export function createComposerSurface(ctx: ConvCtx, options: ComposerOptions = {
   }
 
   function dispose(): void {
+    disposed = true;
+    if (!pendingSubmissions) window.removeEventListener("qm:prepare-update", preventUnsafeUpdate);
     window.removeEventListener("model-account-changed", refreshAccount);
     document.removeEventListener("visibilitychange", revalidateRuntime);
     modelPicker.dispose();
@@ -2071,6 +2165,8 @@ export function createComposerSurface(ctx: ConvCtx, options: ComposerOptions = {
     },
     resizeComposer,
     currentModelOption,
+    followsDefault,
+    followScopeDefault,
     carryModelPick,
     refreshRuntimeSelection,
     onDragEnter,

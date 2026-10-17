@@ -1,8 +1,8 @@
+import { patchPiAi } from "./patch-pi-ai.mjs";
 import { execFileSync } from "node:child_process";
 import { copyFileSync, chmodSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
-import { patchPiAi } from "./patch-pi-ai.mjs";
 
 execFileSync("npm", ["ci", "--omit=dev", "--ignore-scripts"], { stdio: "inherit" });
 patchPiAi();

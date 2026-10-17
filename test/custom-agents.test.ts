@@ -202,7 +202,7 @@ test("effective selection inherits latest release only for new chats and preserv
 test("retiring one agent cannot overwrite a newer default pointing at another", async () => {
   const { service, options } = await fixture();
   const a = await service.create("owner", "personal:owner", pkg);
-  const b = await service.create("owner", "personal:owner", { ...pkg, name: "ZStack specialist" });
+  const b = await service.create("owner", "personal:owner", { ...pkg, name: "Specialist" });
   await service.publish("owner", a.id, 1);
   await service.publish("owner", b.id, 1);
   await service.bind("owner", "default:personal:owner", "personal:owner", { id: a.id, version: 1 });

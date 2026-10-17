@@ -184,7 +184,7 @@ test("keychain store refuses a refresh that switches accounts", async () => {
     })) as unknown as typeof fetch,
   });
   const auth = await store.load();
-  // Falls back to the (stale) stored auth rather than adopting a different account.
+
   assert.ok(auth);
   assert.equal((auth!.tokens as Record<string, unknown>).refresh_token, "refresh-1");
   assert.equal(state.saves.length, 0);

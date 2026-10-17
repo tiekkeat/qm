@@ -44,7 +44,7 @@ export async function verificationUpstream() {
       const text = behavior.empty ? "" : "VERIFIED MODEL REPLY";
       const send = (type: string, data: object) =>
         res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`);
-      if (req.url?.endsWith("/messages")) {
+      if (new URL(req.url ?? "/", "http://localhost").pathname.endsWith("/messages")) {
         send("message_start", {
           message: {
             id: "msg_probe",

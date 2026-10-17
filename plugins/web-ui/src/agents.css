@@ -40,7 +40,7 @@
 .agent-picker select {
   font: inherit;
   color: inherit;
-  background: var(--bg);
+  background: var(--background);
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 10px;
@@ -62,7 +62,7 @@
   cursor: pointer;
 }
 .agent-row:hover {
-  background: var(--hover);
+  background: var(--secondary);
 }
 .agent-row small,
 .agent-editor .muted {

@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { createPgPool } from "../persistence/pg-pool.ts";
 import type { LoginPolicy, PasswordTicket } from "../../plugins/chassis/src/accounts.ts";
 
-export interface PasswordAccount {
+interface PasswordAccount {
   email: string;
   passwordHash: string;
   mustChangePassword: boolean;

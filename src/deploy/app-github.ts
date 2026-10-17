@@ -71,7 +71,7 @@ export interface CollaborationInput {
   expectedGitHubUserId?: number;
 }
 
-export function collaborationInput(value: unknown): CollaborationInput {
+function collaborationInput(value: unknown): CollaborationInput {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("An action object is required.");
   const input = value as Record<string, unknown>;
   for (const key of [

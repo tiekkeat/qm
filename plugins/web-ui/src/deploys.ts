@@ -13,7 +13,8 @@ import { live } from "lit/directives/live.js";
 import { Archive, Check, Copy, ExternalLink, Plus, RotateCcw, Trash2, X } from "lucide";
 import { api, withBase } from "./core-bridge";
 import { errMessage } from "../../chassis/src/errors";
-import { copyText, icon, relTime } from "./ui";
+import { copyText, relTime } from "./ui";
+import { icon } from "./icons";
 import { listBackLink, listPageTpl } from "./list-page";
 import { contextsState, ensureContexts, scopeChip } from "./contexts";
 import { scopedSession, scopedViewTopbar } from "./session-scope";
@@ -71,6 +72,7 @@ let deployTab: DeploymentTab = "yours";
 let deployPageHost: HTMLElement | null = null;
 let activeDeploy: DeploymentView | null = null;
 let detailAbort: AbortController | undefined;
+let detailLoading = false;
 let connectionTimer: ReturnType<typeof setInterval> | undefined;
 function checkActiveConnection(): void {
   if (!activeDeploy || appState.currentView !== "deploys" || document.hidden) return;
@@ -79,6 +81,7 @@ function checkActiveConnection(): void {
 }
 export function stopDeployDetail(): void {
   detailAbort?.abort();
+  detailLoading = false;
   if (activeDeploy) stopCollaborationReads(activeDeploy.id);
   if (connectionTimer) clearInterval(connectionTimer);
   connectionTimer = undefined;
@@ -294,6 +297,7 @@ async function openDeploy(d: DeploymentView): Promise<void> {
   deployDraft = "";
   deployNotices = withoutDeploymentDetailNotice(deployNotices);
   activeDeploy = d;
+  detailLoading = true;
   const tabQuery = pendingDetailTab ?? new URLSearchParams(window.location.search).get("tab");
   pendingDetailTab = undefined;
   const requestedVersion = pendingDeployVersion ?? Number(new URLSearchParams(window.location.search).get("version"));
@@ -321,6 +325,7 @@ async function openDeploy(d: DeploymentView): Promise<void> {
     });
     if (detailAbort !== controller || signal.aborted || appState.currentView !== "deploys" || activeDeploy?.id !== d.id)
       return;
+    detailLoading = false;
     activeDeploy = response.deployment ?? d;
     drawDeployDetail(activeDeploy);
     const release = activeDeploy.versions?.find(
@@ -334,12 +339,13 @@ async function openDeploy(d: DeploymentView): Promise<void> {
       });
   } catch (error) {
     if (activeDeploy?.id !== d.id || detailAbort !== controller || controller.signal.aborted) return;
+    detailLoading = false;
     deployNotices = withDeploymentDetailNotice(deployNotices, d.id, errMessage(error, "Could not load app details."));
     drawDeployDetail(d);
   }
 }
 
-function drawDeployDetail(d: DeploymentView, loading = false): void {
+function drawDeployDetail(d: DeploymentView, loading = detailLoading): void {
   if (appState.currentView !== "deploys" || !appState.mainEl || activeDeploy?.id !== d.id) return;
   d = activeDeploy;
   const host = appState.mainEl.querySelector<HTMLElement>(".deploy-detail-pane") ?? document.createElement("div");
