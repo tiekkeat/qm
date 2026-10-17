@@ -354,7 +354,7 @@ import type { SessionStore } from "./sessions/session-store.ts";
 import { createMockHarness } from "./harness/mock-harness.ts";
 import {
   fileCompanyChatGPTAuth,
-  keychainCompanyChatGPTAuth,
+  companyChatGPTAuthFromStore,
   type CompanyChatGPTAuth,
 } from "./model/company-chatgpt-auth.ts";
 import { keychainHarnessAuthEnv } from "./credentials/harness-auth-env.ts";
@@ -1527,8 +1527,7 @@ export function buildApp(
     companyCodexAuthStore = keychainCodexAuthStore({ keychain, credentialId: config.codexAuthCredential });
   else if (config.codexAuthFile) companyCodexAuthStore = fileCodexAuthStore(config.codexAuthFile);
   let companyChatGPTAuth: CompanyChatGPTAuth | undefined;
-  if (config.codexAuthCredential && keychain)
-    companyChatGPTAuth = keychainCompanyChatGPTAuth({ keychain, credentialId: config.codexAuthCredential });
+  if (config.codexAuthCredential && keychain) companyChatGPTAuth = companyChatGPTAuthFromStore(companyCodexAuthStore!);
   else if (config.codexAuthFile) companyChatGPTAuth = fileCompanyChatGPTAuth(config.codexAuthFile);
   const resolveCompanySubscriptionKeys = async (): Promise<ProviderKeys> => {
     if (!companyChatGPTAuth) return {};

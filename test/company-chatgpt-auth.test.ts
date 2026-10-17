@@ -1,10 +1,15 @@
+import { keychainCodexAuthStore } from "../src/harness/codex-auth-store.ts";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { chatgptAuthFromValue } from "../src/model/chatgpt-auth-file.ts";
-import { fileCompanyChatGPTAuth, keychainCompanyChatGPTAuth } from "../src/model/company-chatgpt-auth.ts";
+import {
+  companyChatGPTAuthFromStore,
+  fileCompanyChatGPTAuth,
+  keychainCompanyChatGPTAuth,
+} from "../src/model/company-chatgpt-auth.ts";
 import type { CredentialFile, Keychain, KeychainCredentialMeta } from "../src/credentials/keychain.ts";
 import type { UserOAuthTokens } from "../src/model/user-model-credential-store.ts";
 
@@ -181,4 +186,21 @@ test("file auth serves the local login as-is and never refreshes or rewrites it"
   writeFileSync(path, JSON.stringify(authJson("acct", 1_000_000_000)));
   chmodSync(path, 0o600);
   await assert.rejects(auth.accessToken(), /has expired; run the Codex CLI to refresh it/);
+});
+
+test("native and Pi company subscriptions share one in-flight credential rotation", async () => {
+  const state = keychainState(authJson("acct", STALE_EXP, "refresh-1"));
+  const { calls, refresh } = refreshTo("acct");
+  const store = keychainCodexAuthStore({
+    keychain: fakeKeychain(state),
+    credentialId: "cred-1",
+    now: () => NOW,
+    refresh,
+  });
+  const company = companyChatGPTAuthFromStore(store);
+  const [native, pi] = await Promise.all([store.load(), company.accessToken()]);
+  assert.equal((native!.tokens as { access_token: string }).access_token, pi);
+  assert.equal(pi, accessToken("acct", FRESH_EXP, "refreshed"));
+  assert.deepEqual(calls, ["refresh-1"]);
+  assert.equal(state.saves.length, 1);
 });

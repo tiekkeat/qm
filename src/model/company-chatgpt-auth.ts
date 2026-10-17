@@ -1,5 +1,5 @@
 import type { Keychain } from "../credentials/keychain.ts";
-import { keychainCodexAuthStore } from "../harness/codex-auth-store.ts";
+import { keychainCodexAuthStore, type CodexAuthStore } from "../harness/codex-auth-store.ts";
 import { accessExpiresAt, authTokens, loadCodexAuthFile } from "./chatgpt-auth-file.ts";
 import type { UserOAuthTokens } from "./user-model-credential-store.ts";
 
@@ -27,7 +27,10 @@ export function keychainCompanyChatGPTAuth(deps: {
   refresh?: (refreshToken: string) => Promise<UserOAuthTokens>;
   now?: () => number;
 }): CompanyChatGPTAuth {
-  const store = keychainCodexAuthStore(deps);
+  return companyChatGPTAuthFromStore(keychainCodexAuthStore(deps));
+}
+
+export function companyChatGPTAuthFromStore(store: CodexAuthStore): CompanyChatGPTAuth {
   return {
     description: store.description,
     async accessToken() {
