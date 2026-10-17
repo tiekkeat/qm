@@ -1,4 +1,4 @@
-import { resumeNote, turnAtSeq } from "../src/core/turn-resume.ts";
+import { turnAtSeq } from "../src/core/turn-resume.ts";
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
@@ -95,7 +95,7 @@ rl.on("line", (line) => {
     }
     return send({ id: msg.id, result: { thread: { id: "thread-1" }, model: "fake-model" } });
   }
-  if (msg.method === "thread/inject_items") return send({ id: msg.id, result: {} });
+  if (msg.method === "thread/inject_items") { require("node:fs").writeFileSync(${JSON.stringify(join(dir, "replayed.json"))}, JSON.stringify(msg.params.items)); return send({ id: msg.id, result: {} }); }
   if (msg.method === "turn/start") {
     send({ id: msg.id, result: { turn: { id: "turn-1", status: "inProgress", items: [] } } });
     if (${commentary}) {
@@ -488,7 +488,7 @@ test("Codex forwards tool-result screening into its native tool bridge", () => {
   assert.equal(ref.screenToolResult, screenToolResult);
 });
 
-test("Codex harness drives app-server JSON-RPC with a read-only jail", async (t) => {
+test("Codex harness drives app-server JSON-RPC with a read-only jail and normalizes subscription model IDs", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "qm-codex-test-"));
   const tasks = createMemoryTaskStore();
   const harness = createCodexHarness({ binaryPath: fakeCodexBinary(dir), env: testHarnessEnv(dir), tasks });
@@ -504,6 +504,7 @@ test("Codex harness drives app-server JSON-RPC with a read-only jail", async (t)
   const result = await harness.turns.runTurn({
     session,
     input: "hi",
+    runtime: { modelId: "codex/gpt-5.6-sol" },
     systemPrompt: "be concise",
     history: [],
     tools: {} as HarnessTurnInput["tools"],
@@ -513,6 +514,10 @@ test("Codex harness drives app-server JSON-RPC with a read-only jail", async (t)
       const saved = { ...entry, sessionId: session.id, seq: entries.length + 1, createdAt: Date.now() } as SessionEntry;
       entries.push(saved);
       return saved;
+    },
+    recordLlmRequest: ({ promptEnvelope }) => {
+      const start = (promptEnvelope as { threadStart: { model: string } }).threadStart;
+      assert.equal(start.model, "gpt-5.6-sol");
     },
     recordModelCall: ({ inputTokens }) => modelCalls.push(inputTokens),
     onDelta: (delta) => deltas.push(delta),
@@ -531,7 +536,7 @@ test("Codex harness drives app-server JSON-RPC with a read-only jail", async (t)
   );
 });
 
-test("Codex ignores continueTurn and still records the resume note as this attempt's user entry", async (t) => {
+test("Codex records a new request when continueTurn has no matching history anchor", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "qm-codex-test-"));
   const harness = createCodexHarness({ binaryPath: fakeCodexBinary(dir), env: testHarnessEnv(dir) });
   t.after(async () => {
@@ -541,7 +546,7 @@ test("Codex ignores continueTurn and still records the resume note as this attem
   const entries: SessionEntry[] = [];
   const scope = { kind: "org", id: "test" } as unknown as ScopeId;
   const session = { id: "session-1" } as Session;
-  const note = resumeNote({ strategy: { kind: "continue" } });
+  const note = "Continue the interrupted request";
   const result = await harness.turns.runTurn({
     session,
     runId: "run-resume",
@@ -696,9 +701,9 @@ test("Codex materializes ChatGPT OAuth auth as ephemeral child material without 
     oauthAccessToken("account-before", "before"),
   );
   assert.equal((childAuth.tokens as Record<string, unknown>).account_id, "account-before");
-  // The child never receives the long-lived credential: only the store refreshes.
+
   assert.equal((childAuth.tokens as Record<string, unknown>).refresh_token, "");
-  // Nothing a child writes ever flows back to the source of truth.
+
   writeFileSync(
     childAuthFile,
     JSON.stringify({
@@ -717,7 +722,7 @@ test("Codex materializes ChatGPT OAuth auth as ephemeral child material without 
     (persisted.tokens as Record<string, unknown>).access_token,
     oauthAccessToken("account-before", "before"),
   );
-  // A stale lock left behind by a dead process is recovered, not honored forever.
+
   const liveLock = `${authFile}.lock`;
   writeFileSync(liveLock, String(process.pid));
   utimesSync(liveLock, new Date(0), new Date(0));
@@ -1335,17 +1340,17 @@ test("per-user Codex turns run on their own app-server with derived auth, never 
       emit: async (entry) => ({ ...entry, sessionId: id, seq: 1, createdAt: Date.now() }) as SessionEntry,
       recordModelCall: () => {},
     });
-  // Two different users' turns and an org turn, all concurrent.
+
   const [alice, bob, org] = await Promise.all([
     run("alice-turn", "acct-alice"),
     run("bob-turn", "acct-bob"),
     run("org-turn"),
   ]);
-  // Each per-user turn saw its OWN account, and no jail ever held a refresh token.
+
   assert.equal(alice.reply, "acct-alice:false");
   assert.equal(bob.reply, "acct-bob:false");
   assert.equal(org.reply, "org-account:false");
-  // The org credential on disk was never touched by per-user turns.
+
   assert.equal(readFileSync(orgAuthFile, "utf8"), orgAuthBefore);
 });
 
@@ -1478,7 +1483,6 @@ test("Codex classifies failures from codexErrorInfo, never from message text", (
     [{ responseTooManyFailedAttempts: { httpStatusCode: 429 } }, "rate_limit", true, 429],
   ];
   for (const [info, code, retryable, status] of cases) {
-    // The text says "401 invalid_api_key" every time; only codexErrorInfo decides.
     const err = codexProviderFailure("Codex 401: invalid_api_key", info);
     assert.ok(err instanceof ProviderTurnError);
     assert.deepEqual([err.code, err.retryable, err.status], [code, retryable, status], JSON.stringify(info));
@@ -1556,7 +1560,6 @@ for (const mode of ["turnFailed", "startRejected"] as const) {
       }),
       (error: unknown) =>
         error instanceof ProviderTurnError &&
-        // turn/completed carries codexErrorInfo; a bare JSON-RPC rejection has no structured cause.
         (mode === "turnFailed" ? error.code === "auth" && !error.retryable : error.code === "unknown"),
     );
   });
@@ -1974,13 +1977,19 @@ for (const final of [true, false]) {
       assert.deepEqual(deltas, final ? ["Checking.", "Partial answer"] : ["Checking."]);
       assert.deepEqual(
         entries.filter((entry) => entry.type === "assistant").map((entry) => entry.payload),
-        [{ text: final ? "Partial answer" : "", stopped: true }],
+        final ? [{ text: "Partial answer", stopped: true }] : [],
+      );
+      assert.ok(
+        entries.some(
+          (entry) => entry.type === "system" && (entry.payload as { kind?: string }).kind === "turn_stopped",
+        ),
+        "a stopped turn remains terminal even when only commentary was emitted",
       );
     });
   }
 }
 
-test("Codex steers extracted documents into the active turn without copying contents into tape", async (t) => {
+test("Codex steers extracted documents into the active turn without copying contents into history", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "qm-codex-steer-doc-test-"));
   const binary = stopReportsFailedCodexBinary(dir);
   const capture = join(dir, "steered.json");
@@ -2007,7 +2016,6 @@ test("Codex steers extracted documents into the active turn without copying cont
     await harness.turns.close?.();
     rmSync(dir, { recursive: true, force: true });
   });
-  const tape: unknown[] = [];
   const entries: SessionEntry[] = [];
   const scope = "personal:tester" as ScopeId;
   const running = harness.turns.runTurn({
@@ -2033,9 +2041,6 @@ test("Codex steers extracted documents into the active turn without copying cont
       return saved;
     },
     recordModelCall: () => {},
-    tape: async (row) => {
-      tape.push(row);
-    },
     prepareSteer: async (text) => ({
       text,
       documents: [
@@ -2062,7 +2067,7 @@ test("Codex steers extracted documents into the active turn without copying cont
   assert.equal(entries.filter((entry) => entry.type === "user").length, 2);
   assert.equal((await signals.pending("steer-document-run")).length, 0);
   assert.match(readFileSync(capture, "utf8"), /STEER-PRIVATE-492/);
-  assert.doesNotMatch(JSON.stringify(tape), /STEER-PRIVATE-492/);
+  assert.doesNotMatch(JSON.stringify(entries), /STEER-PRIVATE-492/);
   assert.doesNotMatch(readFileSync(capture, "utf8"), /OUTSIDE-BUDGET-492/);
   assert.match(readFileSync(capture, "utf8"), /truncated to fit/);
 });
@@ -2246,4 +2251,102 @@ test("Codex skips the stopped reply when shutdown cancels the turn, leaving it o
     [{ text: "Checking.", phase: "commentary" }],
   );
   assert.equal(turnAtSeq(entries, entries[0]!.seq)?.answer, undefined);
+});
+
+test("Codex resumes durable work without appending a duplicate user entry", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-codex-resume-"));
+  const harness = createCodexHarness({ binaryPath: fakeCodexBinary(dir), env: testHarnessEnv(dir) });
+  t.after(async () => {
+    await harness.turns.close?.();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const entries: SessionEntry[] = [];
+  const scope = "personal:alice" as ScopeId;
+  const history = [
+    {
+      type: "user",
+      payload: { text: "Original request" },
+      seq: 7,
+      sessionId: "resume",
+      scopeLabel: scope,
+      createdAt: 1,
+    },
+  ] as SessionEntry[];
+  const calls: HarnessLlmRequestRecord[] = [];
+  const result = await harness.turns.runTurn({
+    session: { id: "resume" } as Session,
+    runId: "resume-run",
+    continueTurn: true,
+    resumeUserSeq: 7,
+    input: "Original request",
+    systemPrompt: "be concise",
+    history,
+    tools: {} as HarnessTurnInput["tools"],
+    scopeLabel: scope,
+    orgScopeId: scope,
+    emit: async (entry) => {
+      const saved = { ...entry, seq: entries.length + 8, sessionId: "resume", createdAt: Date.now() } as SessionEntry;
+      entries.push(saved);
+      return saved;
+    },
+    recordModelCall: () => {},
+    recordLlmRequest: async (call) => {
+      calls.push(call);
+    },
+  });
+  assert.equal(result.reply, "hello");
+  assert.equal(entries.filter((entry) => entry.type === "user").length, 0);
+  assert.equal(calls[0]?.turnSeq, 7);
+});
+
+test("Codex retains authorized image references and replays their bytes on a follow-up turn", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-codex-images-"));
+  const harness = createCodexHarness({ binaryPath: fakeCodexBinary(dir), env: testHarnessEnv(dir) });
+  t.after(async () => {
+    await harness.turns.close?.();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const entries: SessionEntry[] = [];
+  const scope = "personal:alice" as ScopeId;
+  const image = { artifactId: "image-one", mimeType: "image/png", dataBase64: "aGVsbG8=" };
+  const turn: HarnessTurnInput = {
+    session: { id: "image-session" } as Session,
+    input: "Describe this",
+    systemPrompt: "be concise",
+    history: [],
+    images: [image],
+    tools: {} as HarnessTurnInput["tools"],
+    scopeLabel: scope,
+    orgScopeId: scope,
+    emit: async (entry) => {
+      const saved = {
+        ...entry,
+        seq: entries.length + 1,
+        sessionId: "image-session",
+        createdAt: Date.now(),
+      } as SessionEntry;
+      entries.push(saved);
+      return saved;
+    },
+    recordModelCall: () => {},
+  };
+  await harness.turns.runTurn(turn);
+  assert.deepEqual((entries.find((entry) => entry.type === "user")!.payload as { images: unknown }).images, [
+    { artifactId: image.artifactId, mimeType: image.mimeType },
+  ]);
+  assert.doesNotMatch(JSON.stringify(entries), /aGVsbG8=/);
+  let loads = 0;
+  await harness.turns.runTurn({
+    ...turn,
+    images: [],
+    input: "Explain again",
+    history: [...entries],
+    loadImage: async (ref) => {
+      assert.equal(ref.artifactId, image.artifactId);
+      loads++;
+      return { data: image.dataBase64, sizeBytes: 5 };
+    },
+  });
+  assert.equal(loads, 1);
+  assert.match(readFileSync(join(dir, "replayed.json"), "utf8"), /data:image\/png;base64,aGVsbG8=/);
 });

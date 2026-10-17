@@ -24,7 +24,10 @@ async function setup() {
 test("chat selects a pinned revision, records attribution, and resets through /agent default", async () => {
   const built = await setup();
   try {
-    const a = await built.customAgents.create("U1", "personal:U1", pkg);
+    const a = await built.customAgents.create("U1", "personal:U1", {
+      ...pkg,
+      examples: [{ task: "EXAMPLE-CONTENT-ONLY-ON-DEMAND", expected: "Keep the example out of every system prompt" }],
+    });
     await built.customAgents.publish("U1", a.id, 1);
     const req = {
       surface: "test",
@@ -35,6 +38,7 @@ test("chat selects a pinned revision, records attribution, and resets through /a
     assert.equal(first.status, "ok");
     const requests = await built.sessions.listLlmRequests(first.sessionId!);
     assert.match(JSON.stringify(requests), /AGENT-QUARTZ-731/);
+    assert.doesNotMatch(JSON.stringify(requests), /EXAMPLE-CONTENT-ONLY-ON-DEMAND/);
     const user = (await built.sessions.getEntries(first.sessionId!)).find((e) => e.type === "user")!;
     assert.deepEqual((user.payload as { customAgent: unknown }).customAgent, { id: a.id, version: 1 });
     await built.customAgents.save("U1", a.id, { ...pkg, instructions: "AGENT-NEW-V2" }, 1);

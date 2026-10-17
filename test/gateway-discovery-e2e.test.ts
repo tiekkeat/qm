@@ -38,7 +38,7 @@ for (const protocol of ["openai", "anthropic", "unknown"] as const)
       for await (const chunk of req) chunks.push(chunk);
       const raw = Buffer.concat(chunks).toString();
       const body = raw ? JSON.parse(raw) : {};
-      requests.push({ path: req.url!, body, key: req.headers["x-gateway-key"] });
+      requests.push({ path: new URL(req.url!, "http://localhost").pathname, body, key: req.headers["x-gateway-key"] });
       if (req.headers["x-gateway-key"] !== "company-key") {
         res.writeHead(401);
         return res.end();
@@ -61,7 +61,7 @@ for (const protocol of ["openai", "anthropic", "unknown"] as const)
           }),
         );
       }
-      assert.equal(req.url, expectedPath);
+      assert.equal(new URL(req.url!, "http://localhost").pathname, expectedPath);
       assert.equal(body.model, "acme/future");
       assert.equal(body.prompt_cache_retention, undefined);
       assert.equal(body.store, protocol === "openai" ? false : undefined);

@@ -53,6 +53,16 @@ human author. Request bodies cannot set identity, authorization, or provenance.
 }
 ```
 
+Any spawn — initial or later, by the root or by a worker — may choose the
+model for the workers it creates with optional `model`, `effort` (a thinking
+level) and `fastMode`, e.g.
+`{"action":"spawn","requestId":"r1","count":8,"model":"gpt-6.1-sol","effort":"medium","fastMode":false,"text":"..."}`.
+The choice is stored on each new member (visible in inspect), applies to every
+turn that worker takes, and is inherited by workers it spawns unless they choose
+again. Workers do not copy the root's runtime: fields nobody chose resolve like any
+subagent turn, from the org subagent default and then the owner's default. An
+unavailable model fails closed at dispatch.
+
 Optional `settings` overrides the defaults below at initial spawn. The backend
 can configure defaults with `SWARM_DEFAULTS`, a JSON object such as
 `{"agents":16,"turnMs":900000}`. Values must be positive safe integers within the
@@ -218,22 +228,22 @@ Resume, and Stop; and Pause all, Resume all, and Stop all (with a confirm), whic
 apply this action to the root's direct children so it cascades. The strip
 refreshes every few seconds only while workers are active and the tab is visible.
 
-## Defaults and safety bounds
+## Defaults
 
-| Setting                                          | Default              | Maximum     |
-| ------------------------------------------------ | -------------------- | ----------- |
-| `agents` (root and failed reservations included) | 32                   | 256         |
-| `depth` below root                               | 4                    | 8           |
-| `spawnRequests`                                  | 32                   | 64          |
-| `messages` including initial work                | 128                  | 256         |
-| `notifications` including initial work           | 256                  | 1,024       |
-| `contextBytes` / `textBytes`                     | 8,192 each           | 16,384 each |
-| `lifetimeMs` from first spawn                    | 3,600,000            | 86,400,000  |
-| `turnMs` per notification                        | 600,000 (10 minutes) | 3,600,000   |
-| `waitMs` per read                                | 10,000               | 30,000      |
+| Setting                                          | Default              |
+| ------------------------------------------------ | -------------------- |
+| `agents` (root and failed reservations included) | 32                   |
+| `depth` below root                               | 4                    |
+| `spawnRequests`                                  | 32                   |
+| `messages` including initial work                | 128                  |
+| `notifications` including initial work           | 256                  |
+| `contextBytes` / `textBytes`                     | 8,192 each           |
+| `lifetimeMs` from first spawn                    | 3,600,000            |
+| `turnMs` per notification                        | 600,000 (10 minutes) |
+| `waitMs` per read                                | 10,000               |
 
 The root and at least one worker require `agents >= 2`. All other settings accept
-positive integers up to their maximum. Read requests can still use `waitMs:0`.
+any positive integer; `turnMs` is limited only by the 2,147,483,647 ms timer ceiling. Read requests can still use `waitMs:0`.
 Per-swarm budgets are reserved atomically with the messages and members consuming
 them. Both the orchestrator and independent worker cancellation honor the stored
 turn deadline; existing organization-wide limits can shorten it. Internal reconciliation limits, the 32-message read page, and

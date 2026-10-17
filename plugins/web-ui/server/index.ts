@@ -1,9 +1,11 @@
 import "./instrument.ts";
+import { handleVoiceRoute, sweepDictationSpool } from "./voice-routes.ts";
 import { browserErrorConfig } from "./browser-error-config.ts";
 import { flushErrorReporting, reportBackendError } from "../../chassis/src/error-reporting.ts";
 import { appEditSlug } from "../src/app-edit.ts";
 import { composioCallbackUrl } from "./composio-return.ts";
 import { sharedSessionHtml } from "./shared-session.ts";
+import { uiCanvasRoutes } from "./ui-canvas-routes.ts";
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { Readable } from "node:stream";
@@ -326,12 +328,11 @@ type WebConversation = {
 };
 
 function conversationForScope(
-  user: string,
   threadRef: string,
   scope: string | undefined,
   channelName: string | undefined,
 ): WebConversation | null {
-  if (!scope || scope === `personal:${user}`) return { kind: "dm", threadRef };
+  if (!scope || scope.startsWith("personal:")) return { kind: "dm", threadRef };
   const sep = scope.indexOf(":");
   const kind = scope.slice(0, sep);
   const ref = scope.slice(sep + 1);
@@ -345,17 +346,12 @@ async function resolveWebConversation(
   scope: string | undefined,
   channelName: string | undefined,
 ): Promise<{ conversation: WebConversation } | { error: string; message: string }> {
-  if (
-    (/^web:.+:inbox$/.test(threadRef) && threadRef !== `web:${user}:inbox`) ||
-    (!threadRef.startsWith(`web:${user}:`) &&
-      !threadRef.startsWith(SUBAGENT_THREAD_PREFIX) &&
-      !(scope?.startsWith("channel:") || scope?.startsWith("group:")))
-  ) {
+  if (/^web:.+:inbox$/.test(threadRef) && threadRef !== `web:${user}:inbox`) {
     return { error: "forbidden_thread", message: "this conversation can only be continued from its own context" };
   }
   if (threadRef === `web:${user}:inbox` && !isInboxUser(user))
     return { error: "forbidden", message: "inbox access is not enabled for this user" };
-  const conversation = conversationForScope(user, threadRef, scope, channelName);
+  const conversation = conversationForScope(threadRef, scope, channelName);
   if (!conversation || (threadRef === `web:${user}:inbox` && conversation.kind !== "dm")) {
     return {
       error: "forbidden_scope",
@@ -446,6 +442,7 @@ interface Identity {
   user: string;
   name: string | null;
   impersonator: string | null;
+  portalVerified: boolean;
 }
 type Denial = "unauthenticated" | "not_allowed";
 
@@ -469,7 +466,9 @@ function authenticate(req: IncomingMessage): { identity: Identity } | { denied: 
   }
   if (!user) return { denied: "unauthenticated" };
   if (ALLOW.length > 0 && !ALLOW.includes(user)) return { denied: "not_allowed" };
-  return { identity: { user, name: name?.trim() || null, impersonator: impersonator ?? null } };
+  return {
+    identity: { user, name: name?.trim() || null, impersonator: impersonator ?? null, portalVerified: Boolean(claims) },
+  };
 }
 
 function resolveIdentity(req: IncomingMessage): Identity | null {
@@ -734,9 +733,10 @@ async function readJson<T extends object>(
   req: IncomingMessage,
   res: ServerResponse,
   allowEmpty = true,
+  maxBytes = MAX_BODY_BYTES,
 ): Promise<T | null> {
   try {
-    const raw = await readBody(req);
+    const raw = await readBodyCapped(req, maxBytes);
     if (!raw && !allowEmpty) {
       json(res, 400, { error: "bad_request" });
       return null;
@@ -1670,11 +1670,11 @@ const apiRoutes: readonly WebRoute[] = [
     method: "POST",
     path: "/api/suggested-activities",
     handle: async (c) => {
-      const input = JSON.parse((await readBody(c.req)) || "{}") as { timezone?: unknown };
+      const input = JSON.parse((await readBody(c.req)) || "{}") as { timezone?: unknown; poll?: unknown };
       const response = await coreFetch(
         "POST",
         "/v1/suggested-activities",
-        JSON.stringify({ principalId: c.user, seeds: suggestedActivities, timezone: input.timezone }),
+        JSON.stringify({ principalId: c.user, seeds: suggestedActivities, timezone: input.timezone, poll: input.poll }),
         60_000,
       );
       return json(c.res, response.status, JSON.parse(response.text));
@@ -1708,6 +1708,14 @@ const apiRoutes: readonly WebRoute[] = [
       return relayCore(res, "PUT", "/v1/ui-state", JSON.stringify({ ...body, principalId: user }));
     },
   },
+  ...uiCanvasRoutes({
+    impersonated: (req) => Boolean(resolveIdentity(req)?.impersonator),
+    coreFetch,
+    relayCore,
+    relay,
+    json,
+    readJson,
+  }),
   {
     method: "GET",
     path: "/api/inbox",
@@ -1982,21 +1990,6 @@ const apiRoutes: readonly WebRoute[] = [
   },
   {
     method: "POST",
-    path: "/api/sessions/:id/adopt",
-    handle: async (c) => {
-      const p = await readJson<{ parentSessionId?: unknown }>(c.req, c.res);
-      if (!p) return;
-      if (typeof p.parentSessionId !== "string") return json(c.res, 400, { error: "bad_request" });
-      return relayCore(
-        c.res,
-        "POST",
-        `/v1/sessions/${encodeURIComponent(c.params.id!)}/adopt`,
-        JSON.stringify({ principalId: c.user, parentSessionId: p.parentSessionId }),
-      );
-    },
-  },
-  {
-    method: "POST",
     path: "/api/sessions/:id/detach",
     handle: async (c) => {
       const { res, user } = c;
@@ -2005,6 +1998,19 @@ const apiRoutes: readonly WebRoute[] = [
         res,
         "POST",
         `/v1/sessions/${encodeURIComponent(id)}/detach`,
+        JSON.stringify({ principalId: user }),
+      );
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/sessions/:id/goal/cancel",
+    handle: async (c) => {
+      const { res, user } = c;
+      return relayCore(
+        res,
+        "POST",
+        `/v1/sessions/${encodeURIComponent(c.params.id!)}/goal/cancel`,
         JSON.stringify({ principalId: user }),
       );
     },
@@ -2165,51 +2171,23 @@ const apiRoutes: readonly WebRoute[] = [
     },
   },
   {
-    method: "GET",
-    path: "/api/memory/history",
-    handle: async (c) => {
-      const { res, user } = c;
-      return relayCore(res, "GET", `/v1/memory/history?principalId=${encodeURIComponent(user)}`);
-    },
-  },
-  {
-    method: "POST",
-    path: "/api/memory/restore",
-    handle: async (c) => {
-      const { req, res, user } = c;
-      const p = await readJson<{ revision?: unknown; expectedRevision?: unknown }>(req, res, false);
-      if (!p) return;
-      const revision = typeof p.revision === "string" ? p.revision : "";
-      const expectedRevision = typeof p.expectedRevision === "string" ? p.expectedRevision : "";
-      return relayCore(
-        res,
-        "POST",
-        "/v1/memory/restore",
-        JSON.stringify({ principalId: user, revision, expectedRevision }),
-      );
-    },
-  },
-  {
-    method: "PUT",
+    method: "PATCH",
     path: "/api/memory",
     handle: async (c) => {
       const { req, res, user } = c;
-      const p = await readJson<{ content?: unknown; revision?: unknown }>(req, res, false);
+      const p = await readJson<{ facts?: unknown }>(req, res, false);
       if (!p) return;
-      if (typeof p.content !== "string")
-        return json(res, 400, { error: "bad_request", message: "content must be a string" });
-      const content = p.content;
-      const revision =
-        typeof p.revision === "string"
-          ? p.revision
-          : await coreFetch("GET", `/v1/memory?principalId=${encodeURIComponent(user)}`).then((head) => {
-              try {
-                return String((JSON.parse(head.text) as { revision?: unknown }).revision ?? "");
-              } catch {
-                return "";
-              }
-            });
-      return relayCore(res, "PUT", "/v1/memory", JSON.stringify({ principalId: user, content, revision }));
+      return relayCore(res, "PATCH", "/v1/memory", JSON.stringify({ principalId: user, facts: p.facts }));
+    },
+  },
+  {
+    method: "DELETE",
+    path: "/api/memory",
+    handle: async (c) => {
+      const { req, res, user } = c;
+      const p = await readJson<{ ids?: unknown }>(req, res, false);
+      if (!p) return;
+      return relayCore(res, "DELETE", "/v1/memory", JSON.stringify({ principalId: user, ids: p.ids }));
     },
   },
   {
@@ -2218,24 +2196,34 @@ const apiRoutes: readonly WebRoute[] = [
     handle: async (c) => {
       const { req, res, user } = c;
       const id = c.params.id!;
-      const p = await readJson<{ title?: unknown; archived?: unknown; pinned?: unknown; color?: unknown }>(
-        req,
-        res,
-        false,
-      );
+      const p = await readJson<{
+        title?: unknown;
+        archived?: unknown;
+        pinned?: unknown;
+        color?: unknown;
+        unread?: unknown;
+      }>(req, res, false);
       if (!p) return;
-      const patch: { title?: string | null; archived?: boolean; pinned?: boolean; color?: string | null } = {};
+      const patch: {
+        title?: string | null;
+        archived?: boolean;
+        pinned?: boolean;
+        color?: string | null;
+        unread?: boolean;
+      } = {};
       if (p.title === null || typeof p.title === "string") patch.title = p.title as string | null;
       if (typeof p.archived === "boolean") patch.archived = p.archived;
       if (typeof p.pinned === "boolean") patch.pinned = p.pinned;
       if (p.color === null || typeof p.color === "string") patch.color = p.color as string | null;
+      if (typeof p.unread === "boolean") patch.unread = p.unread;
       if (
         patch.title === undefined &&
         patch.archived === undefined &&
         patch.pinned === undefined &&
-        patch.color === undefined
+        patch.color === undefined &&
+        patch.unread === undefined
       ) {
-        return json(res, 400, { error: "bad_request", message: "title, archived, pinned, or color required" });
+        return json(res, 400, { error: "bad_request", message: "title, archived, pinned, color, or unread required" });
       }
       return relayCore(
         res,
@@ -2652,12 +2640,15 @@ const apiRoutes: readonly WebRoute[] = [
       const attachments: CoreAttachment[] = [];
       let approval: { requestId: string; approved: boolean; scope?: string } | undefined;
       let customAgent: unknown;
+      let desktopClientId: string | undefined;
       let proactiveOpener = false;
       let idempotencyKey: string | undefined;
       try {
         const p = JSON.parse(await readBody(req));
         text = String(p.text ?? "");
         customAgent = p.customAgent;
+        if (typeof p.desktopClientId === "string" && p.desktopClientId.length === 36)
+          desktopClientId = p.desktopClientId;
         idempotencyKey = namespacedSendKey(user, p.idempotencyKey);
         if (
           !idempotencyKey &&
@@ -2720,6 +2711,7 @@ const apiRoutes: readonly WebRoute[] = [
         ...(approval ? { approval } : {}),
         ...(customAgent !== undefined ? { customAgent } : {}),
         ...(proactiveOpener ? { proactiveOpener: true } : {}),
+        ...(desktopClientId && !proactiveOpener ? { desktopClientId } : {}),
         ...(idempotencyKey ? { idempotencyKey } : {}),
       };
       return postTurnAndMint(req, res, turn, user, threadRef);
@@ -2819,7 +2811,10 @@ const apiRoutes: readonly WebRoute[] = [
         scopeId?: unknown;
         channelName?: unknown;
         queuedRunId?: unknown;
-      }>(req, res, false);
+        callId?: unknown;
+        result?: unknown;
+        desktopClientId?: unknown;
+      }>(req, res, false, 6_000_000);
       if (!p) return;
       const kind = typeof p.kind === "string" ? p.kind : "";
       const text = typeof p.text === "string" ? p.text : undefined;
@@ -2843,6 +2838,9 @@ const apiRoutes: readonly WebRoute[] = [
         `/v1/runs/${encodeURIComponent(id)}/signal`,
         JSON.stringify({
           kind,
+          ...(kind === "client_result"
+            ? { callId: p.callId, result: p.result, desktopClientId: p.desktopClientId }
+            : {}),
           ...(text !== undefined ? { text } : {}),
           ...steerFields,
           ...(typeof p.queuedRunId === "string" ? { queuedRunId: p.queuedRunId } : {}),
@@ -3498,6 +3496,13 @@ const routeRequest = async (req: IncomingMessage, res: ServerResponse) => {
   if (path === "/me" || path.startsWith("/api/")) {
     const user = cookieUser(req);
     if (!user) return unauthorized(res, req);
+    if (["/api/dictation", "/api/voice", "/api/voice/sessions"].includes(path)) {
+      return handleVoiceRoute(req, res, path, resolveIdentity(req)!, {
+        org: ORG,
+        publicUrl: PUBLIC_URL,
+      });
+    }
+
     const inboxPath = path === "/api/inbox" || path.startsWith("/api/inbox/");
     const loopsPath = path === "/api/loops" || path.startsWith("/api/loops/");
     if ((inboxPath || loopsPath) && !(await hasInboxLoopPreview(user)))
@@ -3611,6 +3616,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
         t.unref?.();
         void runStateFeed();
         void runInboxFeed();
+        void sweepDictationSpool();
       });
     })
     .catch(async (err: unknown) => {

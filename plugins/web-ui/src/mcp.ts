@@ -1,4 +1,5 @@
 import "./mcp.css";
+import { listPageTpl } from "./list-page";
 import { html, nothing, render } from "lit";
 import { until } from "lit/directives/until.js";
 import { api } from "./core-bridge";
@@ -67,7 +68,7 @@ let adding = false;
 let refreshSequence = 0;
 let shareDraft: { id: string; tools: Set<string> } | null = null;
 
-export function openProjectMcp(scope: string): void {
+function openProjectMcp(scope: string): void {
   selected = null;
   projectFilter = scope;
   filter = "projects";
@@ -187,7 +188,9 @@ function openProject(scope: string) {
   location.href = deepLinkPath(UI_BASE, "contexts", null, scope);
 }
 const button = (label: string, click: () => void, danger = false) =>
-  html`<button type="button" class=${danger ? "danger" : ""} ?disabled=${busy} @click=${click}>${label}</button>`;
+  html`<button type="button" class=${danger ? "btn danger" : "btn"} ?disabled=${busy} @click=${click}>
+    ${label}
+  </button>`;
 
 function addForm() {
   return html`<section class="mcp-card">
@@ -659,57 +662,58 @@ function draw() {
         selected && connection
           ? detail(connection)
           : html`
-              <div class="mcp-heading">
-                <div>
-                  <h1>MCP</h1>
-                  <p>Connections you can use with QM</p>
-                </div>
-                ${button("Add MCP", () => {
-                  adding = true;
-                  draw();
-                })}
-              </div>
               ${adding ? addForm() : nothing}
-              <div class="mcp-filters">
-                <label
-                  >Search<input
-                    type="search"
-                    .value=${search}
-                    @input=${(event: Event) => {
-                      search = (event.target as HTMLInputElement).value;
-                      draw();
-                    }}
-                /></label>
-                <label
-                  >Access<select
-                    .value=${filter}
-                    @change=${(event: Event) => {
-                      filter = (event.target as HTMLSelectElement).value;
-                      draw();
-                    }}
+              ${listPageTpl({
+                title: "MCP",
+                subtitle: "Connections you can use with QM",
+                action: {
+                  label: "Add MCP",
+                  onClick: () => {
+                    adding = true;
+                    draw();
+                  },
+                },
+                search: {
+                  value: search,
+                  placeholder: "Search MCP connections",
+                  onInput: (value) => {
+                    search = value;
+                    draw();
+                  },
+                },
+                filters: html`<div class="mcp-filters">
+                  <label
+                    >Access<select
+                      .value=${filter}
+                      @change=${(event: Event) => {
+                        filter = (event.target as HTMLSelectElement).value;
+                        draw();
+                      }}
+                    >
+                      <option value="all">All</option>
+                      <option value="mine">Mine</option>
+                      <option value="shared">Shared with me</option>
+                      <option value="projects">Projects</option>
+                    </select></label
                   >
-                    <option value="all">All</option>
-                    <option value="mine">Mine</option>
-                    <option value="shared">Shared with me</option>
-                    <option value="projects">Projects</option>
-                  </select></label
-                >
-                <label
-                  >Project<select
-                    .value=${projectFilter}
-                    @change=${(event: Event) => {
-                      projectFilter = (event.target as HTMLSelectElement).value;
-                      draw();
-                    }}
+                  <label
+                    >Project<select
+                      .value=${projectFilter}
+                      @change=${(event: Event) => {
+                        projectFilter = (event.target as HTMLSelectElement).value;
+                        draw();
+                      }}
+                    >
+                      <option value="">All projects</option>
+                      ${inventory.projects.map((project) => html`<option value=${project.scopeId}>${project.name}</option>`)}
+                    </select></label
                   >
-                    <option value="">All projects</option>
-                    ${inventory.projects.map((project) => html`<option value=${project.scopeId}>${project.name}</option>`)}
-                  </select></label
-                >
-              </div>
-              ${busy && !rows.length ? html`<p role="status">Loading MCP connections…</p>` : nothing}
-              ${!busy && !rows.length ? html`<section class="mcp-card"><p>No connections match. Add an MCP server or ask its owner to share it.</p></section>` : nothing}
-              ${catalog}
+                </div>`,
+                rows: catalog,
+                empty: busy
+                  ? "Loading MCP connections…"
+                  : "No connections match. Add an MCP server or ask its owner to share it.",
+              })}
               ${
                 inventory.legacy.length
                   ? html`<section class="mcp-card">

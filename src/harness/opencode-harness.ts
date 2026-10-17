@@ -1,3 +1,4 @@
+import { restoreReplayImages } from "./replay-images.ts";
 import {
   documentExtension,
   documentFallbackText,
@@ -12,7 +13,7 @@ import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createOpencodeClient, type OpencodeClient } from "@opencode-ai/sdk";
-import { CONFIG_DEFAULTS, type Config } from "../config.ts";
+import { CONFIG_DEFAULTS, OPENCODE_RUNTIME_VERSION, type Config } from "../config.ts";
 import { customProviderApi, isCustomModelId } from "../model/custom-providers.ts";
 import type { CustomProviderProtocol, CustomProviderSpec } from "../model/custom-providers.ts";
 import {
@@ -38,14 +39,14 @@ import {
 } from "./harness.ts";
 import { coreToolOptions, type ToolContextRef } from "./agent-tools.ts";
 import {
+  imageRefs,
   bridgedTools,
   harnessToolContext,
   harnessToolOptions,
   oneShotModelUtilities,
   oneShotRunner,
-  tapeReplyCheckpoint,
   recordSteerIntake,
-  recordStoppedReply,
+  recordStoppedTurn,
   type SteerIntake,
   type BridgedTool,
   type HarnessToolPlumbing,
@@ -54,9 +55,9 @@ import {
 import { recordedMessageTimestamps, reconstructMessagesFromHistory } from "./replay.ts";
 import { countTokens } from "../util/tokens.ts";
 
-const OPENCODE_VERSION = "1.18.31";
+const OPENCODE_VERSION = OPENCODE_RUNTIME_VERSION;
 const OPENCODE_IDLE_WAIT_MS = 30 * 60_000;
-export const OPENCODE_STARTUP_TIMEOUT_MS = 90_000;
+const OPENCODE_STARTUP_TIMEOUT_MS = 90_000;
 
 function customProviderNpm(protocol: CustomProviderProtocol): string {
   const api = customProviderApi(protocol);
@@ -77,11 +78,7 @@ export interface OpenCodeHarnessOptions extends HarnessToolPlumbing {
   binaryPath?: string;
   startupTimeoutMs?: number;
   tasks?: TaskStore;
-  /**
-   * Admin-registered custom providers, resolved (with keys) when the
-   * opencode server starts. Registrations made while a server is already
-   * running apply to the next server start.
-   */
+
   resolveCustomProviders?: () => Promise<Array<{ spec: CustomProviderSpec; apiKey?: string }>>;
 }
 
@@ -138,7 +135,7 @@ type Runtime = {
   close(): Promise<void>;
 };
 
-export function bridgeToolName(name: string): string {
+function bridgeToolName(name: string): string {
   if (name === "execute") return "workspace_execute";
   if (name === "read") return "workspace_read";
   if (name === "write") return "workspace_write";
@@ -199,10 +196,7 @@ function sessionToken(secret: string, sessionId: string): string {
   return createHmac("sha256", secret).update(sessionId).digest("base64url");
 }
 
-export function modelRef(id: string): { providerID: string; modelID: string } {
-  // A registered custom model wins before slash-splitting: gateway model ids
-  // routinely contain slashes (e.g. "bedrock/claude-x" behind LiteLLM), and
-  // those must route to the registered provider, not a phantom "bedrock".
+function modelRef(id: string): { providerID: string; modelID: string } {
   if (isCustomModelId(id)) {
     const resolved = resolveModel(id);
     if (resolved?.provider) return { providerID: String(resolved.provider), modelID: id };
@@ -211,18 +205,6 @@ export function modelRef(id: string): { providerID: string; modelID: string } {
   if (slash > 0) return { providerID: id.slice(0, slash), modelID: id.slice(slash + 1) };
   const resolved = resolveModel(id);
   return { providerID: String(resolved?.provider ?? (id.startsWith("gpt-") ? "openai" : "anthropic")), modelID: id };
-}
-
-function stripDataUrls(message: unknown): unknown {
-  const m = message as { parts?: unknown[] };
-  if (!m || !Array.isArray(m.parts)) return message;
-  const parts = m.parts.map((part) => {
-    const p = part as { url?: unknown };
-    if (typeof p?.url !== "string" || !p.url.startsWith("data:")) return part;
-    const { url: _url, ...rest } = p;
-    return { ...rest, omitted: true };
-  });
-  return { ...(message as Record<string, unknown>), parts };
 }
 
 function replayMessages(
@@ -246,13 +228,21 @@ function replayMessages(
           agent: "qm",
           model,
         },
-        parts: message.content.map((part) => ({
-          id: id("part"),
-          sessionID: sessionId,
-          messageID,
-          type: "text",
-          text: part.text,
-        })),
+        parts: message.content.flatMap<Record<string, unknown>>((part) => {
+          const base = { id: id("part"), sessionID: sessionId, messageID };
+          if (part.type === "text") return [{ ...base, type: "text", text: part.text }];
+          if (part.type === "image" && "data" in part)
+            return [
+              {
+                ...base,
+                type: "file",
+                mime: part.mimeType,
+                filename: "replayed-image",
+                url: `data:${part.mimeType};base64,${part.data}`,
+              },
+            ];
+          return [];
+        }),
       });
       continue;
     }
@@ -264,6 +254,7 @@ function replayMessages(
         parts.push({ id: id("part"), sessionID: sessionId, messageID, type: "text", text: part.text });
         continue;
       }
+      if (part.type !== "toolCall") continue;
       const result = source[i + 1];
       const paired = result?.role === "toolResult" && result.toolCallId === part.id ? result : null;
       if (paired) i++;
@@ -278,13 +269,20 @@ function replayMessages(
           ? {
               status: "error",
               input: part.arguments,
-              error: paired.content.map((item) => item.text).join("\n"),
+              error: paired.content
+                .filter((item) => item.type === "text")
+                .map((item) => item.text)
+                .join("\n"),
               time: { start: message.timestamp, end: paired.timestamp },
             }
           : {
               status: "completed",
               input: part.arguments,
-              output: paired?.content.map((item) => item.text).join("\n") ?? "",
+              output:
+                paired?.content
+                  .filter((item) => item.type === "text")
+                  .map((item) => item.text)
+                  .join("\n") ?? "",
               title: part.name,
               metadata: {},
               time: { start: message.timestamp, end: paired?.timestamp ?? message.timestamp },
@@ -906,15 +904,21 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
     ref.abortSignal = controller.signal;
     const tools = bridgedTools(ref, harnessToolOptions(opts, turn));
     turn = await withResumedToolCall(turn, ref, tools);
-    const userEntry = await turn.emit({
-      type: "user",
-      payload: {
-        text: turn.input,
-        ...((turn.triggerTs ?? turn.entryTs) ? { ts: turn.triggerTs ?? turn.entryTs } : {}),
-        ...(turn.attachments?.length ? { attachments: turn.attachments } : {}),
-      },
-      scopeLabel: turn.scopeLabel,
-    });
+    const resumed = turn.continueTurn
+      ? turn.history.find((entry) => entry.seq === turn.resumeUserSeq && entry.type === "user")
+      : undefined;
+    const userEntry =
+      resumed ??
+      (await turn.emit({
+        type: "user",
+        payload: {
+          text: turn.input,
+          ...imageRefs(turn.images),
+          ...((turn.triggerTs ?? turn.entryTs) ? { ts: turn.triggerTs ?? turn.entryTs } : {}),
+          ...(turn.attachments?.length ? { attachments: turn.attachments } : {}),
+        },
+        scopeLabel: turn.scopeLabel,
+      }));
     const aliases = tools.flatMap((tool) => {
       const alias = bridgeToolName(tool.name);
       return alias === tool.name ? [] : [`${alias} is ${tool.name}`];
@@ -924,7 +928,11 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
       ref,
       tools: new Map(tools.map((tool) => [bridgeToolName(tool.name), tool])),
       system: `${turn.systemPrompt}${aliases.length ? `\n\nOpenCode tool aliases: ${aliases.join("; ")}.` : ""}`,
-      history: replayMessages(reconstructMessagesFromHistory(turn.history), sessionId, model),
+      history: replayMessages(
+        await restoreReplayImages(reconstructMessagesFromHistory(turn.history), turn.loadImage),
+        sessionId,
+        model,
+      ),
       userSeq: userEntry.seq,
       captures: [],
       steers: [],
@@ -1093,7 +1101,12 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
         }
       }
     };
-    const prompt = [turn.input, turn.environment].filter((item) => item?.trim()).join("\n\n");
+    const prompt = [
+      resumed ? "Continue the interrupted request using the recorded work above." : turn.input,
+      turn.environment,
+    ]
+      .filter((item) => item?.trim())
+      .join("\n\n");
     const promptParts: Array<Record<string, unknown>> = [
       { type: "text", text: prompt },
       ...(turn.images ?? []).map((image, index) => ({
@@ -1103,7 +1116,6 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
         url: `data:${image.mimeType};base64,${image.dataBase64}`,
       })),
     ];
-    const tapePromptParts = [...promptParts];
     promptParts.push(...(await documentParts(turn.documents ?? [])));
     const enabled = Object.fromEntries(definitions.map((tool) => [tool.name, false]));
     for (const tool of tools) enabled[bridgeToolName(tool.name)] = true;
@@ -1142,44 +1154,14 @@ export function createOpenCodeHarness(opts: OpenCodeHarnessOptions = {}): Harnes
           await processEvent({ payload: { type: "message.part.updated", properties: { part } } });
         }
       }
-      if (turn.tape) {
-        let tapedTriggerUser = false;
-        for (const message of messages.data ?? []) {
-          const role = (message as { info?: { role?: string } }).info?.role;
-          if (role !== "user" && role !== "assistant") continue;
-          const isTrigger = role === "user" && !tapedTriggerUser;
-          if (isTrigger) tapedTriggerUser = true;
-          const steered =
-            role === "user" ? state.steers.find((steer) => steer.messageId === message.info.id) : undefined;
-          if (steered && !steered.stamp) continue;
-          const storedParts = isTrigger ? tapePromptParts : steered?.parts;
-          await turn.tape({
-            kind: "message",
-            harness: "opencode",
-            payload: stripDataUrls(storedParts ? { ...message, parts: storedParts } : message),
-            scopeLabel: turn.scopeLabel,
-            ...steered?.stamp,
-            ...(isTrigger
-              ? {
-                  entrySeq: userEntry.seq,
-                  meta: {
-                    bareText: turn.input,
-                    ...((turn.triggerTs ?? turn.entryTs) ? { ts: (turn.triggerTs ?? turn.entryTs)! } : {}),
-                  },
-                }
-              : {}),
-          });
-        }
-      }
+
       for (const thinking of reasoningFromParts(parts))
         await turn.emit({ type: "thinking", payload: thinking, scopeLabel: turn.scopeLabel });
       const reply = ref.runtimeHandoff || ref.silentRequested ? "" : textFromParts(parts);
       const interrupted = state.stopped || turn.cancel?.aborted === true;
       if (reply) {
-        const finalEntry = interrupted
-          ? await recordStoppedReply(turn, reply)
-          : await turn.emit({ type: "assistant", payload: { text: reply }, scopeLabel: turn.scopeLabel });
-        if (finalEntry) await tapeReplyCheckpoint(turn, finalEntry);
+        if (interrupted) await recordStoppedTurn(turn, reply);
+        else await turn.emit({ type: "assistant", payload: { text: reply }, scopeLabel: turn.scopeLabel });
       }
       return {
         reply,

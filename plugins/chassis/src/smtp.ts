@@ -1,7 +1,7 @@
 import { connect as netConnect, type Socket } from "node:net";
 import { connect as tlsConnect } from "node:tls";
 
-export type SmtpTlsMode = "starttls" | "implicit" | "none";
+type SmtpTlsMode = "starttls" | "implicit" | "none";
 
 export interface SmtpOptions {
   host: string;

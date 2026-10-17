@@ -9,9 +9,10 @@ import { isSubagentThreadRef, stopSessionTree } from "../sessions/session-syscal
 import type { Conversation, Principal, TurnRequest, TurnResult } from "../types.ts";
 import { orgId as orgIdOf } from "../config.ts";
 import { scopeId } from "../types.ts";
+import { rosterAdmits } from "../resolution/scope-membership.ts";
 import { isHalt, routeWake, type Wake } from "../wake/wake.ts";
 import type { OrchestratorInput } from "../core/orchestrator.ts";
-import { isPersonAuthored, resolveTurnOrigin } from "../core/turn-origin.ts";
+import { desktopClientForTurn, isPersonAuthored, isSessionTurn, resolveTurnOrigin } from "../core/turn-origin.ts";
 import { conversationScope } from "../resolution/resolution-service.ts";
 import { isTerminal, leaseLapsed } from "../runs/run-store.ts";
 import type { SessionStateEvent } from "../runs/session-state-bus.ts";
@@ -20,6 +21,7 @@ import { isProjectGroupRef, projectIdFromGroupRef } from "../projects/project-st
 import { samePerson } from "../directory/person.ts";
 import {
   defaultModelForHarness,
+  harnessIdOrPi,
   isHarnessId,
   modelProviderAvailabilityFor,
   modelServiceable,
@@ -41,6 +43,8 @@ const PARTICIPANT_REHYDRATE_TIMEOUT_MS = 5_000;
 import { unscreenedNotice } from "../security/security-posture.ts";
 import type { AppHelpers } from "./app-helpers.ts";
 import type { AmbientHelpers } from "./app-ambient.ts";
+
+const USER_STOP = "by user";
 
 export function attributedSteerText(
   steerer: { id: string; displayName?: string | undefined },
@@ -93,8 +97,8 @@ export function createTurnMethods(
     const signals = deps.signals;
     const stop = async () => {
       const session = await deps.sessions.getByThread(run.sessionId);
-      if (session) return stopSessionTree({ sessions: deps.sessions, runs: deps.runs, signals }, session);
-      await signals.send(run.id, { kind: "abort" });
+      if (session) return stopSessionTree({ sessions: deps.sessions, runs: deps.runs, signals }, session, USER_STOP);
+      await signals.send(run.id, { kind: "abort", reason: USER_STOP });
       if (run.status === "pending") await deps.runs.withdraw(run.id);
       return true;
     };
@@ -139,7 +143,7 @@ export function createTurnMethods(
           return { status: "refused", reason: "This project is read-only because it is being deleted or archived." };
         const roster = (await deps.projects?.members(conversationRef)) ?? [];
         const activeMemberIds = roster.filter((memberId) => deps.identity.isInternal(deps.identity.classify(memberId)));
-        if (!activeMemberIds.includes(actor.id))
+        if (!rosterAdmits(activeMemberIds, actor.id, scopeId("group", conversationRef)))
           return { status: "refused", reason: "you're not a member of that context" };
         projectAudience = await Promise.all(
           activeMemberIds.map(async (memberId) => {
@@ -209,12 +213,13 @@ export function createTurnMethods(
               turnRuntimeScope,
               req.conversation.threadRef,
             );
-            await deps.customAgents.bind(
-              actor.id,
-              `selection:${req.conversation.threadRef}`,
-              turnRuntimeScope,
-              customAgent,
-            );
+            if (customAgent)
+              await deps.customAgents.bind(
+                actor.id,
+                `selection:${req.conversation.threadRef}`,
+                turnRuntimeScope,
+                customAgent,
+              );
           }
           if (customAgent) {
             const audience = projectAudience ?? [actor];
@@ -250,9 +255,8 @@ export function createTurnMethods(
       let privateRequest = req.privateSessionMessage ? req : undefined;
       if (approvedRequest?.privateSessionMessage) privateRequest = approvedRequest;
       const origin = resolveTurnOrigin(privateRequest ?? req);
-
       const modelAccount =
-        !req.externalSlack && deps.userModelCredentials
+        !req.externalSlack && !isSessionTurn(req) && deps.userModelCredentials
           ? await deps.config.getModelAccountDurable(actor.id)
           : "company";
       const individualAuth = modelAccount !== "company";
@@ -314,12 +318,14 @@ export function createTurnMethods(
           if (existing.scopeId !== claimed) {
             return { status: "refused", reason: "that conversation lives in a different context" };
           }
+          if (!(await h.mayWriteSession(actor.id, existing)))
+            return { status: "refused", reason: "you can't continue that conversation from the web" };
         } else if (threadRef.startsWith("web:") && !threadRef.startsWith(`web:${actor.id}:`)) {
           return { status: "refused", reason: "you can only start a new conversation on your own thread" };
         }
         const org = scopeId("org", orgIdOf());
         const targetScope = conversationScope(req.conversation, actor.id);
-        const fallbackHarness = isHarnessId(deps.harnessId) ? deps.harnessId : "pi";
+        const fallbackHarness = harnessIdOrPi(deps.harnessId);
         const runtimeFallback = deps.runtimeFallback ?? {
           harnessId: fallbackHarness,
           modelId: defaultModelForHarness(fallbackHarness),
@@ -439,8 +445,13 @@ export function createTurnMethods(
         surface: req.surface,
         ...(req.slackSource ? { slackSource: req.slackSource } : {}),
         ...(req.externalSlack ? { externalSlack: req.externalSlack } : {}),
+        ...(req.spawned && req.sessionSenderId ? { sessionSenderId: req.sessionSenderId } : {}),
+        ...(req.spawned && req.delegatingRunId ? { delegatingRunId: req.delegatingRunId } : {}),
         ...(sameApprovedMessage && approvedRequest?.sessionSenderId
           ? { sessionSenderId: approvedRequest.sessionSenderId }
+          : {}),
+        ...(sameApprovedMessage && approvedRequest?.delegatingRunId
+          ? { delegatingRunId: approvedRequest.delegatingRunId }
           : {}),
         ...(req.deliveryTarget ? { deliveryTarget: req.deliveryTarget } : {}),
         ...(req.deliveryCandidates?.length ? { deliveryCandidates: req.deliveryCandidates } : {}),
@@ -481,6 +492,7 @@ export function createTurnMethods(
         ...(req.botActor ? { botActor: true } : {}),
         ...(req.surfaceTools ? { surfaceTools: true } : {}),
         ...(req.clientTools?.length ? { clientTools: req.clientTools } : {}),
+        desktopClientId: desktopClientForTurn({ ...req, origin }),
         ...(req.envelopeWrapped ? { envelopeWrapped: true } : {}),
         ...(typeof req.displayText === "string" && req.displayText ? { displayText: req.displayText } : {}),
         ...(req.addressed || origin.kind === "human" ? { addressed: true } : {}),
@@ -548,7 +560,7 @@ export function createTurnMethods(
 
       if (replay) dedupKey = replay.signalDedupKey;
 
-      if (origin.kind === "human" && !req.approval) deps.reaperPoke?.();
+      if (origin.kind === "human" && !isSessionTurn(input) && !req.approval) deps.reaperPoke?.();
 
       if (
         req.surface !== "web" &&
@@ -791,16 +803,18 @@ export function createTurnMethods(
       if (!run) return null;
       if (viewer && !(await viewerMayUseRun(run, viewer))) return null;
       const partial = deps.turnStream?.snapshot(runId);
+      const goal = deps.turnStream?.goal(runId);
+      const runtime = deps.turnStream?.runtime(runId) ?? run.result?.runtime;
       const firstBlock = deps.turnStream?.firstBlock(runId);
       const surfacePosted = deps.turnStream?.surfacePosted(runId) ?? false;
       const alive = run.status === "running" && !leaseLapsed(run, Date.now());
       const replying = deps.turnStream?.replying(runId) ?? false;
       const replyComplete = deps.turnStream?.isReplyDone(runId) ?? false;
       const activity = await deps.runActivity?.list(runId);
-      const tasks = await deps.tasks?.list({ originRunId: runId });
       const stale =
         run.status === "pending" ? run.attempts > 0 : !alive && leaseLapsed(run, Date.now() - STALE_LEASE_GRACE_MS);
       return {
+        desktopClientId: desktopClientForTurn({ ...run.request, attempt: run.attempts }),
         status: run.status,
         result: run.result ? await withAdminLink(run.result) : run.result,
         ...(run.request.surface === "web" &&
@@ -828,7 +842,9 @@ export function createTurnMethods(
           : {}),
         startedAt: run.startedAt,
         finishedAt: run.finishedAt,
-        ...(partial ? { partial } : {}),
+        ...(goal ? { goal } : {}),
+        ...(runtime ? { runtime } : {}),
+        ...(partial ? { partial, partialStartOffset: deps.turnStream!.startOffset(runId) } : {}),
         ...(firstBlock
           ? { firstBlock: firstBlock.text, ...(firstBlock.closed ? { firstBlockClosed: true } : {}) }
           : {}),
@@ -837,7 +853,6 @@ export function createTurnMethods(
         ...(stale ? { stale: true } : {}),
         ...(replying ? { replying: true } : {}),
         ...(replyComplete ? { replyComplete: true } : {}),
-        ...(tasks?.length ? { tasks: tasks.map(({ id, title, status }) => ({ id, title, status })) } : {}),
         ...(activity && activity.length ? { activity } : {}),
       };
     },
@@ -864,7 +879,7 @@ export function createTurnMethods(
       const stop = async () => {
         const session = await deps.sessions.getByThread(threadRef);
         if (!session || !deps.signals || (viewer && !(await sessionForViewer(session.id, viewer)))) return false;
-        return stopSessionTree({ sessions: deps.sessions, runs: deps.runs, signals: deps.signals }, session);
+        return stopSessionTree({ sessions: deps.sessions, runs: deps.runs, signals: deps.signals }, session, USER_STOP);
       };
       return deps.advisoryLock ? deps.advisoryLock.withLock("session-tree-admission", stop) : stop();
     },
@@ -932,7 +947,8 @@ export function createTurnMethods(
       }
       if (signal.kind === "client_result") {
         if (viewer && !samePerson(run.request.actor.id, viewer)) return { accepted: false, reason: "not_found" };
-        if (!run.request.clientTools?.length) return { accepted: false, reason: "no_client_tools" };
+        if (!run.request.clientTools?.length && !run.request.desktopClientId)
+          return { accepted: false, reason: "no_client_tools" };
         const sent = await deps.signals.send(runId, {
           kind: "client_result",
           callId: signal.callId,

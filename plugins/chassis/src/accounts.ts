@@ -1,12 +1,7 @@
 import { fetchCoreText } from "./core-client.ts";
 
 export type LoginPolicy = "both" | "password" | "email";
-export interface AccountInfo {
-  email: string;
-  hasPassword: boolean;
-  mustChangePassword: boolean;
-  version: number;
-}
+
 export interface PasswordTicket {
   email: string;
   kind: "setup" | "change" | "reset";

@@ -18,6 +18,8 @@ function principal(ctx: ApiCtx): string | null {
 async function handle(ctx: ApiCtx): Promise<void> {
   const actor = principal(ctx);
   if (!actor) return;
+  if (ctx.capability && ctx.method !== "GET" && ctx.capability.liveActor !== true && ctx.capability.liveAuthor !== true)
+    return sendJson(ctx.res, 403, { error: "live_user_required" });
   try {
     if (ctx.params.scopeId) {
       if (ctx.method === "GET") return sendJson(ctx.res, 200, await ctx.app.listSandboxes(actor, ctx.params.scopeId));

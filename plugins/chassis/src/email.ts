@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { isMissingOrPlaceholder } from "./env.ts";
+import { isMissingOrPlaceholder } from "./config-values.ts";
 import { smtpDeliver, type SmtpOptions } from "./smtp.ts";
 
 export interface OutgoingEmail {

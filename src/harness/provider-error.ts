@@ -1,7 +1,7 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { ProviderTurnError, type ProviderErrorCode } from "../core/turn-error.ts";
 
-type ProviderFailureMessage = AssistantMessage & {
+type ProviderFailureMessage = Pick<AssistantMessage, "rawStopReason" | "errorMessage"> & {
   providerError?: { status?: number; type?: string; code?: string; body?: unknown };
 };
 

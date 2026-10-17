@@ -9,8 +9,7 @@ test("Docker deployments use isolated networks and remove them on destroy", asyn
   const calls: string[][] = [];
   const dockerExec: DockerExec = async (args) => {
     calls.push(args);
-    if (args[0] === "inspect" && args[2] === "{{.State.Running}}")
-      return { code: 0, stdout: "true\n", stderr: "" };
+    if (args[0] === "inspect" && args[2] === "{{.State.Running}}") return { code: 0, stdout: "true\n", stderr: "" };
     return {
       code: args[1] === "inspect" ? 1 : 0,
       stdout: "",
@@ -68,8 +67,7 @@ test("containerized core mounts its host snapshot, routes over a private network
       return { code: 0, stdout: `${running}\n`, stderr: "" };
     if (args[0] === "inspect" && args[2] === "{{json .NetworkSettings.Networks}}")
       return { code: 0, stdout: JSON.stringify({ [net]: {} }), stderr: "" };
-    if (args[0] === "network" && args[1] === "inspect")
-      return { code: 1, stdout: "", stderr: "No such network" };
+    if (args[0] === "network" && args[1] === "inspect") return { code: 1, stdout: "", stderr: "No such network" };
     return { code: 0, stdout: "", stderr: "" };
   };
   const provider = createDockerDeployProvider({
@@ -115,7 +113,10 @@ test("containerized core refuses snapshots outside its Docker mounts", async () 
     return { code: 0, stdout: "", stderr: "" };
   };
   const provider = createDockerDeployProvider({ dockerExec, coreContainer: "qm-core" });
-  await assert.rejects(provider.apply(deployment, deployment.versions[0]!), /outside the core container's Docker mounts/);
+  await assert.rejects(
+    provider.apply(deployment, deployment.versions[0]!),
+    /outside the core container's Docker mounts/,
+  );
 });
 
 test("Docker publish reports startup errors from an exited app", async () => {
@@ -128,8 +129,7 @@ test("Docker publish reports startup errors from an exited app", async () => {
   });
   const dockerExec: DockerExec = async (args) => {
     if (args[0] === "network" && args[1] === "inspect") return { code: 1, stdout: "", stderr: "missing" };
-    if (args[0] === "inspect" && args[2] === "{{.State.Running}}")
-      return { code: 0, stdout: "false\n", stderr: "" };
+    if (args[0] === "inspect" && args[2] === "{{.State.Running}}") return { code: 0, stdout: "false\n", stderr: "" };
     if (args[0] === "logs") return { code: 0, stdout: "", stderr: "Cannot find module '/app/server.js'" };
     return { code: 0, stdout: "", stderr: "" };
   };
@@ -157,12 +157,13 @@ test("Docker provider migrates running deployments off the legacy shared network
     if (args[0] === "inspect") {
       return {
         code: 0,
-        stdout: args[2] === "{{.State.Running}}"
-          ? "true\n"
-          : JSON.stringify({
-              ...(legacyAttached ? { "agent-deploynet": {} } : {}),
-              ...(targetAttached ? { [`${containerName}-net`]: {} } : {}),
-            }),
+        stdout:
+          args[2] === "{{.State.Running}}"
+            ? "true\n"
+            : JSON.stringify({
+                ...(legacyAttached ? { "agent-deploynet": {} } : {}),
+                ...(targetAttached ? { [`${containerName}-net`]: {} } : {}),
+              }),
         stderr: "",
       };
     }
@@ -283,4 +284,70 @@ test("the daemon probe reports a hung daemon as a timeout", async () => {
   const dockerExec: DockerExec = async () => ({ code: -1, stdout: "", stderr: "" });
 
   assert.equal(await dockerDaemonFailure({ dockerExec }), "no response within 10s");
+});
+
+test("a Docker app that only answers 5xx fails publish, reports its output and leaves no container", async () => {
+  const calls: string[][] = [];
+  const dockerExec: DockerExec = async (args) => {
+    calls.push(args);
+    const script = args[0] === "exec" ? args.at(-1)! : "";
+    if (script.includes("http_code")) return { code: 96, stdout: "500\n", stderr: "" };
+    if (script.startsWith("tail -c")) return { code: 0, stdout: "boot: database unreachable", stderr: "" };
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const reported: Array<{ code: string; message: string }> = [];
+  const store = createDeployStore();
+  const d = await store.create({
+    ownerScopeId: scopeId("personal", "U1"),
+    createdBy: "U1",
+    entrypoint: "node server.js",
+    snapshotDir: "/snap/broken",
+  });
+  const provider = createDockerDeployProvider({ dockerExec, onError: (e) => reported.push(e) });
+  await assert.rejects(provider.apply(d, d.versions[0]!), /answered HTTP 500 on \/ .*database unreachable/s);
+  assert.deepEqual(
+    reported.map((e) => e.code),
+    ["app_start_failed"],
+  );
+  assert.match(reported[0]!.message, new RegExp(`\\(deployment ${d.id}\\)`), "the record names the deployment");
+  assert.equal(calls.at(-2)!.join(" "), `rm -f agent-deploy-${d.id.slice(0, 12)}`);
+});
+
+test("Docker startup timeout retains a redacted probe cause and bounded app logs", async (t) => {
+  const store = createDeployStore();
+  const deployment = await store.create({
+    ownerScopeId: scopeId("personal", "U1"),
+    createdBy: "U1",
+    entrypoint: "node server.js",
+    snapshotDir: "/snap/one",
+  });
+  const dockerExec: DockerExec = async (args) => {
+    if (args[0] === "network" && args[1] === "inspect") return { code: 1, stdout: "", stderr: "missing" };
+    if (args[0] === "inspect" && args[2] === "{{.State.Running}}") return { code: 0, stdout: "true", stderr: "" };
+    if (args[0] === "logs")
+      return { code: 0, stdout: "x".repeat(20_000), stderr: "App failed: access_token=app-secret-value" };
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  let probed = false;
+  const provider = createDockerDeployProvider({
+    dockerExec,
+    fetchImpl: async () => {
+      probed = true;
+      throw new Error("DNS lookup failed: access_token=probe-secret-value");
+    },
+  });
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
+  const rejected = assert.rejects(provider.apply(deployment, deployment.versions[0]!), (error: Error) => {
+    assert.match(error.message, /did not listen/);
+    assert.match(error.message, /App failed/);
+    assert.ok(error.message.length < 17_000);
+    assert.ok(!error.message.includes("app-secret-value"));
+    assert.match((error.cause as Error).message, /DNS lookup failed/);
+    assert.ok(!(error.cause as Error).message.includes("probe-secret-value"));
+    return true;
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(probed, true);
+  t.mock.timers.tick(60_001);
+  await rejected;
 });

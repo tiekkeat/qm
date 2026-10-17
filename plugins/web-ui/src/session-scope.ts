@@ -1,9 +1,8 @@
-import { sessionStatusMark } from "./session-status.ts";
-import type { CoreSession } from "./core-bridge.ts";
 import { html, nothing, type TemplateResult } from "lit";
 import { ArrowUpLeft, Box, Brain, Clock3, Ellipsis, Files, GitFork, KeyRound, Rocket } from "lucide";
 import { api } from "./core-bridge";
-import { closeFormMenus, icon, toggleFormMenu } from "./ui";
+import { closeFormMenus, toggleFormMenu } from "./ui";
+import { icon } from "./icons";
 import { tip } from "./tooltip";
 
 /** A session's context carried into the crons/files/memory views so the whole
@@ -78,7 +77,6 @@ export function scopeToolCount(tool: SessionTool, scope: string, onReady: () => 
 export type SessionTool = "crons" | "files" | "memory" | "apps" | "skills" | "agents" | "keychain";
 
 export interface SessionTopbarOpts {
-  status?: CoreSession["status"];
   sessionId?: string | null;
   crumb: string | null;
   title: string;
@@ -181,7 +179,6 @@ export function sessionTopbarTpl(o: SessionTopbarOpts): TemplateResult {
             </button>`
           : html`<div class="session-heading">${heading}</div>`
       }
-      ${sessionStatusMark(o.status)}
       <div class="topbar-actions session-tools">
         ${tool("crons", Clock3, "Crons")} ${tool("apps", Rocket, "Apps")} ${tool("files", Files, "Files")}
         ${tool("agents", Brain, "Agents")} ${tool("skills", Box, "Skills")} ${tool("memory", Brain, "Memory")}
@@ -201,7 +198,7 @@ export function sessionTopbarTpl(o: SessionTopbarOpts): TemplateResult {
         <div class="menu-popover" role="menu" hidden>
           <div class="menu-title">This conversation's workspace</div>
           ${sheetTool("crons", Clock3, "Crons")} ${sheetTool("apps", Rocket, "Apps")}
-          ${sheetTool("agents", Brain, "Agents")} ${sheetTool("files", Files, "Files")}
+          ${sheetTool("files", Files, "Files")} ${sheetTool("agents", Brain, "Agents")}
           ${sheetTool("skills", Box, "Skills")} ${sheetTool("memory", Brain, "Memory")}
           ${sheetTool("keychain", KeyRound, "Your keychain")}
         </div>

@@ -11,7 +11,7 @@ import { NonRetryableTurnError, ProviderTurnError, TitleRejected } from "../core
 import { NeedsApproval } from "../tools/primitives.ts";
 import { deterministicCompactSummary, estimateHistoryTokens } from "./context-compaction.ts";
 import { countTokens } from "../util/tokens.ts";
-import { recordStoppedReply } from "./harness-shared.ts";
+import { recordStoppedTurn } from "./harness-shared.ts";
 import {
   SECURITY_SCREEN_STEP,
   SECURITY_SCREEN_SYSTEM_PROMPT,
@@ -97,15 +97,19 @@ export function createMockHarness(): Harness {
     },
     {
       async runTurn(turn: HarnessTurnInput): Promise<HarnessTurnResult> {
-        const userEntry = await turn.emit({
-          type: "user",
-          payload: {
-            text: turn.input,
-            ...((turn.triggerTs ?? turn.entryTs) ? { ts: turn.triggerTs ?? turn.entryTs } : {}),
-            ...(turn.attachments?.length ? { attachments: turn.attachments } : {}),
-          },
-          scopeLabel: turn.scopeLabel,
-        });
+        const continued = turn.continueTurn ? turn.history.find((e) => e.seq === turn.resumeUserSeq) : undefined;
+        if (continued) turn = { ...turn, input: "", environment: undefined };
+        const userEntry =
+          continued ??
+          (await turn.emit({
+            type: "user",
+            payload: {
+              text: turn.input,
+              ...((turn.triggerTs ?? turn.entryTs) ? { ts: turn.triggerTs ?? turn.entryTs } : {}),
+              ...(turn.attachments?.length ? { attachments: turn.attachments } : {}),
+            },
+            scopeLabel: turn.scopeLabel,
+          }));
         const modelPrompt = [turn.input, turn.environment].filter((s) => s && s.trim()).join("\n\n");
 
         turn.recordModelCall({
@@ -145,7 +149,6 @@ export function createMockHarness(): Harness {
             ...(turn.documents?.length
               ? { documents: turn.documents.map(({ name, mimeType, artifactId }) => ({ name, mimeType, artifactId })) }
               : {}),
-            ...(turn.tapeMode ? { tapeMode: turn.tapeMode } : {}),
           },
           truncated: false,
           usage: callUsage(0),
@@ -182,7 +185,7 @@ export function createMockHarness(): Harness {
         } else if (command0 === "!boom-always" || boomAlwaysSessions.has(turn.session.id)) {
           boomAlwaysSessions.add(turn.session.id);
           throw new Error("boom: simulated turn fault");
-        } else if (command0.startsWith("(system note:") && resumePostSessions.has(turn.session.id)) {
+        } else if (resumePostSessions.has(turn.session.id)) {
           const msg = resumePostSessions.get(turn.session.id)!;
           resumePostSessions.delete(turn.session.id);
           await turn.emit({
@@ -198,7 +201,7 @@ export function createMockHarness(): Harness {
           });
           usedTool = true;
           reply = r.ok ? "(posted after resume)" : `[not sent] ${r.message ?? "failed"}`;
-        } else if (command0.startsWith("(system note:") && shutdownResumeSessions.has(turn.session.id)) {
+        } else if (shutdownResumeSessions.has(turn.session.id)) {
           shutdownResumeSessions.delete(turn.session.id);
           reply = "finished after resume";
         } else if (command0 === "!work-until-shutdown") {
@@ -217,7 +220,7 @@ export function createMockHarness(): Harness {
             if (!turn.cancel || turn.cancel.aborted) resolve();
             else turn.cancel.addEventListener("abort", () => resolve(), { once: true });
           });
-          await recordStoppedReply(turn, "(stopped)");
+          await recordStoppedTurn(turn, "");
           return { reply: "(stopped)", stopped: true, modelCalls: 1 };
         } else if (command0.startsWith("!post-lost-result ")) {
           const msg = cmd.slice(cmd.indexOf("!post-lost-result ") + "!post-lost-result ".length);
@@ -379,12 +382,6 @@ export function createMockHarness(): Harness {
           reply = `wallclock:${turn.turnWallClockMs ?? 0}`;
         } else if (command0 === "!surfacename") {
           reply = `surface:${turn.surfaceName ?? "none"}`;
-        } else if (command0.startsWith("!askagent ")) {
-          const rest = command0.slice("!askagent ".length).trim();
-          const sp = rest.indexOf(" ");
-          const target = sp === -1 ? rest : rest.slice(0, sp);
-          const task = sp === -1 ? "help with this request" : rest.slice(sp + 1).trim();
-          reply = `I'll ask their personal agent.\n\n[[ask-agent: ${target} | ${task}]]`;
         } else if (command0.startsWith("!think ")) {
           await turn.emit({
             type: "thinking",
@@ -397,10 +394,12 @@ export function createMockHarness(): Harness {
             command: string;
             credentials?: string[];
             ownerAuth?: boolean;
+            sandboxId?: string;
           };
           const result = await turn.tools.execute(params.command, {
             credentials: params.credentials,
             ownerAuth: params.ownerAuth,
+            sandboxId: params.sandboxId,
           });
           await turn.emit({ type: "tool_result", payload: result, scopeLabel: turn.scopeLabel });
           turn.onProgress?.({ toolCalls: 1 });
@@ -577,9 +576,13 @@ export function createMockHarness(): Harness {
           const hits = await turn.tools.memorySearch(query);
           usedTool = true;
           reply = hits?.join("\n") ?? "(memory unavailable)";
+        } else if (command0.startsWith("!memoryread ")) {
+          const scope = command0.slice("!memoryread ".length).trim();
+          reply = (await turn.tools.memoryRead(scope)) ?? "(memory unavailable)";
+          usedTool = true;
         } else if (command0.startsWith("!memoryremember ")) {
           const fact = command0.slice("!memoryremember ".length).trim();
-          const added = await turn.tools.memoryRemember([fact]);
+          const added = await turn.tools.memoryAdd([fact]);
           usedTool = true;
           reply = added === null ? "(memory unavailable)" : `remembered ${added}`;
         } else if (command0.startsWith("!skill-run ")) {
@@ -913,7 +916,6 @@ export function createMockHarness(): Harness {
                     documents: turn.documents.map(({ name, mimeType, artifactId }) => ({ name, mimeType, artifactId })),
                   }
                 : {}),
-              ...(turn.tapeMode ? { tapeMode: turn.tapeMode } : {}),
             },
             truncated: false,
             usage: callUsage(1),

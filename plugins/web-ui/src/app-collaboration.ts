@@ -2,7 +2,8 @@ import { html, nothing } from "lit";
 import { ref } from "lit/directives/ref.js";
 import { Github, Check, Copy, ExternalLink, RefreshCw, X, GitBranch, ShieldCheck } from "lucide";
 import { api, withBase } from "./core-bridge";
-import { copyText, icon } from "./ui";
+import { copyText } from "./ui";
+import { icon } from "./icons";
 import { restoreDialogFocus } from "./dialog-focus";
 import type { DeploymentView } from "./deploy-view";
 import {

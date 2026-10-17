@@ -17,7 +17,16 @@ import {
 } from "./sandbox.ts";
 
 export type SandboxBackendName =
-  "sprites" | "aws" | "local" | "smolmachines" | "e2b" | "modal" | "porter" | "agent37" | "superserve";
+  | "sprites"
+  | "aws"
+  | "local"
+  | "smolmachines"
+  | "e2b"
+  | "modal"
+  | "porter"
+  | "agent37"
+  | "superserve"
+  | "do-managed-agents";
 
 export class NoDefaultSandboxError extends Error {
   constructor() {
@@ -96,13 +105,14 @@ export function createSandboxRouter(opts: RoutingSandboxOptions): Sandbox {
     profile: fallback.profile,
 
     async profileFor(scopeId: string, sandboxId?: string): Promise<AgentComputerProfile> {
-      const resource = sandboxId ? await resources.get(sandboxId) : await resources.resolve(scopeId);
+      const resource = sandboxId !== undefined ? await resources.get(sandboxId) : await resources.resolve(scopeId);
       return resource ? backendFor(resource.backend).profile : fallback.profile;
     },
 
     async provision(layers: WorkspaceLayer[], provOpts?: ProvisionOptions): Promise<SandboxHandle> {
       const scope = provOpts?.routeScopeId ?? writableScope(layers);
-      const resource = provOpts?.sandboxId ? await resources.get(provOpts.sandboxId) : await resources.resolve(scope);
+      const resource =
+        provOpts?.sandboxId !== undefined ? await resources.get(provOpts.sandboxId) : await resources.resolve(scope);
       const backend = resource?.backend ?? defaultBackend;
       const sandbox = backendFor(backend);
       const provision = async (targetLayers: WorkspaceLayer[]) => {
@@ -121,7 +131,16 @@ export function createSandboxRouter(opts: RoutingSandboxOptions): Sandbox {
       const routedLayers = layers.map((layer) =>
         layer.mode === "rw" ? { ...layer, scopeId: resource.backingScopeId } : layer,
       );
-      const handle = await resources.use(resource.id, () => provision(routedLayers), true, provOpts?.lifecycleCleanup);
+      const handle = await resources.use(
+        resource.id,
+        async () => {
+          const handle = await provision(routedLayers);
+          if (provOpts?.runId) await resources.hold(resource.id, provOpts.runId);
+          return handle;
+        },
+        false,
+        provOpts?.lifecycleCleanup,
+      );
       return { ...handle, backend: resource.backend, scopeId: resource.ownerScopeId, resourceId: resource.id };
     },
 
@@ -159,12 +178,15 @@ export function createSandboxRouter(opts: RoutingSandboxOptions): Sandbox {
       });
     },
     teardown(handle, tdOpts?: TeardownOptions): Promise<void> {
-      const action = () => forHandle(handle).teardown(handle, tdOpts);
+      const action = async () => {
+        const held = handle.resourceId && (await resources.get(handle.resourceId)).holders?.length;
+        await forHandle(handle).teardown(handle, held && !tdOpts?.destroy ? { ...tdOpts, keepWarm: true } : tdOpts);
+      };
       return handle.resourceId
         ? resources.use(
             handle.resourceId,
             action,
-            !!tdOpts?.destroy || !!forHandle(handle).profile.parksOnTeardown,
+            !!tdOpts?.destroy || (!tdOpts?.keepWarm && !!forHandle(handle).profile.parksOnTeardown),
             true,
           )
         : action();

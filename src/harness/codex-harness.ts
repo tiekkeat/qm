@@ -1,3 +1,4 @@
+import { restoreReplayImages } from "./replay-images.ts";
 import { documentsFallbackText } from "../core/document-inputs.ts";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -5,12 +6,12 @@ import { join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { CONFIG_DEFAULTS, type Config } from "../config.ts";
 import { NonRetryableTurnError, ProviderTurnError, type ProviderErrorCode } from "../core/turn-error.ts";
-import { DEFAULT_CODEX_MODEL_ID, modelSupportedByHarness } from "../model/pi-models.ts";
+import { DEFAULT_CODEX_MODEL_ID, codexProviderModelId, modelSupportedByHarness } from "../model/pi-models.ts";
 import { startSignalPoll, type RunSignalStore } from "../runs/run-signal-store.ts";
 import type { TaskStatus, TaskStore } from "../tasks/task-store.ts";
 import type { LlmCallUsage } from "../sessions/session-store.ts";
 import type { ScopeId, SessionEntry } from "../types.ts";
-import { asError, swallow } from "../util/errors.ts";
+import { swallow } from "../util/errors.ts";
 import { countTokens } from "../util/tokens.ts";
 import { CodexAppServer, CodexRpcError } from "./codex-app-server.ts";
 import { redactSecrets } from "./redact-secrets.ts";
@@ -24,6 +25,7 @@ import {
 import { defineHarness, type Harness, type HarnessTurnInput, type HarnessTurnResult } from "./harness.ts";
 import { coreToolOptions, type ToolContextRef } from "./agent-tools.ts";
 import {
+  imageRefs,
   bridgedTools,
   nativeChildToolAllowed,
   bridgedToolText,
@@ -31,9 +33,8 @@ import {
   harnessToolOptions,
   oneShotModelUtilities,
   oneShotRunner,
-  tapeReplyCheckpoint,
   recordSteerIntake,
-  recordStoppedReply,
+  recordStoppedTurn,
   type SteerIntake,
   transitionTask,
   type BridgedTool,
@@ -55,9 +56,9 @@ export interface CodexHarnessOptions extends HarnessToolPlumbing {
   env?: NodeJS.ProcessEnv;
   turnWallClockMs?: number;
   appServerStartTimeoutMs?: number;
-  /** Cap on simultaneous per-user app-server launches (default 8). */
+
   maxConcurrentUserServers?: number;
-  /** Custodian of the ChatGPT-subscription Codex login (keychain-backed in production). */
+
   authStore?: CodexAuthStore;
   resolveApiKey?: () => Promise<string | null>;
   signals?: RunSignalStore;
@@ -155,7 +156,6 @@ type ActiveTurn = {
   usageByThread: Map<string, LlmCallUsage>;
   firstOutputAt: number | null;
   fallbackInputTokens: number;
-  tapeError?: Error;
   seenUserItems: Set<string>;
   pendingSteers: Array<{ prompt: string; inputText: string; intake: SteerIntake }>;
   interrupt?: () => Promise<void>;
@@ -173,8 +173,6 @@ type StartingRuntime = {
 };
 const CODEX_START_TIMEOUT_MS = 30_000;
 
-// Codex app-server TurnError.codexErrorInfo (protocol v2, codex-cli 0.156.1). Strings and single-key
-// objects; HTTP-backed variants carry httpStatusCode.
 type CodexErrorInfo = string | Record<string, { httpStatusCode?: number | null } | undefined>;
 
 const CODEX_ERROR_CODES: Record<string, ProviderErrorCode> = {
@@ -194,7 +192,6 @@ const CODEX_ERROR_CODES: Record<string, ProviderErrorCode> = {
   badRequest: "bad_request",
 };
 
-/** Classifies a Codex failure from codexErrorInfo only; the message text is carried, never matched. */
 export function codexProviderFailure(message: string, info?: CodexErrorInfo | null): ProviderTurnError {
   const safe = redactSecrets(message);
   const variant = typeof info === "string" || !info ? info || undefined : Object.keys(info)[0];
@@ -307,7 +304,6 @@ export function prepareCodexHome(
   const fileAuth = () => (authPath ? readCodexOAuthAuthFile(authPath) : null);
   const oauthAuth = auth !== undefined ? auth : fileAuth();
   if (oauthAuth) {
-    // The child receives derived, ephemeral material only: no refresh token.
     writeFileSync(join(target, "auth.json"), JSON.stringify(childCodexOAuthAuth(oauthAuth)), { mode: 0o600 });
     return target;
   }
@@ -336,7 +332,12 @@ function replayItems(messages: readonly PiReplayMessage[]): CodexItem[] {
       out.push({
         type: "message",
         role: "user",
-        content: message.content.map((part) => ({ type: "input_text", text: part.text })),
+        content: message.content.flatMap<Record<string, unknown>>((part) => {
+          if (part.type === "text") return [{ type: "input_text", text: part.text }];
+          if (part.type === "image" && "data" in part)
+            return [{ type: "input_image", image_url: `data:${part.mimeType};base64,${part.data}` }];
+          return [];
+        }),
       });
       continue;
     }
@@ -344,7 +345,10 @@ function replayItems(messages: readonly PiReplayMessage[]): CodexItem[] {
       out.push({
         type: "function_call_output",
         call_id: codexReplayCallId(message.toolCallId),
-        output: message.content.map((part) => part.text).join("\n"),
+        output: message.content
+          .filter((part) => part.type === "text")
+          .map((part) => part.text)
+          .join("\n"),
       });
       continue;
     }
@@ -432,10 +436,7 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
   let startingServer: CodexAppServer | null = null;
   let setupUsers = 0;
   let runtimeCleanupRequested = false;
-  // Per-user turns get their own short-lived app-server (own jail, own auth) —
-  // measured at ~0.5s/9MB per spawn — so accounts never share a process and
-  // org turns are never serialized behind them. The semaphore only bounds
-  // simultaneous process launches.
+
   const ephemeralServers = new Set<CodexAppServer>();
   const maxConcurrentSpawns = opts.maxConcurrentUserServers ?? 8;
   let activeSpawns = 0;
@@ -575,8 +576,6 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
             }
           }
           if (method === "item/completed") {
-            let stamp: Awaited<ReturnType<typeof recordSteerIntake>> | undefined;
-            let tapeItem = item;
             if (
               threadId === state.threadId &&
               item.type === "userMessage" &&
@@ -592,25 +591,10 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
               const index = state.pendingSteers.findIndex((steer) => steer.inputText === text);
               if (index >= 0) {
                 const [steer] = state.pendingSteers.splice(index, 1);
-                stamp = await recordSteerIntake(state.turn, steer!.intake);
-                tapeItem = { type: "message", role: "user", content: [{ type: "input_text", text: steer!.prompt }] };
+                await recordSteerIntake(state.turn, steer!.intake);
               }
             }
             state.completedItems.push(item);
-            if (state.turn.tape && !state.tapeError) {
-              try {
-                await state.turn.tape({
-                  kind: "message",
-                  harness: "codex",
-                  scopeLabel: state.turn.scopeLabel,
-                  payload: tapeItem,
-                  ...stamp,
-                });
-              } catch (error) {
-                state.tapeError = asError(error);
-                void state.interrupt?.();
-              }
-            }
           }
           await processCollabItem(state, item);
         }
@@ -934,9 +918,6 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
     };
     try {
       if (!ephemeral && oauthConfigured) {
-        // Re-materialize fresh, centrally refreshed tokens for this turn. The
-        // store owns the refresh token; the child jail only ever holds
-        // short-lived derived material.
         const sourceAuth = await awaitSetup(authStore!.load());
         if (!sourceAuth) {
           rmSync(join(rt.jail, "codex-home", "auth.json"), { force: true });
@@ -976,7 +957,9 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
         inputSchema: tool.parameters,
       }));
       const requestedModel = turn.runtime?.modelId;
-      model = modelSupportedByHarness(requestedModel, "codex") ? requestedModel! : resolveModelId(turn.scopeLabel);
+      model = codexProviderModelId(
+        modelSupportedByHarness(requestedModel, "codex") ? requestedModel! : resolveModelId(turn.scopeLabel),
+      );
       const reasoningEffort = codexReasoningEffort(turn.runtime?.effortLevel);
       threadStartRequest = {
         ...(model ? { model } : {}),
@@ -1059,19 +1042,25 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
     let userEntry!: SessionEntry;
     try {
       threadId = started.thread.id;
-      replay = replayItems(reconstructMessagesFromHistory(turn.history));
+      replay = replayItems(await restoreReplayImages(reconstructMessagesFromHistory(turn.history), turn.loadImage));
       if (replay.length) await awaitSetup(rt.server.request("thread/inject_items", { threadId, items: replay }));
-      userEntry = await awaitSetup(
-        turn.emit({
-          type: "user",
-          payload: {
-            text: turn.input,
-            ...((turn.triggerTs ?? turn.entryTs) ? { ts: turn.triggerTs ?? turn.entryTs } : {}),
-            ...(turn.attachments?.length ? { attachments: turn.attachments } : {}),
-          },
-          scopeLabel: turn.scopeLabel,
-        }),
-      );
+      const resumed = turn.continueTurn
+        ? turn.history.find((entry) => entry.seq === turn.resumeUserSeq && entry.type === "user")
+        : undefined;
+      userEntry =
+        resumed ??
+        (await awaitSetup(
+          turn.emit({
+            type: "user",
+            payload: {
+              text: turn.input,
+              ...imageRefs(turn.images),
+              ...((turn.triggerTs ?? turn.entryTs) ? { ts: turn.triggerTs ?? turn.entryTs } : {}),
+              ...(turn.attachments?.length ? { attachments: turn.attachments } : {}),
+            },
+            scopeLabel: turn.scopeLabel,
+          }),
+        ));
     } catch (error) {
       return failSetup(error);
     }
@@ -1124,30 +1113,6 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
         fallbackInputTokens: countTokens(JSON.stringify({ replay, input })),
         stopped: false,
       };
-      if (turn.tape) {
-        await turn.tape({
-          kind: "message",
-          harness: "codex",
-          scopeLabel: turn.scopeLabel,
-          entrySeq: userEntry.seq,
-          meta: {
-            bareText: turn.input,
-            ...((turn.triggerTs ?? turn.entryTs) ? { ts: (turn.triggerTs ?? turn.entryTs)! } : {}),
-          },
-          payload: {
-            type: "message",
-            role: "user",
-            content: [
-              { type: "input_text", text: codexTurnInputText(turn) },
-              ...(turn.images ?? []).map((image) => ({
-                type: "input_image",
-                image_url: "[image bytes omitted]",
-                media_type: image.mimeType,
-              })),
-            ],
-          },
-        });
-      }
     } catch (error) {
       return failSetup(error);
     }
@@ -1219,7 +1184,7 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
               scopeLabel: turn.scopeLabel,
             });
         }
-        await recordStoppedReply(turn, state.stoppedReply ?? "");
+        await recordStoppedTurn(turn, state.stoppedReply ?? "");
       })();
       return stoppedReplySaved;
     };
@@ -1333,7 +1298,6 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
               }),
             ])
           : await completed;
-      if (state.tapeError) throw state.tapeError;
       if (state.modelCalls === 0) {
         state.modelCalls = 1;
         turn.recordModelCall({
@@ -1354,12 +1318,11 @@ export function createCodexHarness(opts: CodexHarnessOptions = {}): Harness {
         for (const thinking of reasoningFromTurn(result))
           await turn.emit({ type: "thinking", payload: { thinking }, scopeLabel: turn.scopeLabel });
         if (reply && !terminal) {
-          const finalEntry = await turn.emit({
+          await turn.emit({
             type: "assistant",
             payload: { text: reply },
             scopeLabel: turn.scopeLabel,
           });
-          await tapeReplyCheckpoint(turn, finalEntry);
         }
         turnResult = {
           reply,

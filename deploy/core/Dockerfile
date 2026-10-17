@@ -22,14 +22,12 @@ COPY .husky/install.mjs .husky/install.mjs
 COPY scripts/install-core-dependencies.mjs ./scripts/install-core-dependencies.mjs
 COPY scripts/patch-pi-ai.mjs ./scripts/patch-pi-ai.mjs
 COPY vendor/pi-ai/provider-error.patch ./vendor/pi-ai/provider-error.patch
-RUN node scripts/install-core-dependencies.mjs && npm audit --omit=dev --audit-level=moderate \
+RUN node scripts/install-core-dependencies.mjs && npm run audit:prod \
   && rm -rf /root/.npm /tmp/node-compile-cache
 
 COPY --from=connector-sdk-build /app/.generated/connector-sdk ./.generated/connector-sdk
 COPY src ./src
 COPY cli/src/credential-paths.ts cli/src/tool-descriptor.ts ./cli/src/
-COPY scripts/migrate-transcript-tape.ts ./scripts/migrate-transcript-tape.ts
-COPY scripts/lib/transcript-tape-migration.ts ./scripts/lib/transcript-tape-migration.ts
 COPY cli/templates/slack-manifest.json ./cli/templates/slack-manifest.json
 COPY skills-seed ./skills-seed
 COPY plugins/onboarding ./plugins/onboarding

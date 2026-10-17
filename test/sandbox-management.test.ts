@@ -238,10 +238,10 @@ test("archived skills and memory remain readable but cannot mutate or execute th
   await f.skills.publish(skill.id);
   const memory = f.guard.memory({
     read: async () => "saved memory",
-    recall: async () => "saved memory",
+    recall: async () => [],
     query: async () => ["saved memory"],
     capture: async () => 1,
-    replace: async () => {},
+    edit: async () => {},
   } satisfies MemoryService);
   await f.methods.deleteProject("owner", "p1");
   assert.equal((await f.skills.get(skill.id))!.manifest.body, "saved skill");
@@ -250,9 +250,9 @@ test("archived skills and memory remain readable but cannot mutate or execute th
   assert.deepEqual(await f.skills.visibleFor(["personal:owner"], [{ id: skill.id, ownerScopeId: f.scope }]), []);
   assert.equal((await f.skills.resolve("saved", [f.scope])).skill, null);
   assert.equal(await memory.read(f.scope), "saved memory");
-  assert.equal(await memory.recall(f.scope), "");
+  assert.deepEqual(await memory.recall(f.scope), []);
   await assert.rejects(memory.capture(f.scope, ["new"], Date.now()), /read-only/);
-  await assert.rejects(memory.replace(f.scope, "new"), /read-only/);
+  await assert.rejects(memory.edit!(f.scope, [{ id: "1", text: "new" }]), /read-only/);
 });
 
 test("retirement waits for admitted commands and prevents subsequent execution", async () => {
@@ -287,6 +287,7 @@ test("retiring a second sandbox does not stop legacy work on the selected defaul
   const second = await f.resources.create("owner", "personal:owner", "local", "second");
   await f.resources.setDefault("owner", "personal:owner", first.id);
   await f.processes.register({
+    sandboxId: first.id,
     processId: "legacy",
     scopeId: "personal:owner",
     kind: "background",

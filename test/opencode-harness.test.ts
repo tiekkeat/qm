@@ -1,4 +1,3 @@
-import { resumeNote } from "../src/core/turn-resume.ts";
 import test from "node:test";
 import { createMemoryRunSignalStore } from "../src/runs/run-signal-store.ts";
 import assert from "node:assert/strict";
@@ -111,7 +110,7 @@ function turnInput(
   };
 }
 
-test("OpenCode ignores continueTurn and still records the resume note as this attempt's user entry", async (t) => {
+test("OpenCode records a new request when continueTurn has no matching history anchor", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "qm-opencode-test-"));
   const harness = createOpenCodeHarness({ binaryPath: fakeSidecar(dir, "resume", promptHandlers(okAssistant)) });
   t.after(async () => {
@@ -119,7 +118,7 @@ test("OpenCode ignores continueTurn and still records the resume note as this at
     rmSync(dir, { recursive: true, force: true });
   });
   const entries: SessionEntry[] = [];
-  const note = resumeNote({ strategy: { kind: "continue" } });
+  const note = "Continue the interrupted request";
   const result = await harness.turns.runTurn(
     turnInput(entries, [], { input: note, continueTurn: true, runId: "run-resume" }),
   );
@@ -385,7 +384,7 @@ test("custom providers materialize into the opencode config (enabled + provider 
   const dir = mkdtempSync(join(tmpdir(), "opencode-custom-"));
   const dump = join(dir, "config.json");
   const bin = fakeSidecar(dir, "custom", promptHandlers(okAssistant));
-  // wrap the binary so it writes the config it received before exec
+
   const wrapped = join(dir, "custom-wrapped");
   writeFileSync(
     wrapped,
@@ -470,7 +469,7 @@ test("OpenCode advertises aliases only for tools available on the turn", async (
     await harness.turns.runTurn(turnInput([], []));
     const { systemPrompt } = JSON.parse(readFileSync(captured, "utf8")) as { systemPrompt: string };
     assert.doesNotMatch(systemPrompt, /workspace_read|workspace_write/);
-    if (sandboxResources) assert.doesNotMatch(systemPrompt, /workspace_execute/);
+    if (sandboxResources) assert.match(systemPrompt, /workspace_execute/);
     else assert.match(systemPrompt, /workspace_execute is execute/);
   }
 });
@@ -500,7 +499,7 @@ test("OpenCode steer message IDs sort against IDs minted by native OpenCode 1.18
   assert.ok(first < second, "IDs minted in the same millisecond keep creation order");
 });
 
-test("OpenCode includes steered PDF and extracted documents without copying echoed contents into tape", async (t) => {
+test("OpenCode includes steered PDF and extracted documents without copying echoed contents into history", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "qm-opencode-steer-doc-"));
   const capturePath = join(dir, "steered.json");
   const binary = fakeSidecar(
@@ -538,13 +537,9 @@ test("OpenCode includes steered PDF and extracted documents without copying echo
   });
   const pdf = readFileSync(new URL("./fixtures/documents/sample.pdf", import.meta.url)).toString("base64");
   const docx = readFileSync(new URL("./fixtures/documents/sample.docx", import.meta.url)).toString("base64");
-  const tape: unknown[] = [];
   const entries: SessionEntry[] = [];
   const turn = turnInput(entries, []);
   turn.runId = "opencode-steer-docs";
-  turn.tape = async (row) => {
-    tape.push(row);
-  };
   turn.documents = [
     { name: "initial.txt", mimeType: "text/plain", dataBase64: Buffer.from("A".repeat(80_000)).toString("base64") },
   ];
@@ -590,8 +585,8 @@ test("OpenCode includes steered PDF and extracted documents without copying echo
   assert.ok(!sent.includes("OUTSIDE-BUDGET-492"));
   assert.match(sent, /truncated to fit/);
   assert.ok(sent.includes("DOCX-QUARTZ-731"));
-  assert.ok(!JSON.stringify(tape).includes(pdf));
-  assert.ok(!JSON.stringify(tape).includes("DOCX-QUARTZ-731"));
+  assert.ok(!JSON.stringify(entries).includes(pdf));
+  assert.ok(!JSON.stringify(entries).includes("DOCX-QUARTZ-731"));
 });
 
 for (const [modelId, fastMode, expected] of [
@@ -817,3 +812,80 @@ for (const shutdown of [false, true]) {
     );
   });
 }
+
+test("OpenCode resumes durable work without appending a duplicate user entry", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-opencode-resume-"));
+  const harness = createOpenCodeHarness({
+    binaryPath: fakeSidecar(dir, "resume-durable", promptHandlers(okAssistant)),
+  });
+  t.after(async () => {
+    await harness.turns.close?.();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const entries: SessionEntry[] = [];
+  const calls: HarnessLlmRequestRecord[] = [];
+  const history = [
+    {
+      type: "user",
+      payload: { text: "Original request" },
+      seq: 7,
+      sessionId: "resume",
+      scopeLabel: "personal:alice",
+      createdAt: 1,
+    },
+  ] as SessionEntry[];
+  const result = await harness.turns.runTurn(
+    turnInput(entries, calls, {
+      input: "Original request",
+      history,
+      continueTurn: true,
+      resumeUserSeq: 7,
+      runId: "resume-run",
+    }),
+  );
+  assert.equal(result.reply, "hello from fake");
+  assert.equal(entries.filter((entry) => entry.type === "user").length, 0);
+  assert.equal(calls[0]?.turnSeq, 7);
+});
+
+test("OpenCode retains authorized image references and imports their bytes on a follow-up turn", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-opencode-images-"));
+  const capturePath = join(dir, "contexts.json");
+  const handlers = `
+    if (req.method === "POST" && message) {
+      await readBody(req);
+      const context = await fetch(process.env.OPENCODE_BRIDGE_URL + "/session/" + message[1] + "/context", { headers: { authorization: "Bearer " + process.env.OPENCODE_BRIDGE_SECRET } }).then(r => r.json());
+      require("node:fs").writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify(context.history));
+      await capture(message[1], { system: "s", messages: [{role:"user"}] });
+      return json(res, ${okAssistant});
+    }
+    if (req.method === "GET" && message) return json(res, [${okAssistant}]);
+  `;
+  const harness = createOpenCodeHarness({ binaryPath: fakeSidecar(dir, "images", handlers) });
+  t.after(async () => {
+    await harness.turns.close?.();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const entries: SessionEntry[] = [];
+  const calls: HarnessLlmRequestRecord[] = [];
+  const image = { artifactId: "image-one", mimeType: "image/png", dataBase64: "aGVsbG8=" };
+  await harness.turns.runTurn(turnInput(entries, calls, { images: [image] }));
+  assert.deepEqual((entries.find((entry) => entry.type === "user")!.payload as { images: unknown }).images, [
+    { artifactId: image.artifactId, mimeType: image.mimeType },
+  ]);
+  assert.doesNotMatch(JSON.stringify(entries), /aGVsbG8=/);
+  let loads = 0;
+  await harness.turns.runTurn(
+    turnInput(entries, calls, {
+      input: "Explain again",
+      history: [...entries],
+      loadImage: async (ref) => {
+        assert.equal(ref.artifactId, image.artifactId);
+        loads++;
+        return { data: image.dataBase64, sizeBytes: 5 };
+      },
+    }),
+  );
+  assert.equal(loads, 1);
+  assert.match(readFileSync(capturePath, "utf8"), /data:image\/png;base64,aGVsbG8=/);
+});

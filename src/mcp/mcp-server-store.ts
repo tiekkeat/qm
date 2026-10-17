@@ -8,7 +8,7 @@ import { encryptSecret, decryptSecret, type SecretKey } from "../connectors/conn
 
 import type { DurableMap } from "../persistence/durable-map.ts";
 
-export type McpServerAuthMode = "none" | "bearer" | "client-credentials";
+export type McpServerAuthMode = "none" | "bearer" | "client-credentials" | "oauth-user";
 
 export interface McpServer {
   id: string;
@@ -22,6 +22,10 @@ export interface McpServer {
   bearerToken?: string;
   clientId?: string;
   clientSecret?: string;
+  oauthAuthorizeUrl?: string;
+  oauthTokenUrl?: string;
+  oauthScopes?: string[];
+  tools?: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }>;
   readOnly: boolean;
   enabled: boolean;
   updatedAt: number;

@@ -99,4 +99,4 @@ export class AgentPicker extends LitElement {
       ${this.error ? html`<span class="composer-error" role="alert">${this.error}</span>` : nothing}`;
   }
 }
-customElements.define("qm-agent-picker", AgentPicker);
+if (!customElements.get("qm-agent-picker")) customElements.define("qm-agent-picker", AgentPicker);

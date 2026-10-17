@@ -270,6 +270,5 @@ export function createUserModelCredentialStore(input: {
     async deleteSharedLogin(id) {
       await sharedLogins.delete(id);
     },
-
   };
 }
