@@ -703,7 +703,7 @@ export function modelSupportedByHarness(id: string | undefined, harness: string)
   if (harness === "pi" || harness === "opencode" || harness === "mock") return Boolean(resolveModel(id));
   const provider = resolveModel(id)?.provider;
   if (harness === "codex") return provider === "openai" || provider === CODEX_SUBSCRIPTION_PROVIDER;
-  if (harness === "claude") return provider === "anthropic";
+  if (harness === "claude") return provider ? provider === "anthropic" : id.startsWith("claude-");
   return false;
 }
 

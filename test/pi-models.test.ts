@@ -57,6 +57,8 @@ test("native harnesses reject cross-provider pins and choose their own defaults"
   assert.equal(modelSupportedByHarness("claude-opus-4-8", "claude"), true);
   assert.equal(modelSupportedByHarness("gpt-5.6-sol", "claude"), false);
   assert.equal(modelSupportedByHarness("claude-future-9", "claude"), true);
+  assert.equal(modelSupportedByHarness("codex/not-a-model", "codex"), false);
+  assert.equal(modelSupportedByHarness("claude-opus-5", "codex"), false);
   assert.equal(defaultModelForHarness("claude", "gpt-5.6-sol"), "claude-opus-5");
 });
 
