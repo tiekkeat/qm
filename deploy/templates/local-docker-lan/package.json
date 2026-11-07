@@ -1,9 +1,7 @@
 {
   "name": "qm-local-qm-deployment",
   "version": "0.0.0",
-  "dependencies": {
-    "@yc-software/qm": "0.1.14"
-  },
+  "dependencies": {},
   "private": true,
   "engines": {
     "node": ">=24.0.0"

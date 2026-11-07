@@ -7,7 +7,7 @@
 Use Ubuntu 24.04 x86_64 with Internet access, a permanent IPv4 address, and a normal user who can run sudo. Install Git first if it is missing. Keep the source checkout and deployment directory alongside each other:
 
 ```bash
-git clone --branch feat/app-github-lifecycle https://github.com/tiekkeat/qm.git qm
+git clone --branch integration/official-main-20261107 https://github.com/tiekkeat/qm.git qm
 cp -a qm/deploy/templates/local-docker-lan qm-deployment
 cd qm-deployment
 bash scripts/install.sh
@@ -24,9 +24,9 @@ Before the DNS verification stage, configure your firewall or existing DNS serve
 
 QM chooses the app from its hostname and enforces sharing grants. No individual app DNS records are needed. The installer queries the supplied DNS server for verification; it does not change host or Docker DNS, gateways, or firewall DNS records. If the host's default resolver cannot see the private zone, core may log a DNS warning even when the explicit firewall checks pass.
 
-The installer checks or installs basic tools, installs checksum-verified Node 24.21.0 when an adequate Node/npm is absent, runs `npm ci` with the pinned CLI 0.1.14, generates missing signing/encryption secrets, and sets administrator access. It installs Docker/Buildx and Caddy through `sudo bash scripts/install-host.sh`, builds the selected source checkout, verifies loopback bindings, HTTPS and anonymous access gates, checks live deployment conformance, then verifies a backup and restores it into a temporary database. Fresh Docker group membership is handled with `sg`, without requiring a new login during installation. A sudo password prompt is normal.
+The installer checks or installs basic tools, installs checksum-verified Node 24.22.2 when an adequate Node/npm is absent, builds and installs the CLI from the selected source checkout, generates missing signing/encryption secrets, and sets administrator access. It installs Docker/Buildx and Caddy through `sudo bash scripts/install-host.sh`, builds the selected source checkout, verifies loopback bindings, HTTPS and anonymous access gates, checks live deployment conformance, then verifies a backup and restores it into a temporary database. Fresh Docker group membership is handled with `sg`, without requiring a new login during installation. A sudo password prompt is normal.
 
-The external-DNS host adapter preserves HTTPS access from any client address and installs no DNS server on this machine. Caddy routes the portal to `127.0.0.1:8081` and wildcard apps to core at `127.0.0.1:8080` with `X-QM-App-Host: 1`. Application and database containers stay private.
+The external-DNS host adapter preserves HTTPS access from any client address and installs no DNS server on this machine. Caddy routes the portal and wildcard apps to core’s public front door at `127.0.0.1:8082` with `X-QM-App-Host: 1`. Application and database containers stay private.
 
 The generated `.env` has permissions `0600`. Signing and encryption secrets contain real generated values; the fields below start empty unless previously configured:
 
@@ -93,7 +93,7 @@ Copy the kit and its `.sha256` file to the new machine and verify the digest aga
 ```bash
 kit_digest=$(awk '{print $1}' qm-reinstall-kit.tar.gz.sha256)
 printf '%s  qm-reinstall-kit.tar.gz\n' "$kit_digest" | sha256sum -c -
-git clone --branch feat/app-github-lifecycle https://github.com/tiekkeat/qm.git qm
+git clone --branch integration/official-main-20261107 https://github.com/tiekkeat/qm.git qm
 tar -xzf qm-reinstall-kit.tar.gz
 git -C qm checkout "$(cat qm-deployment/SOURCE_REVISION)"
 cd qm-deployment
@@ -109,7 +109,7 @@ This deployment needs a Docker host with a Unix Docker socket, Node.js 24, npm, 
 This template ships in the QM source fork. Copy it outside the source checkout so deployment config and source can be updated independently:
 
 ```bash
-git clone --branch feat/app-github-lifecycle https://github.com/tiekkeat/qm.git qm
+git clone --branch integration/official-main-20261107 https://github.com/tiekkeat/qm.git qm
 cp -a qm/deploy/templates/local-docker-lan qm-deployment
 cd qm-deployment
 ```
@@ -120,21 +120,21 @@ Never put `.env`, backups, or certificate private keys in Git. The copied direct
 cp hosting.env.example hosting.env
 ${EDITOR:-nano} hosting.env
 bash scripts/configure-hosting.sh
-npm ci
+bash scripts/install-source-cli.sh
 python3 scripts/bootstrap-secrets.py
 python3 scripts/credentials.py
 ```
 
 Set `QM_PORTAL_HOST` to the DNS name clients will use. `QM_SOURCE_DIR` defaults to the sibling `../qm` checkout. `QM_LAN_IP` is optional and, when set, makes verification require DNS to resolve to that ingress IP. `QM_DNS_SERVER` optionally queries a specific DNS server; leave it empty to use the host resolver. `QM_CA_CERT` optionally names a trusted CA certificate for a private HTTPS issuer. `QM_LAN_INTERFACE` and `QM_LAN_PREFIX` are needed only by the Ubuntu helper below. `hosting.env` is ignored by Git. `configure-hosting.sh` synchronizes the portal URL and app domain in `qm.config.jsonc`.
 
-Create DNS records for the portal hostname and `*.apps.<portal-host>` that point to the HTTPS ingress. The same-host proxy must route the portal hostname to `127.0.0.1:8081` and wildcard app hostnames to **QM core** at `127.0.0.1:8080`, preserving Host and sending `X-QM-App-Host: 1` on app requests. For example, with Caddy:
+Create DNS records for the portal hostname and `*.apps.<portal-host>` that point to the HTTPS ingress. The same-host proxy must route the portal hostname to `127.0.0.1:8082` and wildcard app hostnames to **QM core** at `127.0.0.1:8080`, preserving Host and sending `X-QM-App-Host: 1` on app requests. For example, with Caddy:
 
 ```caddyfile
 https://qm.example.com {
-    reverse_proxy 127.0.0.1:8081
+    reverse_proxy 127.0.0.1:8082
 }
 https://*.apps.qm.example.com {
-    reverse_proxy 127.0.0.1:8080 {
+    reverse_proxy 127.0.0.1:8082 {
         header_up X-QM-App-Host 1
     }
 }
@@ -160,14 +160,22 @@ To update the source fork, pull it into the path named by `QM_SOURCE_DIR`, then 
 
 ## Apply SMTP changes
 
-The pinned CLI 0.1.14 does not automatically forward the broker's SMTP credentials to core, which sends invitation emails. The deployment helper now selects SMTP for core and generates credential-name mappings when all four SMTP values are populated. Secret values stay in `.env`; they are not copied into configuration or Git. It also copies `SMTP_PORT` and `SMTP_TLS` from `env.auth` to core when specified.
+The sign-in broker and invitation sender run inside core. The deployment helper now selects SMTP for core and generates credential-name mappings when all four SMTP values are populated. Secret values stay in `.env`; they are not copied into configuration or Git. It also copies `SMTP_PORT` and `SMTP_TLS` from `env.auth` to core when specified.
 
 After changing email settings:
 
 1. Fill `SMTP_HOST`, `SMTP_USERNAME`, `SMTP_PASSWORD`, and `AUTH_EMAIL_FROM` in `.env`. Keep this file private and at permissions `0600`.
-2. If needed, set `SMTP_PORT` and `SMTP_TLS` in `env.auth` in `qm.config.jsonc`; the defaults are port 587 with STARTTLS. Avoid putting these non-secret settings in `.env`.
+2. Set `env.auth.AUTH_EMAIL_TRANSPORT` to `smtp`. If needed, set `SMTP_PORT` and `SMTP_TLS` in `env.auth` in `qm.config.jsonc`; the defaults are port 587 with STARTTLS. Avoid putting these non-secret settings in `.env`.
 3. Run `bash scripts/start.sh`. It synchronizes core email configuration, checks SMTP credentials, and recreates the services with the current settings. A simple `docker restart` reuses the old container environment and does not apply `.env` changes.
 4. Run `bash scripts/diagnose.sh`, refresh Admin → Users, and resend or create the invitation. Existing unsent invitations are not automatically retried.
 5. Confirm that the recipient receives the email. A successful SMTP authentication check does not prove inbox delivery.
 
 Changing `.env` alone is insufficient. You do not need to reinstall Node, Docker, or Caddy, and you do not need to edit QM's invitation sender code.
+
+## Public Internet portal
+
+Copy this template outside the source checkout and set `QM_PORTAL_HOST` and `QM_SOURCE_DIR` in `hosting.env`. Run `bash scripts/install-source-cli.sh`, `python3 scripts/bootstrap-secrets.py`, and `python3 scripts/credentials.py`, then `bash scripts/start-public.sh`. This builds the selected source revision and sandbox locally, stores data in Docker volumes, binds the API and public front door to loopback, and enables container restart after reboot. The public startup script permits preparing the stack before DNS exists; this does not verify Internet access.
+
+Run `sudo bash scripts/install-public-proxy.sh` to install Caddy and route the portal to `127.0.0.1:8082`. Point the portal DNS record to the host’s reachable public IPv4 address and allow inbound TCP ports 80 and 443. Caddy obtains a public certificate once DNS reaches the host. If using Cloudflare, use an end-to-end HTTPS origin connection after the origin certificate is issued. The internal API at port 8080 and Postgres must remain private.
+
+Published app hostnames additionally need `*.apps.<portal-host>` DNS and a wildcard-capable TLS configuration; the public proxy installer only configures the portal. Public HTTPS, administrator sign-in, and a real model response remain required validation steps. Without SMTP, obtain an administrator link privately with `bash scripts/qm.sh admin-login`. Without a model key, configure the provider and base model in Admin before testing a response. Never place credentials in this source repository.

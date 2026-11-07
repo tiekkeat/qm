@@ -16,6 +16,7 @@ test("LAN configuration forwards configured SMTP credentials to core without cop
     const config = JSON.parse(
       readFileSync(new URL("../deploy/templates/local-docker-lan/qm.config.jsonc", import.meta.url), "utf8"),
     );
+    config.env.auth.AUTH_EMAIL_TRANSPORT = "smtp";
     config.env.auth.SMTP_PORT = "465";
     config.env.auth.SMTP_TLS = "implicit";
     writeFileSync(configPath, JSON.stringify(config));

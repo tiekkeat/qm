@@ -38,7 +38,7 @@ COPY package.json package-lock.json ./
 COPY .husky/install.mjs .husky/install.mjs
 COPY scripts/install-core-dependencies.mjs ./scripts/install-core-dependencies.mjs
 COPY scripts/patch-pi-ai.mjs ./scripts/patch-pi-ai.mjs
-COPY vendor/pi-ai/provider-error.patch vendor/pi-ai/served-tier.patch ./vendor/pi-ai/
+COPY vendor/pi-ai ./vendor/pi-ai
 RUN node scripts/install-core-dependencies.mjs && npm run audit:prod \
   && rm -rf /root/.npm /tmp/node-compile-cache
 

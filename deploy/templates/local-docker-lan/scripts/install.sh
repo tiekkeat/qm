@@ -75,7 +75,7 @@ bash scripts/configure-hosting.sh
 stage=node-and-cli
 echo "STAGE: $stage"
 bash scripts/install-node.sh
-npm ci --no-audit --no-fund
+bash scripts/install-source-cli.sh
 stage=secrets-and-administrator
 echo "STAGE: $stage"
 python3 scripts/bootstrap-secrets.py

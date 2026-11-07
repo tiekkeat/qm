@@ -25,10 +25,12 @@ if [[ "$network_binding" != 127.0.0.1 ]]; then
     exit 1
 fi
 python3 scripts/check-hosting.py
+docker image inspect qm-sandbox-local:latest >/dev/null 2>&1 || (cd "$QM_SOURCE_DIR" && bash scripts/local-sandbox-build.sh)
 bash scripts/qm.sh check
 bash scripts/qm.sh doctor
 bash scripts/qm.sh plan --build-from "$QM_SOURCE_DIR"
 bash scripts/qm.sh up --build-from "$QM_SOURCE_DIR"
+docker update --restart unless-stopped qm-qm-local-core qm-qm-local-pg >/dev/null
 python3 scripts/verify.py
 bash scripts/qm.sh conformance
 echo "QM endpoint: https://$QM_PORTAL_HOST"

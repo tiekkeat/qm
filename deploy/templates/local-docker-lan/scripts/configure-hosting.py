@@ -10,7 +10,7 @@ host = os.environ['QM_PORTAL_HOST']
 apps_domain = os.environ['QM_APPS_DOMAIN']
 config['publicUrl'] = f'https://{host}'
 config['env']['core']['DEPLOY_APPS_DOMAIN'] = apps_domain
-config['env']['portal']['PORTAL_APPS_DOMAIN'] = apps_domain
+config['env']['core']['PORTAL_APPS_DOMAIN'] = apps_domain
 values = {}
 env_path = root / '.env'
 if env_path.exists():

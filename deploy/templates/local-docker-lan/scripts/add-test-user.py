@@ -20,11 +20,11 @@ if password != again:
     raise SystemExit('Passwords did not match; no changes made.')
 if len(password) < 12 or len(password.encode()) > 1024 or '\n' in password or '\r' in password:
     raise SystemExit('Use a password of at least 12 characters, at most 1024 bytes, without line breaks.')
-result = subprocess.run(['docker', 'exec', '-i', 'qm-qm-local-portal', 'node',
-                         '/auth/src/hash-password.ts', email],
+result = subprocess.run(['docker', 'exec', '-i', 'qm-qm-local-core', 'node',
+                         '/app/plugins/auth/src/hash-password.ts', email],
                         input=password + '\n', text=True, capture_output=True)
 if result.returncode != 0:
-    raise SystemExit('Password hashing failed. Confirm Docker access and that the portal container is running.')
+    raise SystemExit('Password hashing failed. Confirm Docker access and that the core container is running.')
 entry = result.stdout.strip()
 if not entry.startswith(email + ':scrypt$') or '\n' in entry:
     raise SystemExit('Password helper returned an unexpected format; no changes made.')

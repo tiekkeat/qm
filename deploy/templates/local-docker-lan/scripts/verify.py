@@ -3,7 +3,7 @@ import json
 import subprocess
 from hosting_check import apps_domain, check_dns, curl_host_args, host, root
 
-expected = ['qm-qm-local-pg', 'qm-qm-local-core', 'qm-qm-local-web-ui', 'qm-qm-local-portal']
+expected = ['qm-qm-local-pg', 'qm-qm-local-core']
 items = json.loads(subprocess.check_output(['docker', 'inspect', *expected], text=True))
 for item in items:
     name = item['Name'].lstrip('/')

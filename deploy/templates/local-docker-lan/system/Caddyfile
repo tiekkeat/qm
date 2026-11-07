@@ -15,13 +15,13 @@ https://{$QM_LAN_IP}:8443 {
 https://{$QM_PORTAL_HOST} {
 	bind {$QM_LAN_IP}
 	tls internal
-	reverse_proxy 127.0.0.1:8081
+	reverse_proxy 127.0.0.1:8082
 }
 
 https://*.apps.{$QM_PORTAL_HOST} {
 	bind {$QM_LAN_IP}
 	tls internal
-	reverse_proxy 127.0.0.1:8080 {
+	reverse_proxy 127.0.0.1:8082 {
 		header_up X-QM-App-Host 1
 	}
 }

@@ -145,7 +145,11 @@
     "@earendil-works/chord": "1.0.4",
     "@earendil-works/pi-codemode": "1.0.4",
     "@earendil-works/pi-mcp": "1.0.4",
-    "@earendil-works/pi-tui": "1.0.4"
+    "@earendil-works/pi-tui": "1.0.4",
+    "toml": "5.0.1",
+    "@opencode-ai/plugin": {
+      "zod": "$zod"
+    }
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

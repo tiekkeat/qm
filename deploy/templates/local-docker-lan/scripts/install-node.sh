@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
-if command -v node >/dev/null && command -v npm >/dev/null && node -e 'const [major,minor]=process.versions.node.split(".").map(Number);process.exit(major>24||major===24&&minor>=15?0:1)' && npm --version | awk -F. '{exit !($1>11 || ($1==11 && $2>=10))}'; then
+if command -v node >/dev/null && command -v npm >/dev/null && node -e 'const [major,minor,patch]=process.versions.node.split(".").map(Number);process.exit(major>24||major===24&&(minor>22||minor===22&&patch>=1)?0:1)' && npm --version | awk -F. '{exit !($1>11 || ($1==11 && $2>=10))}'; then
     echo "Using Node $(node --version), npm $(npm --version)."
     exit 0
 fi
 [[ "$(uname -m)" == x86_64 ]] || { echo 'This installer supports Linux x86_64.' >&2; exit 1; }
-node_version=24.21.0
+node_version=24.22.2
 archive="node-v${node_version}-linux-x64.tar.xz"
 cache_dir="$HOME/.cache/qm-installer"
 node_dir="$HOME/.local/lib/node-v${node_version}-linux-x64"

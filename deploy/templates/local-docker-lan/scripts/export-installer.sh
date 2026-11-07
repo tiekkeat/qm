@@ -19,7 +19,7 @@ path = root / 'qm.config.jsonc'
 config = json.loads(path.read_text())
 config['publicUrl'] = 'https://qm.example.com'
 config['env']['core']['DEPLOY_APPS_DOMAIN'] = 'apps.qm.example.com'
-config['env']['portal']['PORTAL_APPS_DOMAIN'] = 'apps.qm.example.com'
+config['env']['core']['PORTAL_APPS_DOMAIN'] = 'apps.qm.example.com'
 path.write_text(json.dumps(config, indent=2) + '\n')
 PY
 if [[ -f "$deployment_dir/hosting.env" ]]; then

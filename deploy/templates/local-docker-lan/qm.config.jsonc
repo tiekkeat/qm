@@ -4,7 +4,7 @@
   "publicUrl": "https://qm.example.com",
   "target": "docker",
   "basePort": 8080,
-  "services": ["core", "web-ui", "admin", "portal", "auth"],
+  "services": ["core", "auth"],
   "plugins": [],
   "skills": [],
   "env": {
@@ -14,18 +14,11 @@
       "DEPLOY_APPS_DOMAIN": "apps.qm.example.com",
       "HARNESS_SECURITY_POSTURE": "auto",
       "HARNESS_SHARING_POSTURE": "isolated",
-      "AUTH_EMAIL_TRANSPORT": "smtp"
-    },
-    "web-ui": {
-      "NODE_ENV": "production"
-    },
-    "portal": {
-      "NODE_ENV": "production",
       "PORTAL_APPS_DOMAIN": "apps.qm.example.com"
     },
     "auth": {
       "NODE_ENV": "production",
-      "AUTH_EMAIL_TRANSPORT": "smtp"
+      "AUTH_EMAIL_TRANSPORT": "resend"
     }
   },
   "secretEnv": {
@@ -35,6 +28,7 @@
     }
   },
   "sandbox": {
-    "backend": "local"
+    "backend": "local",
+    "image": "qm-sandbox-local:latest"
   }
 }
