@@ -234,6 +234,7 @@ test("runtime-config lets a person set, keep, and inherit an approved personal r
       effective: { modelId: string; effortLevel: string; fastMode: boolean };
     };
     assert.deepEqual(selected.effective, {
+      harnessId: "pi",
       modelId: "gpt-5.5",
       effortLevel: "low",
       fastMode: false,
@@ -270,7 +271,7 @@ test("runtime-config lets a person set, keep, and inherit an approved personal r
       scopeOverride: { modelId: string };
     };
     assert.equal(keptLegacy.upgradeAvailable, false);
-    assert.deepEqual(keptLegacy.scopeOverride, { modelId: "claude-sonnet-4-6", orgRevision: 2 });
+    assert.deepEqual(keptLegacy.scopeOverride, { harnessId: "pi", modelId: "claude-sonnet-4-6", orgRevision: 2 });
   } finally {
     await srv.close();
   }
@@ -622,6 +623,39 @@ test("ambient-policy edits a channel's standing order and bot ledger through the
     });
     assert.equal(fresh.status, 200);
     assert.equal((await srv.built.channelPolicy.get("C1"))?.orders, "updated");
+  } finally {
+    await srv.close();
+  }
+});
+
+test("approved harnesses save Codex, validate input, and restore deployment defaults", async () => {
+  const srv = start();
+  try {
+    const path = `${srv.base}/v1/admin/scopes/org:default-org/approved-harnesses`;
+    for (const body of [{ ids: ["unknown"] }, { ids: [1] }, {}, { ids: "codex" }]) {
+      const response = await fetch(path, { method: "PUT", headers: ADMIN, body: JSON.stringify(body) });
+      assert.equal(response.status, 400);
+    }
+    const personal = await fetch(`${srv.base}/v1/admin/scopes/personal:U1/approved-harnesses`, {
+      method: "PUT",
+      headers: ADMIN,
+      body: JSON.stringify({ ids: ["codex"] }),
+    });
+    assert.equal(personal.status, 400);
+    const saved = await fetch(path, {
+      method: "PUT",
+      headers: ADMIN,
+      body: JSON.stringify({ ids: ["pi", "codex", "codex"] }),
+    });
+    assert.equal(saved.status, 200);
+    assert.deepEqual(await srv.built.config.getApprovedHarnessesDurable(), ["pi", "codex"]);
+    const read = await fetch(`${srv.base}/v1/admin/scopes/org:default-org`, { headers: ADMIN });
+    const settings = (await read.json()) as { approvedHarnesses: string[]; harnessOptions: string[] };
+    assert.deepEqual(settings.approvedHarnesses, ["pi", "codex"]);
+    assert.deepEqual(settings.harnessOptions, ["pi", "codex"]);
+    const cleared = await fetch(path, { method: "PUT", headers: ADMIN, body: JSON.stringify({ ids: [] }) });
+    assert.equal(cleared.status, 200);
+    assert.equal(await srv.built.config.getApprovedHarnessesDurable(), null);
   } finally {
     await srv.close();
   }

@@ -9,6 +9,8 @@ import { parseCommandPolicy } from "../../policy/command-policy.ts";
 import { parseScopeId, scopeId, type CommandPolicy, type Grant, type ScopeId } from "../../types.ts";
 import {
   defaultModel,
+  HARNESS_IDS,
+  isHarnessId,
   fastModeModelIds,
   modelSupported,
   modelServiceable,
@@ -519,6 +521,28 @@ export const ADMIN_RESOURCES: readonly AdminResource[] = [
       return { ok: true };
     },
   })),
+  {
+    id: "approved-harnesses",
+    kind: "string-list",
+    target: "org",
+    clearable: true,
+    readKey: "approvedHarnesses",
+    enumValues: HARNESS_IDS,
+    get: (deps) => deps.config!.getApprovedHarnessesDurable(),
+    apply: generic(
+      (body, { scope }) => {
+        const bad = orgOnly(scope, "approved harnesses are org-wide");
+        if (bad) return bad;
+        const raw = (body as { ids?: unknown }).ids;
+        if (!Array.isArray(raw)) return { error: "approved-harnesses requires { ids: string[] }" };
+        if (raw.some((id) => !isHarnessId(id)))
+          return { error: `unknown harness (expected ${HARNESS_IDS.join(" | ")})` };
+        const ids = [...new Set(raw.filter(isHarnessId))];
+        return { value: ids.length ? ids : null };
+      },
+      (deps, _scope, ids) => deps.config!.setApprovedHarnesses(ids),
+    ),
+  },
   {
     id: "webui-models",
     refreshesModels: true,

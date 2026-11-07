@@ -1341,12 +1341,12 @@ async function getSurfaceConfig(ctx: ApiCtx): Promise<void> {
     ...(providerStatus && {
       modelProviderConfigured: Boolean(
         providerStatus.anthropic ||
-          providerStatus.openai ||
-          providerStatus.openrouter ||
-          providerStatus.modelIds?.size ||
-          deps.harnessCarriedModelAuth ||
-          (sharedCodex?.connected && !sharedCodex.needsReconnect) ||
-          deps.companySubscriptionAuth,
+        providerStatus.openai ||
+        providerStatus.openrouter ||
+        providerStatus.modelIds?.size ||
+        deps.harnessCarriedModelAuth ||
+        (sharedCodex?.connected && !sharedCodex.needsReconnect) ||
+        deps.companySubscriptionAuth,
       ),
     }),
     externalSlackParticipants,
@@ -1401,7 +1401,10 @@ async function putRuntimeConfig(ctx: ApiCtx): Promise<void> {
     else {
       const legacyModel = await config.getBaseModelOwnDurable(target.scope);
       if (legacyModel && modelSupported(legacyModel) && (await webuiModelEnabled(ctx, legacyModel))) {
-        await config.setRuntimeSelection(target.scope, { modelId: legacyModel });
+        await config.setRuntimeSelection(target.scope, {
+          harnessId: runtimeFallback(ctx).harnessId,
+          modelId: legacyModel,
+        });
       }
     }
   } else {
