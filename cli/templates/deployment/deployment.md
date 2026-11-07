@@ -15,7 +15,7 @@ Before cloud mutation, read `qm.config.jsonc` when it exists. Its `target` is
 the selected provider; confirm it with the operator and do not offer to change
 it in place. If the repository has not been initialized, collect:
 
-- hosting target: a cloud provider — Fly.io, AWS, or Porter. Recommend Fly.io
+- hosting target: a cloud provider — Fly.io, AWS, Render, or Porter. Recommend Fly.io
   when the operator has no preference. Porter deploys onto a Kubernetes
   cluster in the operator's own cloud account and has no `qm` CLI target:
   choosing it switches this workflow to `references/porter.md`, which drives
@@ -58,14 +58,14 @@ contracts are scaffolded as one unit.
 
 ## 2. Prepare the deployment repository
 
-Require Node 24+, npm, Git, Docker with Buildx, and `openssl`.
+Require Node 24+, npm, Git, Docker with Buildx (Fly and AWS only), and `openssl`.
 
 For a repository without `qm.config.jsonc`, first confirm the hosting target
 and the derived slug, then initialize its root with the current CLI:
 
 ```bash
 npm exec --yes --package=@yc-software/qm@latest -- \
-  qm init . --org <slug> --target <fly-or-aws> --model-provider <provider>
+  qm init . --org <slug> --target <fly-aws-or-render> --model-provider <provider>
 npm install
 ```
 
@@ -133,7 +133,7 @@ early. Configure services, model, and the final public origin in the same pass.
 A workspace that already runs on Slack can sign in with it and skip email
 altogether. Drop `"auth"` from `services` and follow
 `.codex/skills/deploy-qm/references/slack.md`, which covers the SSO app, the
-`env.portal` endpoints, the workspace trust boundary, and the client
+`env.core` endpoints, the workspace trust boundary, and the client
 credentials. The bot app in that same reference is a separate decision — Slack
 sign-in does not require the agent in the workspace, and the agent does not
 require Slack sign-in.
@@ -142,7 +142,7 @@ require Slack sign-in.
 
 To use a different work-email OIDC provider, drop `"auth"` from
 `services`, register `<publicUrl>/auth/callback` with the provider, and put its
-endpoints and the email gate in `env.portal`. For Google Workspace:
+endpoints and the email gate in `env.core`. For Google Workspace:
 
 ```json
 {
@@ -165,7 +165,7 @@ administrator still signs in through whichever route above the deployment
 configured. Enable it in `qm.config.jsonc`:
 
 ```json
-"env": { "portal": { "PORTAL_PLAYGROUND": "1" } }
+"env": { "core": { "PORTAL_PLAYGROUND": "1" } }
 ```
 
 A playground must be its **own deployment**, never a flag on a working org's
@@ -193,12 +193,10 @@ and get a working one rather than deploying a stack that greets the
 administrator and then fails their first message.
 
 `modelProvider` also picks the model itself, so no model id has to be chosen at
-deploy time: Anthropic serves `claude-opus-5`, OpenAI `gpt-5.6-sol`, OpenRouter
+deploy time: Anthropic serves `claude-opus-5`, OpenAI `gpt-6.1-sol`, OpenRouter
 `openrouter/auto`. Set `model` in `qm.config.jsonc` only to override that, and
 only with a model the chosen provider can bill — a mismatch is refused at
-startup rather than at the first message. The same rule covers the harness:
-`HARNESS` `claude` runs Anthropic models alone, and `openai` and `openrouter`
-need the default `pi` harness.
+startup rather than at the first message.
 
 An operator may still prefer to hold the key centrally and rotate it from the
 Admin page. That is a deliberate choice, not the default: drop `modelProvider`
@@ -211,6 +209,7 @@ preflight and setup order:
 
 - Fly.io: `.codex/skills/deploy-qm/references/fly.md`
 - AWS: `.codex/skills/deploy-qm/references/aws.md`
+- Render: `.codex/skills/deploy-qm/references/render.md`
 
 ## 4. Deploy and prove the web surface
 
@@ -228,7 +227,8 @@ agent turn plus auxiliary title generation, verifies the exact reply and
 persisted transcript, requires a generated title, checks the session-scoped
 error log, and archives itself. It does not recall or capture administrator
 memory. Fly runs it inside the core machine; AWS runs it as a one-off task on
-the core service's private network. It does not add a public session endpoint.
+the core service's private network; Render runs it as a one-off job on the core
+service. It does not add a public session endpoint.
 
 Open `adminOnboardingUrl` from the JSON output and confirm Model provider
 reports the chosen vendor as configured, sourced from the environment. It does

@@ -188,10 +188,9 @@ test("docker with sandbox.backend local passes without a Fly sandbox app", () =>
 test("Docker portal app domains require matching HTTPS and session wiring", () => {
   const base = {
     publicUrl: "https://qm.example.test",
-    services: ["core", "portal"] as QmConfig["services"],
+    services: ["core"] as QmConfig["services"],
     env: {
-      core: { DEPLOY_APPS_DOMAIN: "apps.qm.example.test" },
-      portal: { PORTAL_APPS_DOMAIN: "apps.qm.example.test" },
+      core: { DEPLOY_APPS_DOMAIN: "apps.qm.example.test", PORTAL_APPS_DOMAIN: "apps.qm.example.test" },
     },
     secretEnv: { core: { DEPLOY_APPS_SESSION_SECRET: "PORTAL_SESSION_SECRET" } },
   };
@@ -201,18 +200,21 @@ test("Docker portal app domains require matching HTTPS and session wiring", () =
     d.config.publicUrl = "https://qm.example.test:8443";
     assert.throws(() => check(d), /HTTPS on port 443/);
     d.config.publicUrl = base.publicUrl;
-    d.config.env.portal = { PORTAL_APPS_DOMAIN: "apps.other.test" };
+    d.config.env.core = { ...base.env.core, PORTAL_APPS_DOMAIN: "apps.other.test" };
     assert.throws(() => check(d), /must match/);
-    d.config.env.portal = base.env.portal;
+    d.config.env.core = base.env.core;
     d.config.secretEnv = {};
     assert.throws(() => check(d), /DEPLOY_APPS_SESSION_SECRET/);
     d.config.secretEnv = base.secretEnv;
     d.config.env = {
-      core: { DEPLOY_APPS_DOMAIN: "apps.example.test" },
-      portal: { PORTAL_APPS_DOMAIN: "apps.example.test", PORTAL_COOKIE_DOMAIN: "example.test" },
+      core: {
+        DEPLOY_APPS_DOMAIN: "apps.example.test",
+        PORTAL_APPS_DOMAIN: "apps.example.test",
+        PORTAL_COOKIE_DOMAIN: "example.test",
+      },
     };
     assert.doesNotThrow(() => check(d));
-    d.config.env.portal = { PORTAL_APPS_DOMAIN: "apps.example.test", PORTAL_COOKIE_DOMAIN: "other.test" };
+    d.config.env.core = { ...d.config.env.core, PORTAL_COOKIE_DOMAIN: "other.test" };
     assert.throws(() => check(d), /share PORTAL_COOKIE_DOMAIN/);
   } finally {
     rmSync(d.dir, { recursive: true, force: true });
@@ -256,7 +258,7 @@ test("AWS requires exact ECS/ECR coordinates for discovered plugins", () => {
 test("AWS accepts retained bundled coordinates only when their host is enabled", () => {
   const d = deployment(() => {}, {
     target: "aws",
-    services: ["core", "web-ui", "admin", "portal", "auth"],
+    services: ["core", "auth"],
     aws: {
       accountId: "123456789012",
       region: "us-west-2",
@@ -266,7 +268,7 @@ test("AWS accepts retained bundled coordinates only when their host is enabled",
       imageLabel: "release",
       networking: { cloudMapNamespace: "acme.internal" },
       services: Object.fromEntries(
-        ["core", "web-ui", "admin", "portal", "auth"].map((name) => [
+        ["core", "auth"].map((name) => [
           name,
           { ecrRepository: name, ecsService: `acme-${name}`, cpu: 512, memory: 1024 },
         ]),
@@ -275,13 +277,8 @@ test("AWS accepts retained bundled coordinates only when their host is enabled",
   });
   try {
     assert.doesNotThrow(() => check(d));
-    delete d.config.aws!.services["web-ui"];
-    assert.throws(() => check(d), /aws\.services\.web-ui/);
     d.config.services = ["core"];
-    delete d.config.aws!.services.portal;
-    assert.throws(() => check(d), /aws\.services\.(admin|auth)/);
-    delete d.config.aws!.services.admin;
-    delete d.config.aws!.services.auth;
+    assert.doesNotThrow(() => check(d));
     d.config.aws!.services.unused = { ecrRepository: "unused", ecsService: "unused", cpu: 512, memory: 1024 };
     assert.throws(() => check(d), /aws\.services\.unused/);
   } finally {
@@ -557,17 +554,5 @@ test("quiet checks reject invalid supplied sandbox credentials just like human c
     }
   } finally {
     rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("only public PostHog ingestion tokens may be configured as plaintext", () => {
-  for (const value of ["phc_example123", "phx_personal123", "private-token"]) {
-    const d = deployment(() => {}, { env: { core: { POSTHOG_API_KEY: value } } });
-    try {
-      if (value.startsWith("phc_")) assert.doesNotThrow(() => check(d));
-      else assert.throws(() => check(d), /POSTHOG_API_KEY belongs in the target secret store/);
-    } finally {
-      rmSync(d.dir, { recursive: true, force: true });
-    }
   }
 });

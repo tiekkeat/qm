@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { applyReasoningMode, createPiHarness } from "../src/harness/pi-harness.ts";
-import { getRequiredModel, thinkingLevelsForHarness, safeModelMetadata } from "../src/model/pi-models.ts";
+import { applyReasoningMode, createAgent } from "../src/agent/agent-run.ts";
+import { createModelRoutes } from "../src/model/model-route.ts";
+import { getRequiredModel, thinkingLevelsFor, thinkingLevelsForHarness, safeModelMetadata } from "../src/model/pi-models.ts";
 import { validateRuntimeChoice } from "../src/api/runtime-config.ts";
-import type { HarnessTurnInput } from "../src/harness/harness.ts";
+import type { AgentTurnInput } from "../src/agent/agent.ts";
 import { setGatewayModels } from "../src/model/gateway-models.ts";
+import { testConfigStore } from "./support/test-database.ts";
 
 const adaptiveId = "claude-sonnet-4-6";
 
@@ -19,7 +21,7 @@ test("native Auto is model and harness specific, while legacy auto remains valid
   }
   for (const modelId of ["gpt-6-astra", "codex/gpt-5.6-sol", "claude-haiku-4-5", "openrouter/auto"])
     assert.equal(validateRuntimeChoice({ harnessId: "pi", modelId, effortLevel: "adaptive" }), "effort_not_supported");
-  assert.deepEqual(safeModelMetadata(adaptiveId)?.effortLevelsByHarness.pi, thinkingLevelsForHarness("pi", adaptiveId));
+  assert.deepEqual(safeModelMetadata(adaptiveId)?.effortLevelsByHarness?.pi, thinkingLevelsForHarness("pi", adaptiveId));
 });
 
 test("gateway capability is determined by the real API and metadata, not its model name", (t) => {
@@ -29,8 +31,8 @@ test("gateway capability is determined by the real API and metadata, not its mod
     { ...model, provider: "qm:gateway", id: "gateway/opaque", api: "anthropic-messages" },
     { ...model, provider: "qm:gateway", id: "gateway/claude-sonnet-4-6", api: "openai-completions", compat: {} },
   ]);
-  assert.ok(thinkingLevelsForHarness("pi", "gateway/opaque").includes("adaptive"));
-  assert.ok(!thinkingLevelsForHarness("pi", "gateway/claude-sonnet-4-6").includes("adaptive"));
+  assert.ok(thinkingLevelsFor("gateway/opaque").includes("adaptive"));
+  assert.ok(!thinkingLevelsFor("gateway/claude-sonnet-4-6").includes("adaptive"));
 });
 
 test("mode serialization retains unrelated output configuration and rejects unsupported Auto", () => {
@@ -114,20 +116,22 @@ test("real Pi AgentSession and Anthropic serializer send Auto without a fixed ef
   for (const modelId of [adaptiveId, "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"])
     for (const route of ["api-key", "personal-key", "oauth", "gateway"] as const) {
       await t.test(`${modelId}/${route}`, async () => {
-        const harness = createPiHarness({
-          defaultModelId: modelId,
-          ...(route === "gateway"
-            ? {
-                modelGateway: {
-                  url: "https://gateway.invalid",
-                  apiKey: "test-key",
-                  apiKeyHeader: "x-gateway-key",
-                  models: { [modelId]: "routed-model" },
-                },
-              }
-            : { apiKey: "sk-offline-test-key" }),
+        const agent = createAgent({
+          routes: createModelRoutes({
+            defaultModelId: modelId,
+            ...(route === "gateway"
+              ? {
+                  modelGateway: {
+                    url: "https://gateway.invalid",
+                    apiKey: "test-key",
+                    apiKeyHeader: "x-gateway-key",
+                    models: { [modelId]: "routed-model" },
+                  },
+                }
+              : { apiKey: "sk-offline-test-key" }),
+          }),
         });
-        t.after(() => harness.turns.close?.());
+        t.after(() => agent.close?.());
         const mandatoryThinking = getRequiredModel(modelId).thinkingLevelMap?.off === null;
         for (const effortLevel of [
           "high",
@@ -139,12 +143,12 @@ test("real Pi AgentSession and Anthropic serializer send Auto without a fixed ef
           ...(mandatoryThinking ? ["xhigh", "max", "ultracode", "medium"] : []),
         ]) {
           sendTool = true;
-          const result = await harness.turns.runTurn({
-            session: { id: `native-auto-${modelId}-${route}` } as HarnessTurnInput["session"],
+          const result = await agent.runTurn({
+            session: { id: `native-auto-${modelId}-${route}` } as AgentTurnInput["session"],
             input: "Reply OK",
             systemPrompt: "Reply OK",
             history: [],
-            tools: { attach: async () => ({ ok: true, files: [], staged: 0 }) } as unknown as HarnessTurnInput["tools"],
+            tools: { attach: async () => ({ ok: true, files: [], staged: 0 }) } as unknown as AgentTurnInput["tools"],
             scopeLabel: "personal:test",
             orgScopeId: "org:test",
             runtime: { effortLevel },
@@ -187,33 +191,31 @@ test("real Pi AgentSession and Anthropic serializer send Auto without a fixed ef
 });
 
 test("runtime scope writes and turn dispatch reject unsupported modes without changing legacy selections", async () => {
-  const { createMemoryConfigStore } = await import("../src/resolution/config-store.ts");
-  const { resolveRuntimeChoice } = await import("../src/harness/harness-router.ts");
-  const { createRuntimeService } = await import("../src/harness/runtime-control.ts");
-  const config = createMemoryConfigStore("default-org");
-  config.setApprovedHarnesses(["pi", "claude", "codex", "opencode"]);
-  const active = { harnessId: "pi" as const, modelId: "claude-sonnet-5", effortLevel: "auto" };
-  await config.setRuntimeSelectionLatest("personal:test", active);
-  const service = createRuntimeService({ config, harnessId: "pi" }, { authorizesCapabilityScope: async () => true });
+  const { resolveRuntimeChoice } = await import("../src/agent/runtime-choice.ts");
+  const { createRuntimeService } = await import("../src/agent/runtime-control.ts");
+  const config = testConfigStore("default-org");
+  const active = { modelId: "claude-sonnet-5", effortLevel: "auto" };
+  await config.setRuntimeSelection("personal:test", active);
+  const service = createRuntimeService({ config }, { authorizesCapabilityScope: async () => true });
   const claims = { actorId: "test", scopeId: "personal:test" as const, liveActor: true, exp: Date.now() + 60_000 };
   for (const effort of ["adaptive", "default"]) {
     const result = await service(claims, active, { action: "set", effort, lifetime: "scope" });
     assert.equal(result.ok, true);
-    assert.equal(resolveRuntimeChoice(config, "org:default-org", "personal:test", active).effortLevel, effort);
+    assert.equal((await resolveRuntimeChoice(config, "org:default-org", "personal:test", active)).effortLevel, effort);
   }
   assert.deepEqual(
     await service(claims, active, { action: "set", effort: "adaptive", model: "gpt-6-astra", lifetime: "scope" }),
     { ok: false, error: "effort_not_supported" },
   );
   assert.equal(config.getRuntimeSelection("personal:test")?.effortLevel, "default");
-  assert.throws(
-    () =>
-      resolveRuntimeChoice(config, "org:default-org", "personal:test", active, {
+  await assert.rejects(
+    async () =>
+      await resolveRuntimeChoice(config, "org:default-org", "personal:test", active, {
         modelId: "gpt-6-astra",
         effortLevel: "adaptive",
       }),
     /not supported/,
   );
-  await config.setRuntimeSelectionLatest("personal:test", active);
-  assert.equal(resolveRuntimeChoice(config, "org:default-org", "personal:test", active).effortLevel, "auto");
+  await config.setRuntimeSelection("personal:test", active);
+  assert.equal((await resolveRuntimeChoice(config, "org:default-org", "personal:test", active)).effortLevel, "auto");
 });

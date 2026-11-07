@@ -97,7 +97,7 @@ interface State {
   error: string;
   busy: boolean;
   saving: boolean;
-  connections: Partial<Record<ProviderKey, ConnKind>>;
+  connections: Partial<Record<ProviderMeta["apiName"], ConnKind>>;
   open: ProviderKey | null;
   method: Method | null;
   flow: Flow;
@@ -165,7 +165,7 @@ function applyStatus(status: StatusResponse): void {
   s.account = status.account;
   s.connections = {};
   for (const c of status.connections ?? []) {
-    s.connections[c.provider === "anthropic" ? "claude" : "chatgpt"] = c.kind;
+    s.connections[c.provider] = c.kind;
   }
   s.loaded = true;
   if (appState.me) {
@@ -559,7 +559,7 @@ function connectBody(p: ProviderMeta): TemplateResult {
 }
 
 function providerRow(p: ProviderMeta): TemplateResult {
-  const kind = s.connections[p.key];
+  const kind = s.connections[p.apiName];
   const open = s.open === p.key;
   let statusLine = `Chat with ${p.name} on your own account`;
   if (kind === "oauth") statusLine = `Connected with your ${p.name} subscription`;
@@ -650,7 +650,7 @@ async function switchAccount(
 
 function view(): TemplateResult {
   const anyConnected =
-    PROVIDERS.some((p) => s.connections[p.key] && (s.account === "personal" || s.account === p.apiName)) ||
+    PROVIDERS.some((p) => s.connections[p.apiName] && (s.account === "personal" || s.account === p.apiName)) ||
     (s.account === "shared-openai" && s.sharedAvailable);
   let cta: TemplateResult | typeof nothing = nothing;
   if (s.loaded && (s.mode === "manager" || anyConnected || !s.personal)) {
@@ -665,7 +665,7 @@ function view(): TemplateResult {
   let accountHint = "Or use your own account. Connect a provider, then choose Use account.";
   if (s.personal) {
     const subscription = PROVIDERS.some(
-      (p) => s.connections[p.key] === "oauth" && (s.account === "personal" || s.account === p.apiName),
+      (p) => s.connections[p.apiName] === "oauth" && (s.account === "personal" || s.account === p.apiName),
     );
     accountHint = subscription
       ? "Models compatible with your subscription appear automatically in the model picker."
@@ -675,7 +675,7 @@ function view(): TemplateResult {
   if (!s.loaded) choices = html`<button type="button" class="btn" @click=${() => void load()}>Retry</button>`;
   else if (s.intent)
     choices = html`<div class="mc-simple-connect">
-      ${s.connections[s.intent.key] ? providerRow(s.intent) : connectBody(s.intent)}
+      ${s.connections[s.intent.apiName] ? providerRow(s.intent) : connectBody(s.intent)}
     </div>`;
   else
     choices = html`<div class="mc-providers">
@@ -798,7 +798,7 @@ export function openModelConnectManager(provider?: "anthropic" | "openai"): void
   void load().then(() => {
     if (current(state) && s.loaded && s.intent) {
       s.open = s.intent.key;
-      if (!s.connections[s.intent.key]) void pickSubscription(s.intent);
+      if (!s.connections[s.intent.apiName]) void pickSubscription(s.intent);
       else paint();
     }
   });

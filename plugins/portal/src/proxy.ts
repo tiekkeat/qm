@@ -1,7 +1,9 @@
 import { request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import { signedHeaders } from "../../chassis/src/core-client.ts";
-import { withVary } from "../../chassis/src/http.ts";
+import { relayStream, withVary } from "../../chassis/src/http.ts";
 import { mintPortalIdentity, PORTAL_IDENTITY_HEADER } from "../../chassis/src/portal-identity.ts";
+import { CLIENT_SURFACE_HEADER } from "../../chassis/src/client-surface.ts";
+import { REQUEST_ID_HEADERS } from "../../chassis/src/error-reporting.ts";
 
 const IDENTITY_TTL_MS = 60_000;
 
@@ -12,6 +14,8 @@ const FORWARD_REQUEST_HEADERS = [
   "user-agent",
   "accept-encoding",
   "sec-fetch-dest",
+  CLIENT_SURFACE_HEADER,
+  ...REQUEST_ID_HEADERS,
 ];
 
 const DROP_RESPONSE_HEADERS = new Set([
@@ -60,7 +64,8 @@ function relay(
   },
 ): void {
   const headers = { ...target.headers };
-  if (req.headers["content-length"] !== undefined) headers["content-length"] = req.headers["content-length"];
+  const length = req.headers["content-length"];
+  if (length !== undefined) headers["content-length"] = length;
   else if (req.headers["transfer-encoding"] !== undefined) headers["transfer-encoding"] = "chunked";
   const up = httpRequest(
     {
@@ -82,8 +87,7 @@ function relay(
       if (out.vary !== undefined) out.vary = withVary(res, String(out.vary));
       if (target.honorFramePolicy && declaresFrameAncestors(out)) res.removeHeader("x-frame-options");
       res.writeHead(upRes.statusCode ?? 502, out);
-      upRes.on("error", () => res.destroy());
-      upRes.pipe(res);
+      relayStream(upRes, res);
     },
   );
   up.on("error", () => {
@@ -94,11 +98,10 @@ function relay(
       res.end();
     }
   });
-  req.on("error", () => up.destroy());
   res.on("close", () => {
     if (!res.writableFinished) up.destroy();
   });
-  req.pipe(up);
+  relayStream(req, up);
 }
 
 export interface SurfaceTarget {
@@ -154,13 +157,13 @@ export const FORWARD_WEBHOOK_HEADERS = [
   "x-slack-signature",
   "x-slack-request-timestamp",
   "stripe-signature",
+  "linear-signature",
   "x-signature",
   "x-delivery-id",
 ];
 
 export const FORWARD_AGENT_API_HEADERS = [
   "content-type",
-  "content-length",
   "accept",
   "accept-encoding",
   "x-agent-capability",
@@ -168,12 +171,15 @@ export const FORWARD_AGENT_API_HEADERS = [
   "git-protocol",
 ];
 
-export const FORWARD_DEPLOYMENT_LAYER_HEADERS = [
+export const FORWARD_DEPLOYMENT_LAYER_HEADERS = ["content-type", "accept", "x-timestamp", "x-signature"];
+
+export const FORWARD_DEPLOYMENT_GIT_HEADERS = [
+  "authorization",
   "content-type",
   "content-length",
+  "content-encoding",
   "accept",
-  "x-timestamp",
-  "x-signature",
+  "git-protocol",
 ];
 
 export const FORWARD_OAUTH_HEADERS = ["accept", "accept-language", "user-agent", "content-type"];
@@ -243,7 +249,7 @@ export function proxyToUpstream(
   });
 }
 
-export const FORWARD_BROKER_HEADERS = ["accept", "accept-language", "user-agent", "content-type", "content-length"];
+export const FORWARD_BROKER_HEADERS = ["accept", "accept-language", "user-agent", "content-type"];
 
 export function proxyToAppHost(req: IncomingMessage, res: ServerResponse, coreBase: string, clientIp?: string): void {
   const upstream = new URL(coreBase);

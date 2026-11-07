@@ -24,11 +24,11 @@ function ctx(useSkill: (name: string, path: string, sandboxId?: string) => Promi
     provision: async () => ({ id: "h", rootDir: "/workspace" }) as SandboxHandle,
     useSkill,
     backgroundBroker: backgroundBroker as never,
-    layers: [{ scopeId: scopeId("personal", "U1"), mountPath: "", mode: "rw" }],
+    writableScopeId: scopeId("personal", "U1"),
+    readOnlyScopeIds: [],
     commandPolicy: () => ({ mode: "denylist", rules: [] }),
     authorizeCommand: () => false,
     grantedHandles: [],
-    workspace: {} as never,
     deploy: {} as never,
     acl: {} as never,
     createdBy: "U1",
@@ -84,11 +84,11 @@ function createToolContextWithout(extra: Partial<ToolContextDeps> = {}) {
   const tc = createToolContext({
     sandbox: {} as unknown as Sandbox,
     provision: async () => ({ id: "h", rootDir: "/workspace" }) as SandboxHandle,
-    layers: [{ scopeId: scopeId("personal", "U1"), mountPath: "", mode: "rw" }],
+    writableScopeId: scopeId("personal", "U1"),
+    readOnlyScopeIds: [],
     commandPolicy: () => ({ mode: "denylist", rules: [] }),
     authorizeCommand: () => false,
     grantedHandles: [],
-    workspace: {} as never,
     deploy: {} as never,
     acl: {} as never,
     createdBy: "U1",
@@ -97,7 +97,7 @@ function createToolContextWithout(extra: Partial<ToolContextDeps> = {}) {
   return { tc };
 }
 
-test("skill discovery pages the current visible catalog without provisioning or exposing metadata", async () => {
+test("skill discovery pages the current visible catalog with ids, without provisioning or exposing other metadata", async () => {
   const skills = Array.from({ length: 3 }, (_, i) => ({
     skill: {
       manifest: {
@@ -127,22 +127,27 @@ test("skill discovery pages the current visible catalog without provisioning or 
   assert.deepEqual(await tc.listSkills(), { sourceScopeId: null, skills: [] });
   assert.deepEqual(await tc.listSkills("", 0, 2, "personal:someone"), {
     sourceScopeId: "personal:someone",
-    skills: [0, 1].map((i) => ({ name: `skill-${i}`, description: "General task", source: "personal:someone" })),
+    skills: [0, 1].map((i) => ({
+      id: `id-${i}`,
+      name: `skill-${i}`,
+      description: "General task",
+      source: "personal:someone",
+    })),
     nextOffset: 2,
   });
   assert.deepEqual(await tc.listSkills("", 2, 2, "personal:someone"), {
     sourceScopeId: "personal:someone",
-    skills: [{ name: "skill-2", description: "Telescope planning", source: "personal:someone" }],
+    skills: [{ id: "id-2", name: "skill-2", description: "Telescope planning", source: "personal:someone" }],
   });
   assert.deepEqual(await tc.listSkills("telescope", 0, 50, "personal:someone"), {
     sourceScopeId: "personal:someone",
-    skills: [{ name: "skill-2", description: "Telescope planning", source: "personal:someone" }],
+    skills: [{ id: "id-2", name: "skill-2", description: "Telescope planning", source: "personal:someone" }],
   });
   skills[1]!.skill.scopeId = scopeId("personal", "U1");
   const native = await tc.listSkills();
   assert.deepEqual(native, {
     sourceScopeId: null,
-    skills: [{ name: "skill-1", description: "General task", source: "personal:U1" }],
+    skills: [{ id: "id-1", name: "skill-1", description: "General task", source: "personal:U1" }],
   });
   assert.deepEqual(await tc.listSkills("", 0, 100, "personal:missing"), { sourceScopeId: null, skills: [] });
   skills.pop();

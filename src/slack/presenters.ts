@@ -1,3 +1,6 @@
+import { escapeSlackText } from "./mrkdwn.ts";
+import { swallow } from "../util/errors.ts";
+
 export const DEFAULT_ACK_REACTIONS = ["eyes", "mag", "hourglass_flowing_sand", "telescope", "saluting_face"] as const;
 
 export const CURATED_ACK_EMOJI = [
@@ -54,12 +57,6 @@ export const CURATED_ACK_EMOJI = [
   "coffee",
 ] as const;
 
-export function stripAckPrefix(text: string, ack: string | undefined): string {
-  if (!ack) return text;
-  const lead = text.trimStart();
-  return lead.startsWith(ack) ? lead.slice(ack.length).trimStart() : text;
-}
-
 export interface AckPresenter {
   onFirstBlock(text: string): void;
   onSurfacePosted(): void;
@@ -83,7 +80,7 @@ export function createAckPresenter(deps: {
   const randomEmoji = (): string =>
     candidates[Math.min(candidates.length - 1, Math.floor(random() * candidates.length))]!;
   let pickResult: string | undefined;
-  void deps.emojiPick?.then((v) => (pickResult = v)).catch(() => undefined);
+  void deps.emojiPick?.then((v) => (pickResult = v)).catch((e) => swallow("slack: pick ack emoji", e));
   let emoji = "";
   let reactionApplied = false;
   let reactionCancelled = false;
@@ -92,7 +89,7 @@ export function createAckPresenter(deps: {
   let sawFirstBlock = false;
   let chain: Promise<void> = Promise.resolve();
   const enqueue = (op: () => Promise<void>): void => {
-    chain = chain.then(op).catch(() => {});
+    chain = chain.then(op).catch((e) => swallow("slack: ack presenter step", e));
   };
   const timer = setTimeout(() => {
     if (deps.taskManaged || settled || ackPosted || reactionCancelled) return;
@@ -147,7 +144,7 @@ export function renderGoalNotice(goal: GoalNoticeView): string {
     .replace(/\s+/g, " ")
     .trim();
   const bounded = oneLine.length > 140 ? `${oneLine.slice(0, 139)}…` : oneLine;
-  const objective = bounded.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const objective = escapeSlackText(bounded);
   if (goal.status === "complete") return `✓ Goal complete: ${objective}`;
   if (goal.status === "cancelled") return `✕ Goal cancelled: ${objective}`;
   if (goal.status === "paused") return `⏸ Goal paused: ${objective}`;

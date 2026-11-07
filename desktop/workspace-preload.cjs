@@ -62,9 +62,9 @@ window.addEventListener("DOMContentLoaded", () => {
         height: 96px; min-height: 96px; padding: 48px 0 8px; justify-content: center;
       }
       html[data-qm-desktop="darwin"] .brand button { -webkit-app-region: no-drag; }
-      html[data-qm-desktop="darwin"] .dv-tabs-and-actions-container,
+      html[data-qm-desktop="darwin"] .single-pane .dv-tabs-and-actions-container,
       html[data-qm-desktop="darwin"] .chat-topbar { -webkit-app-region: drag; }
-      html[data-qm-desktop="darwin"] .dv-tabs-and-actions-container :is(button, a, input, [role="tab"], .dv-tab),
+      html[data-qm-desktop="darwin"] .dv-tabs-and-actions-container :is(button, a, input, [role="tab"], .dv-tab, .dv-right-actions-container),
       html[data-qm-desktop="darwin"] .chat-topbar :is(button, a, input, [role="tab"]) {
         -webkit-app-region: no-drag;
       }
@@ -114,6 +114,10 @@ window.addEventListener("DOMContentLoaded", () => {
   ipcRenderer.on("qm:cycle-tab", (_event, step) => {
     if (document.querySelector('dialog[open], [aria-modal="true"]:not(.sidebar)')) return;
     window.dispatchEvent(new CustomEvent("qm:cycle-tab", { detail: step }));
+  });
+  ipcRenderer.on("qm:new-session", () => {
+    if (document.querySelector('dialog[open], [aria-modal="true"]:not(.sidebar)')) return;
+    window.dispatchEvent(new CustomEvent("qm:new-session"));
   });
   window.addEventListener(
     "keydown",

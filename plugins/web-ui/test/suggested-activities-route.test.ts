@@ -31,15 +31,6 @@ test.after(() => {
   core.close();
 });
 
-test("only signed-in users receive configured suggestions", async () => {
-  const anonymous = await fetch(`${base}/me`);
-  assert.equal(anonymous.status, 401);
-  assert.equal((await anonymous.json()).suggestedActivities, undefined);
-  const signedIn = await fetch(`${base}/me`, { headers: { cookie: "webuiuser=alice" } });
-  assert.equal(signedIn.status, 200);
-  assert.deepEqual((await signedIn.json()).suggestedActivities, activities);
-});
-
 test("generation requires sign-in and derives identity and seeds server-side", async () => {
   assert.equal((await fetch(`${base}/api/suggested-activities`, { method: "POST" })).status, 401);
   const result = await fetch(`${base}/api/suggested-activities`, {

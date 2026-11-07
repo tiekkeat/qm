@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { createInsecureTestServer } from "../src/api/server.ts";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { testConfig } from "./support/test-config.ts";
 
 function start() {
@@ -95,6 +95,56 @@ test("per-kind artifact reads are scope-filtered, authz-gated, and audited", asy
         `${kind}: the read is audited`,
       );
     }
+  } finally {
+    await s.close();
+  }
+});
+
+test("an admin cannot repoint someone else's grant-carrying cron; its owner can", async () => {
+  const s = start();
+  try {
+    const cron = await s.built.app.createCron({
+      ownerScopeId: "personal:U1",
+      owner: "U1",
+      createdBy: "U1",
+      schedule: { everyMs: 60_000 },
+      action: "review spend",
+      unattendedGrants: ["admin.spend.read"],
+    });
+    const put = (destination: unknown) =>
+      fetch(`${s.base}/v1/admin/crons/${encodeURIComponent(cron.id)}/destination?scope=personal:U1`, {
+        method: "PUT",
+        headers: { ...ALICE_ADMIN, "content-type": "application/json" },
+        body: JSON.stringify({ destination }),
+      });
+    assert.equal((await put({ type: "slack", target: "C9", audienceScopeId: "channel:C9" })).status, 409);
+    assert.equal(
+      (await put({ type: "slack", target: "C9", audienceScopeId: "personal:U1" })).status,
+      409,
+      "a caller-supplied audience cannot launder a room destination",
+    );
+    assert.equal((await s.built.app.getCron(cron.id))?.destination, undefined);
+
+    const own = await s.built.app.createCron({
+      ownerScopeId: "personal:admin-alice",
+      owner: "admin-alice",
+      createdBy: "admin-alice",
+      schedule: { everyMs: 60_000 },
+      action: "review spend",
+      unattendedGrants: ["admin.spend.read"],
+    });
+    const moved = await fetch(
+      `${s.base}/v1/admin/crons/${encodeURIComponent(own.id)}/destination?scope=personal:admin-alice`,
+      {
+        method: "PUT",
+        headers: { ...ALICE_ADMIN, "content-type": "application/json" },
+        body: JSON.stringify({ destination: { type: "slack", target: "C9", audienceScopeId: "channel:C9" } }),
+      },
+    );
+    assert.equal(moved.status, 200, "the owner, acting live, chooses where their cron's output goes");
+    const after = await s.built.app.getCron(own.id);
+    assert.equal(after?.destination?.target, "C9");
+    assert.deepEqual(after?.unattendedGrants, ["admin.spend.read"]);
   } finally {
     await s.close();
   }
@@ -358,7 +408,7 @@ test("admin cron runtime edits preserve task authority and reject unavailable or
       unattendedGrants: ["publish"],
       destination: { type: "principal", target: "U1" },
     });
-    const runtime = { harnessId: "mock", modelId: "claude-sonnet-5" };
+    const runtime = { modelId: "claude-sonnet-5" };
     const put = (body: unknown, scope = "personal:U1", actor = ALICE_ADMIN) =>
       fetch(`${s.base}/v1/admin/crons/${cron.id}/runtime?scope=${scope}`, {
         method: "PUT",

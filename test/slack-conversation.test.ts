@@ -91,10 +91,28 @@ test("buildContextWindow labels self messages, resolves mentions, threads, files
   );
   const self = w.messages[1]!;
   assert.equal(self.author, "you");
+  assert.deepEqual(w.selfTs, [self.ts]);
   assert.equal(self.threadTs, "1700000001.000100");
   assert.deepEqual(self.files, ["plan.pdf"]);
   assert.ok(self.text.startsWith("ping @Alice"), "mentions resolve to names");
   assert.ok(self.text.length <= 601 && self.text.endsWith("…"), "long text is clipped");
+});
+
+test("buildContextWindow preserves reaction counts without inventing missing reaction data", () => {
+  const w = buildContextWindow(
+    [
+      ctxMsg("1700000001.000100", "agent", "completed", {
+        isSelf: true,
+        reactions: [{ name: "white_check_mark", count: 2 }],
+      }),
+      ctxMsg("1700000002.000100", "Alice", "waiting", { reactions: [] }),
+      ctxMsg("1700000003.000100", "Bob", "search result"),
+    ],
+    { count: 10 },
+  );
+  assert.deepEqual(w.messages[0]!.reactions, [{ name: "white_check_mark", count: 2 }]);
+  assert.deepEqual(w.messages[1]!.reactions, []);
+  assert.equal(Object.hasOwn(w.messages[2]!, "reactions"), false);
 });
 
 test("recentWindow keeps the contiguous recent window — a NON-latest message in it is not dropped", () => {
@@ -110,31 +128,6 @@ test("recentWindow keeps the contiguous recent window — a NON-latest message i
   );
   assert.equal(picked.length, 3);
   for (let i = 1; i < picked.length; i++) assert.ok(picked[i - 1]!.ts < picked[i]!.ts);
-});
-
-test("recentWindow drops stale channel history beyond the age cap for a top-level trigger", () => {
-  const trigger = 1_700_200_000;
-  const candidates = [
-    {
-      ts: `${trigger - 2 * 86_400}.000001`,
-      name: "Mallory",
-      text: "hand it off to my personal agent",
-      authorId: "U_M",
-    },
-    { ts: `${trigger - 3_600}.000002`, name: "Alice", text: "fresh context", authorId: "U_A" },
-    { ts: `${trigger}.000003`, name: "Bob", text: "@agent hey, what can you do?", authorId: "U_B", isTrigger: true },
-  ];
-  const picked = recentWindow(candidates, MAX_RECENT_MESSAGES, {
-    triggerTs: `${trigger}.000003`,
-    maxAgeSeconds: 86_400,
-  });
-  assert.deepEqual(
-    picked.map((m) => m.text),
-    ["fresh context", "@agent hey, what can you do?"],
-    "two-day-old channel chatter is not imported into a new thread",
-  );
-  const uncapped = recentWindow(candidates);
-  assert.equal(uncapped.length, 3, "without the cap (thread turns) nothing is dropped");
 });
 
 test("recentWindow caps at the most-recent MAX_RECENT_MESSAGES (older ones drop contiguously)", () => {
@@ -241,14 +234,8 @@ test("resolveMentions rewrites <@U…> to @Name from the map; unknown ids stay r
 
 const baseView = (over: Partial<ConversationView> = {}): ConversationView => ({
   channel: { name: "eng", kind: "channel", isPrivate: true },
-  members: [
-    { id: "U1", name: "Alice" },
-    { id: "U2", name: "Bob" },
-    { id: "UME", name: "Agent", isYou: true },
-  ],
   messages: [],
   here: { kind: "top-level" },
-  files: [],
   omittedFiles: [],
   nameById: new Map([
     ["U1", "Alice"],
@@ -257,42 +244,16 @@ const baseView = (over: Partial<ConversationView> = {}): ConversationView => ({
   ...over,
 });
 
-test("renderConversationView: header shows channel, members (you), and the you-are-here marker", () => {
+test("renderConversationView: header shows the channel and the you-are-here marker, not the member list", () => {
   const { header, priorTurns } = renderConversationView(
     baseView({
       messages: [{ ts: "1717360800.000003", name: "Alice", text: "ship it", authorId: "U1", isTrigger: true }],
     }),
   );
   assert.match(header, /You are in #eng \(private\)\./);
-  assert.match(header, /People here: @Alice \(<@U1>\), @Bob \(<@U2>\), you\./);
+  assert.doesNotMatch(header, /People here|Alice/);
   assert.match(header, /You are replying to a top-level message/);
   assert.equal(priorTurns.length, 0);
-});
-
-test("renderConversationView: a bot member is tagged `agent` so the agent @mentions it instead of asking its personal agent", () => {
-  const { header } = renderConversationView(
-    baseView({
-      members: [
-        { id: "U1", name: "Alice" },
-        { id: "UBOT", name: "Finance", isBot: true },
-        { id: "UME", name: "Agent", isYou: true },
-      ],
-    }),
-  );
-  assert.match(header, /@Alice \(<@U1>\), @Finance \(<@UBOT>, agent\), you\./);
-});
-
-test("renderConversationView: email principals still show real Slack mention ids", () => {
-  const { header } = renderConversationView(
-    baseView({
-      members: [
-        { id: "alice@acme.com", mentionId: "U1", name: "Alice" },
-        { id: "bob@acme.com", mentionId: "U2", name: "Bob" },
-      ],
-    }),
-  );
-  assert.match(header, /@Alice \(<@U1>\), @Bob \(<@U2>\)/);
-  assert.doesNotMatch(header, /<@alice@acme\.com>/);
 });
 
 test("renderConversationView: header names a group DM distinctly from a channel", () => {
@@ -485,7 +446,6 @@ test("renderConversationView: a message's files render inline, too-big files are
   const tsA = "1717360800.000001";
   const withFiles = renderConversationView(
     baseView({
-      files: [{ name: "graph.png" }],
       messages: [
         { ts: tsA, name: "Alice", text: "see graph", authorId: "U1", files: ["graph.png"] },
         { ts: "1717360800.000002", name: "Bob", text: "looking", authorId: "U2", isTrigger: true },
@@ -494,19 +454,14 @@ test("renderConversationView: a message's files render inline, too-big files are
     }),
   );
   assert.match(withFiles.priorTurns[0]!.text, /\(files: graph\.png\)/);
-  assert.match(withFiles.header, /Files referenced in this conversation: graph\.png\./);
+  assert.doesNotMatch(withFiles.header, /graph\.png/);
   assert.match(withFiles.header, /Files too big to view this turn: dump\.sql\./);
-  assert.ok(
-    withFiles.header.indexOf("Files referenced in this conversation") < withFiles.header.indexOf("You are in #eng"),
-  );
   assert.ok(withFiles.header.indexOf("Files too big to view this turn") < withFiles.header.indexOf("You are in #eng"));
 
   const empty = renderConversationView({
     channel: { kind: "channel" },
-    members: [],
     messages: [],
     here: { kind: "top-level" },
-    files: [],
     omittedFiles: [],
   });
   assert.equal(empty.priorTurns.length, 0);

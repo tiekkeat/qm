@@ -1,15 +1,11 @@
 import { cleanupFailedProvision } from "./sandbox.ts";
 import { randomUUID } from "node:crypto";
-import type { WorkspaceLayer } from "../types.ts";
-import type { WorkspaceStore } from "../workspace/workspace-store.ts";
 import type { DurableMap } from "../persistence/durable-map.ts";
-import { createMemoryMap } from "../persistence/durable-map.ts";
 import { createKeyedQueue } from "../util/async.ts";
 import { swallowAs, errMessage } from "../util/errors.ts";
 import { shq } from "../util/shell.ts";
-import { nonInteractiveShellPrefix, DROPPED_PROXY_ENV, forceThroughProxyEnv } from "./sandbox-env.ts";
+import { nonInteractiveShellPrefix, DROPPED_PROXY_ENV } from "./sandbox-env.ts";
 import { createExecProcessSessions, type ExecProcessIo } from "./exec-process-session.ts";
-import { materializeRoLayers } from "./ro-layers.ts";
 import { createLayerToolInstaller } from "./layer-tool-install.ts";
 import type { LayerInstallFile } from "../deployment/load-layer.ts";
 import {
@@ -36,8 +32,8 @@ import {
 } from "./managed-agents-client.ts";
 import {
   createHomeSnapshotOps,
-  createMemorySnapshotStore,
   HOME_SNAPSHOT_PRUNE,
+  isJobComputerScope,
   snapshotDue,
   type HomeSnapshotStore,
 } from "./home-snapshot.ts";
@@ -56,8 +52,6 @@ const WORKSPACE_ROOT = "/workspace";
 const HOME_DIR = `${WORKSPACE_ROOT}/home`;
 const TRANSFER_RELAY_BASENAME = ".qm-transfer.";
 const WORKSPACE_BASENAME = "workspace";
-const RO_LAYERS_TAR = ".ro-layers.tar";
-const RO_LAYERS_MANIFEST = ".ro-layers.manifest";
 const HOME_TAR = `${HOME_DIR}/.qm-home.tar`;
 
 const SNAPSHOT_PRUNE = HOME_SNAPSHOT_PRUNE;
@@ -89,23 +83,21 @@ export interface ManagedAgentsSandboxOptions extends BlobStagingOptions {
   namePrefix?: string;
   defaultTimeoutSec?: number;
   snapshotIntervalMs?: number;
-  egressProxyUrl?: string;
   extraTools?: string[];
   credentialPaths?: CredentialPathSpec[];
   layerToolFiles?: () => readonly LayerInstallFile[];
-  store?: DurableMap<StoredManagedAgentsSandbox>;
+  store: DurableMap<StoredManagedAgentsSandbox>;
   snapshots?: HomeSnapshotStore;
   onError?: (e: { category: string; code: string; message: string; scopeLabel?: string }) => void;
 }
 
-export function createManagedAgentsSandbox(workspace: WorkspaceStore, opts: ManagedAgentsSandboxOptions): Sandbox {
+export function createManagedAgentsSandbox(opts: ManagedAgentsSandboxOptions): Sandbox {
   const client = opts.client;
   const prefix = opts.namePrefix ?? "qm";
   const defaultTimeoutSec = opts.defaultTimeoutSec ?? 600;
   const snapshotIntervalMs = opts.snapshotIntervalMs ?? DEFAULT_SNAPSHOT_INTERVAL_MS;
   const workspaceDir = `${HOME_DIR}/${WORKSPACE_BASENAME}`;
-  const store = opts.store ?? createMemoryMap<StoredManagedAgentsSandbox>();
-  const snapshots = opts.snapshots ?? createMemorySnapshotStore();
+  const store = opts.store;
   const provisionQueue = createKeyedQueue<string>();
 
   const sessionByName = new Map<string, ManagedAgentsSession>();
@@ -117,20 +109,26 @@ export function createManagedAgentsSandbox(workspace: WorkspaceStore, opts: Mana
     opts.onError?.({ category, code, message, ...(scopeLabel ? { scopeLabel } : {}) });
   };
 
-  const homeSnapshots = createHomeSnapshotOps<ManagedAgentsSession>({
-    label: "do-managed-agents",
-    homeDir: HOME_DIR,
-    homeTarPath: HOME_TAR,
-    prunePaths: [...SNAPSHOT_PRUNE, ...ephemeralCredLinkPaths(opts.credentialPaths ?? []).map(({ rel }) => `./${rel}`)],
-    store: snapshots,
-    io: {
-      runCommand: (session, script, timeoutMs) => session.runCommand(script, { timeoutMs }),
-      readFileBytes: (session, abs) => session.readFileBytes(abs),
-      writeFileBytes: (session, abs, data) => session.writeFileBytes(abs, data),
-    },
-  });
+  const homeSnapshots = opts.snapshots
+    ? createHomeSnapshotOps<ManagedAgentsSession>({
+        label: "do-managed-agents",
+        homeDir: HOME_DIR,
+        homeTarPath: HOME_TAR,
+        prunePaths: [
+          ...SNAPSHOT_PRUNE,
+          ...ephemeralCredLinkPaths(opts.credentialPaths ?? []).map(({ rel }) => `./${rel}`),
+        ],
+        store: opts.snapshots,
+        io: {
+          runCommand: (session, script, timeoutMs) => session.runCommand(script, { timeoutMs }),
+          readFileBytes: (session, abs) => session.readFileBytes(abs),
+          writeFileBytes: (session, abs, data) => session.writeFileBytes(abs, data),
+        },
+      })
+    : undefined;
 
   async function snapshotHome(scope: string, session: ManagedAgentsSession): Promise<void> {
+    if (!homeSnapshots) return;
     await homeSnapshots.snapshotHome(scope, session);
     await store.merge(scope, { lastSnapshotMs: Date.now(), homeDirty: false });
   }
@@ -159,6 +157,7 @@ export function createManagedAgentsSandbox(workspace: WorkspaceStore, opts: Mana
   }
 
   async function captureCheckpoint(scope: string, session: ManagedAgentsSession): Promise<void> {
+    if (isJobComputerScope(scope)) return;
     const stored = await store.get(scope);
     const previous = stored?.checkpointId;
     const captured = await session.createCheckpoint(CHECKPOINT_LABEL);
@@ -174,8 +173,8 @@ export function createManagedAgentsSandbox(workspace: WorkspaceStore, opts: Mana
     if (previous && previous !== captured.checkpointId) await forgetCheckpoint(scope, session, previous);
   }
 
-  const hydrateHome = (scope: string, session: ManagedAgentsSession): Promise<boolean> =>
-    homeSnapshots.hydrateHome(scope, session);
+  const hydrateHome = async (scope: string, session: ManagedAgentsSession): Promise<boolean> =>
+    homeSnapshots ? homeSnapshots.hydrateHome(scope, session) : false;
 
   const recordSession = (scope: string, session: ManagedAgentsSession, createdAtMs: number): Promise<void> =>
     store.put(scope, {
@@ -304,7 +303,7 @@ export function createManagedAgentsSandbox(workspace: WorkspaceStore, opts: Mana
     writablePersistence: client.nativePause ? "provider_managed" : "snapshot_to_workspace",
     processSessions: true,
     parksOnTeardown: true,
-    egressEnforcement: opts.egressProxyUrl ? "domain" : "none",
+    egressEnforcement: "none",
     spec: {
       os: "Linux — DigitalOcean Managed Agents Firecracker microVM (provider pause preserves state; publish durable work to git or Files)",
       runtimes: ["Node", "Python 3"],
@@ -407,10 +406,8 @@ export function createManagedAgentsSandbox(workspace: WorkspaceStore, opts: Mana
     ...execFileOps,
     ...blobStaging,
 
-    async provision(layers: WorkspaceLayer[], provOpts?: ProvisionOptions): Promise<SandboxHandle> {
+    async provision(scope: string, provOpts?: ProvisionOptions): Promise<SandboxHandle> {
       const scratch = provOpts?.scratch;
-      const writable = layers.find((l) => l.mode === "rw") ?? layers[0];
-      const scope = writable?.scopeId ?? "default";
       let name: string;
       let coldStart: boolean;
       if (scratch) {
@@ -421,14 +418,7 @@ export function createManagedAgentsSandbox(workspace: WorkspaceStore, opts: Mana
         ({ coldStart } = await ensureSession(scope, name, provOpts?.onStatus));
       }
 
-      const forceEgress = !!opts.egressProxyUrl && !!provOpts?.egressToken;
-      const turnEnv = Object.fromEntries(
-        Object.entries(provOpts?.env ?? {}).filter(([k]) => !DROPPED_PROXY_ENV.has(k)),
-      );
-      const env = {
-        ...turnEnv,
-        ...(forceEgress ? forceThroughProxyEnv(opts.egressProxyUrl!, provOpts!.egressToken!) : {}),
-      };
+      const env = Object.fromEntries(Object.entries(provOpts?.env ?? {}).filter(([k]) => !DROPPED_PROXY_ENV.has(k)));
       const handle: SandboxHandle = {
         id: name,
         rootDir: workspaceDir,
@@ -444,17 +434,6 @@ export function createManagedAgentsSandbox(workspace: WorkspaceStore, opts: Mana
         if (prep.code !== 0)
           throw new Error(`do-managed-agents provision prep failed: ${(prep.stderr || prep.stdout).slice(0, 200)}`);
 
-        await materializeRoLayers(
-          workspace,
-          layers,
-          handle,
-          {
-            readFile: (h, rel) => sandbox.readFile(h, rel),
-            writeFileBytes: (h, rel, data) => sandbox.writeFileBytes(h, rel, data),
-            exec: (script, t) => execRaw(name, script, t),
-          },
-          { manifest: RO_LAYERS_MANIFEST, tar: RO_LAYERS_TAR, label: "do-managed-agents" },
-        );
         await installLayerTools?.({
           exec: (script, t) => execRaw(name, script, t),
           writeAbs: (abs, data) => writeAbsBytes(name, abs, data),
@@ -507,12 +486,16 @@ export function createManagedAgentsSandbox(workspace: WorkspaceStore, opts: Mana
 
     exportFiles: execExport.exportFiles,
 
-    async persistHomeSnapshot(scopeId: string): Promise<void> {
-      const name = sandboxScopeName(prefix, scopeId);
-      scopeByName.set(name, scopeId);
-      const { session } = await ensureSession(scopeId, name);
-      await snapshotHome(scopeId, session);
-    },
+    ...(homeSnapshots
+      ? {
+          async persistHomeSnapshot(scopeId: string): Promise<void> {
+            const name = sandboxScopeName(prefix, scopeId);
+            scopeByName.set(name, scopeId);
+            const { session } = await ensureSession(scopeId, name);
+            await snapshotHome(scopeId, session);
+          },
+        }
+      : {}),
 
     async restartComputer(scopeId: string): Promise<void> {
       const name = sandboxScopeName(prefix, scopeId);
@@ -520,6 +503,28 @@ export function createManagedAgentsSandbox(workspace: WorkspaceStore, opts: Mana
       return provisionQueue(scopeId, async () => {
         const stored = await store.get(scopeId);
         if (!stored?.sessionId) throw new Error("do-managed-agents restart: no sandbox provisioned yet");
+        if (homeSnapshots) {
+          let session = sessionByName.get(name);
+          if (!session) {
+            try {
+              session = await client.connect(stored.sessionId);
+            } catch (e) {
+              if (!(e instanceof ManagedAgentsSandboxGoneError)) throw e;
+            }
+          }
+          if (session) {
+            await snapshotHome(scopeId, session);
+            await session.kill();
+          }
+          sessionByName.delete(name);
+          await store.merge(scopeId, {
+            checkpointId: undefined,
+            checkpointAtMs: undefined,
+            checkpointError: undefined,
+            preservationError: undefined,
+          });
+          return;
+        }
         const checkpointId = stored.checkpointId;
         if (!checkpointId) throw new Error("do-managed-agents restart: no checkpoint to restore");
         const cached = sessionByName.get(name);
@@ -629,7 +634,10 @@ export function createManagedAgentsSandbox(workspace: WorkspaceStore, opts: Mana
     if (!tdOpts?.homeUnchanged) await store.merge(scope, { homeDirty: true });
     await retryPendingCheckpointDeletes(scope, session);
     const homeDirty = stored?.homeDirty;
-    if (snapshotDue({ lastSnapshotMs: stored?.checkpointAtMs, homeDirty }, tdOpts, snapshotIntervalMs)) {
+    if (
+      !homeSnapshots &&
+      snapshotDue({ lastSnapshotMs: stored?.checkpointAtMs, homeDirty }, tdOpts, snapshotIntervalMs)
+    ) {
       try {
         await captureCheckpoint(scope, session);
       } catch (e) {

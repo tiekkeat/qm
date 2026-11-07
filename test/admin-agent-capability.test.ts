@@ -1,5 +1,7 @@
 import { createAdminCall } from "../src/tools/admin.ts";
-import { createAgentTools } from "../src/harness/agent-tools.ts";
+import { adminRoutes } from "../src/api/routes/admin.ts";
+import { UNATTENDED_ADMIN_GRANTS } from "../src/api/control-service.ts";
+import { createAgentTools } from "../src/agent/agent-tools.ts";
 import type { ToolContext } from "../src/tools/primitives.ts";
 import "./support/auto-fake-sprites.ts";
 import { selectDefaultSandbox } from "./support/default-sandbox.ts";
@@ -11,10 +13,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { createServer } from "../src/api/server.ts";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { createKeychain } from "../src/credentials/keychain.ts";
 import { deriveConnectorKey } from "../src/connectors/connector-client-store.ts";
-import { createMemoryMap } from "../src/persistence/durable-map.ts";
 import { scopeId, type TurnRequest } from "../src/types.ts";
 import {
   mintCapabilityToken,
@@ -24,11 +25,13 @@ import {
 } from "../src/auth/capability-token.ts";
 import { testConfig } from "./support/test-config.ts";
 import { mintSignedPayload } from "../src/auth/signed-token.ts";
+import { testAdvisoryLock, testMap, testDatabaseUrl } from "./support/test-database.ts";
+import { createPostgresReplayDedupe } from "../src/auth/replay-dedupe.ts";
 
 const SECRET = "agent-admin-test-secret".repeat(3);
 const ORG = scopeId("org", "default-org");
 
-function start(withConfig = true) {
+async function start(withConfig = true) {
   const built = buildApp(
     testConfig({
       dataDir: mkdtempSync(join(tmpdir(), "admin-agent-cap-")),
@@ -37,7 +40,7 @@ function start(withConfig = true) {
       apiBaseUrl: "http://core.example.test",
     }),
   );
-  void built.directory.replaceChannels(
+  await built.directory.replaceChannels(
     [{ channelId: "C1", name: "agent-admin", isPrivate: false }],
     [
       { channelId: "C1", principalId: "admin-alice" },
@@ -45,12 +48,14 @@ function start(withConfig = true) {
     ],
   );
   const keychain = createKeychain({
-    creds: createMemoryMap(),
-    grants: createMemoryMap(),
-    asks: createMemoryMap(),
+    lock: testAdvisoryLock(),
+    creds: testMap(),
+    grants: testMap(),
+    asks: testMap(),
     key: deriveConnectorKey("admin-agent-capability-keychain"),
   });
   const server = createServer(built.app, {
+    replayDedupe: createPostgresReplayDedupe(testDatabaseUrl()),
     admin: built.admin,
     memory: built.memory,
     ...(withConfig ? { config: built.config } : {}),
@@ -87,7 +92,7 @@ const capFor = async (
 };
 
 test("an org admin's capability token can read and rewrite a scope's notebook via the admin API", async () => {
-  const s = start();
+  const s = await start();
   try {
     const cap = await capFor("admin-alice");
     await s.built.memory.capture(ORG, ["seed"], 0);
@@ -113,7 +118,7 @@ test("an org admin's capability token can read and rewrite a scope's notebook vi
 });
 
 test("a large channel's capability passes HTTP parsing and retains admin authorization", async () => {
-  const s = start();
+  const s = await start();
   try {
     const members = Array.from({ length: 120 }, (_, i) => ({
       id: `channel-member-${i}@example.test`,
@@ -164,7 +169,7 @@ test("a large channel's capability passes HTTP parsing and retains admin authori
 });
 
 test("whoami answers an agent capability token for admins and non-admins alike", async () => {
-  const s = start();
+  const s = await start();
   try {
     const admin = await fetch(`${s.base}/v1/admin/whoami`, {
       headers: { "x-agent-capability": await capFor("admin-alice") },
@@ -179,7 +184,7 @@ test("whoami answers an agent capability token for admins and non-admins alike",
 });
 
 test("a non-admin's capability token gets 403 from admin routes (gate routes, the grant store decides)", async () => {
-  const s = start();
+  const s = await start();
   try {
     const cap = await capFor("U1");
     await s.built.memory.capture(ORG, ["seed"], 0);
@@ -197,7 +202,7 @@ test("a non-admin's capability token gets 403 from admin routes (gate routes, th
 });
 
 test("x-admin-actor cannot escalate a capability token — the header is the portal's source-authed door", async () => {
-  const s = start();
+  const s = await start();
   try {
     const cap = await capFor("U1");
     const spoof = { "x-agent-capability": cap, "x-admin-actor": "admin-alice@default-org" };
@@ -223,7 +228,7 @@ test("x-admin-actor cannot escalate a capability token — the header is the por
 });
 
 test("a wrong-audience token never reaches the admin plane", async () => {
-  const s = start();
+  const s = await start();
   try {
     const res = await fetch(`${s.base}/v1/admin/whoami`, {
       headers: { "x-agent-capability": await capFor("admin-alice", { aud: EGRESS_PROXY_AUD }) },
@@ -235,7 +240,7 @@ test("a wrong-audience token never reaches the admin plane", async () => {
 });
 
 test("an autonomous turn's token cannot act as an admin, even when its actor holds the grant", async () => {
-  const s = start();
+  const s = await start();
   try {
     const cap = await capFor("admin-alice", { live: false });
 
@@ -256,8 +261,8 @@ test("an autonomous turn's token cannot act as an admin, even when its actor hol
   }
 });
 
-test("an unattended admin-read grant opens only the five read-only routes and keeps the DM gate", async () => {
-  const s = start();
+test("an unattended admin-read grant opens only its read-only routes and keeps the DM gate", async () => {
+  const s = await start();
   try {
     const granted = await capFor("admin-alice", { live: false, grants: ["admin.sessions.read"] });
     const scopeQ = `scope=${encodeURIComponent(ORG)}`;
@@ -266,7 +271,6 @@ test("an unattended admin-read grant opens only the five read-only routes and ke
       [`/v1/admin/sessions/missing-session?${scopeQ}`, 404],
       ["/v1/admin/scopes", 200],
       [`/v1/admin/errors?${scopeQ}`, 200],
-      [`/v1/admin/runs?${scopeQ}`, 200],
     ];
     for (const [path, expected] of allowed) {
       const response = await fetch(`${s.base}${path}`, { headers: { "x-agent-capability": granted } });
@@ -291,10 +295,17 @@ test("an unattended admin-read grant opens only the five read-only routes and ke
     }
 
     const ungranted = await capFor("admin-alice", { live: false });
-    assert.equal(
-      (await fetch(`${s.base}/v1/admin/sessions`, { headers: { "x-agent-capability": ungranted } })).status,
-      403,
+    const ungrantedRead = await fetch(`${s.base}/v1/admin/spend`, { headers: { "x-agent-capability": ungranted } });
+    assert.equal(ungrantedRead.status, 403);
+    assert.match(
+      ((await ungrantedRead.json()) as { message: string }).message,
+      /lacks the unattended grant admin\.spend\.read/,
     );
+    const noGrantRoute = await fetch(`${s.base}/v1/admin/memory?${scopeQ}`, {
+      headers: { "x-agent-capability": ungranted },
+    });
+    assert.equal(noGrantRoute.status, 403);
+    assert.match(((await noGrantRoute.json()) as { message: string }).message, /cannot use this route/);
     const channelGrant = await capFor("admin-alice", {
       live: false,
       grants: ["admin.sessions.read"],
@@ -311,21 +322,23 @@ test("an unattended admin-read grant opens only the five read-only routes and ke
 });
 
 test("each new unattended read grant opens exactly its own routes", async () => {
-  const s = start();
+  const s = await start();
   try {
     const scopeQ = `scope=${encodeURIComponent(ORG)}`;
     const cases: Array<[string, string[]]> = [
       ["admin.audit.read", [`/v1/admin/audit?${scopeQ}`]],
-      ["admin.metrics.read", [`/v1/admin/metrics?${scopeQ}`]],
       ["admin.egress.read", [`/v1/admin/egress?${scopeQ}`]],
       ["admin.files.read", [`/v1/admin/files?${scopeQ}`]],
+      ["admin.spend.read", ["/v1/admin/spend"]],
+      ["admin.crons.read", [`/v1/admin/crons?${scopeQ}`]],
     ];
     const crossDenied = [
       `/v1/admin/sessions?${scopeQ}`,
       `/v1/admin/audit?${scopeQ}`,
-      `/v1/admin/metrics?${scopeQ}`,
       `/v1/admin/egress?${scopeQ}`,
       `/v1/admin/files?${scopeQ}`,
+      "/v1/admin/spend",
+      `/v1/admin/crons?${scopeQ}`,
     ];
     for (const [grant, allowed] of cases) {
       const token = await capFor("admin-alice", { live: false, grants: [grant] });
@@ -341,10 +354,10 @@ test("each new unattended read grant opens exactly its own routes", async () => 
     }
     const combined = await capFor("admin-alice", {
       live: false,
-      grants: ["admin.sessions.read", "admin.metrics.read"],
+      grants: ["admin.sessions.read", "admin.egress.read"],
     });
     assert.equal(
-      (await fetch(`${s.base}/v1/admin/metrics?${scopeQ}`, { headers: { "x-agent-capability": combined } })).status,
+      (await fetch(`${s.base}/v1/admin/egress?${scopeQ}`, { headers: { "x-agent-capability": combined } })).status,
       200,
     );
     assert.equal(
@@ -360,8 +373,47 @@ test("each new unattended read grant opens exactly its own routes", async () => 
   }
 });
 
+test("the unattended-grant listing mirrors the route annotations and only answers a live org admin", async () => {
+  const s = await start();
+  try {
+    const expected = adminRoutes.flatMap((route) =>
+      "path" in route && route.admin?.unattended
+        ? [{ grant: route.admin.unattended.grant, method: route.method, path: route.path }]
+        : [],
+    );
+    const listing = await createAdminCall(s.base, await capFor("admin-alice"))({ action: "unattended_grants" });
+    assert.equal(listing.status, 200);
+    const grants = (listing.body as { grants: Array<Record<string, string>> }).grants;
+    assert.deepEqual(
+      grants.map(({ grant, method, path }) => ({ grant, method, path })),
+      expected,
+    );
+    assert.deepEqual(new Set(grants.map((entry) => entry.grant)), new Set(UNATTENDED_ADMIN_GRANTS));
+    assert.ok(grants.every((entry) => entry.summary));
+    assert.deepEqual(
+      grants.filter((entry) => entry.action === "spend" || entry.action === "crons").map((entry) => entry.grant),
+      ["admin.spend.read", "admin.crons.read"],
+    );
+    assert.ok(!grants.some((entry) => entry.path === "/v1/admin/users"));
+    assert.ok((await s.built.auditLog.events()).some((e) => e.action === "unattended-grants.read"));
+
+    const nonAdmin = await fetch(`${s.base}/v1/admin/unattended-grants`, {
+      headers: { "x-agent-capability": await capFor("U1") },
+    });
+    assert.equal(nonAdmin.status, 403);
+    const unattended = await fetch(`${s.base}/v1/admin/unattended-grants`, {
+      headers: {
+        "x-agent-capability": await capFor("admin-alice", { live: false, grants: [...UNATTENDED_ADMIN_GRANTS] }),
+      },
+    });
+    assert.equal(unattended.status, 403);
+  } finally {
+    await s.close();
+  }
+});
+
 test("an aud-less token never opens the admin door", async () => {
-  const s = start();
+  const s = await start();
   try {
     const res = await fetch(`${s.base}/v1/admin/memory?scope=${encodeURIComponent(ORG)}`, {
       headers: { "x-agent-capability": await capFor("admin-alice", { aud: null }) },
@@ -374,7 +426,7 @@ test("an aud-less token never opens the admin door", async () => {
 });
 
 test("grant management refuses agent tokens outright — promote/revoke stays in the portal", async () => {
-  const s = start();
+  const s = await start();
   try {
     const cap = await capFor("admin-alice");
     const promote = await fetch(`${s.base}/v1/admin/grants`, {
@@ -398,8 +450,68 @@ test("grant management refuses agent tokens outright — promote/revoke stays in
   }
 });
 
+test("admin walls hold for every spelling of a path, and encoded params still route", async () => {
+  const s = await start();
+  try {
+    const live = await capFor("admin-alice");
+    const unattended = await capFor("admin-alice", { live: false });
+    for (const [path, status] of [
+      ["/v1/admin/grants", 403],
+      ["/v1/%61dmin/grants", 404],
+      ["/v1/admin/gr%61nts", 404],
+    ] as const) {
+      const promote = await fetch(`${s.base}${path}`, {
+        method: "POST",
+        headers: { "x-agent-capability": live, "content-type": "application/json" },
+        body: JSON.stringify({ principalId: "U9", role: "org_admin", scopeId: ORG }),
+      });
+      assert.equal(promote.status, status, `promote via ${path}`);
+    }
+    for (const [path, status] of [
+      ["/v1/admin/grants/admin-bob", 403],
+      ["/v1/%61dmin/grants/admin-bob", 404],
+    ] as const) {
+      const revoke = await fetch(`${s.base}${path}?scope=${encodeURIComponent(ORG)}&role=org_admin`, {
+        method: "DELETE",
+        headers: { "x-agent-capability": unattended },
+      });
+      assert.equal(revoke.status, status, `unattended revoke via ${path}`);
+    }
+    const whoami = async (who: string) =>
+      (
+        (await (
+          await fetch(`${s.base}/v1/admin/whoami`, { headers: { "x-agent-capability": await capFor(who) } })
+        ).json()) as any
+      ).isAdmin;
+    assert.equal(await whoami("U9"), false);
+    assert.equal(await whoami("admin-bob"), true);
+
+    const scope = await fetch(`${s.base}/v1/admin/scopes/${encodeURIComponent(ORG)}`, {
+      headers: { "x-agent-capability": live },
+    });
+    assert.equal(scope.status, 200);
+  } finally {
+    await s.close();
+  }
+});
+
+test("MCP server registration refuses agent tokens — the agent cannot change which calls need approval", async () => {
+  const s = await start();
+  try {
+    const res = await fetch(`${s.base}/v1/admin/mcp-servers/crm`, {
+      method: "PUT",
+      headers: { "x-agent-capability": await capFor("admin-alice"), "content-type": "application/json" },
+      body: JSON.stringify({ url: "https://tools.example.com/mcp", approval: "none", validate: false }),
+    });
+    assert.equal(res.status, 403);
+    assert.match(((await res.json()) as any).message, /portal-only/);
+  } finally {
+    await s.close();
+  }
+});
+
 test("impersonation refuses agent tokens outright — acting as another user stays in the portal", async () => {
-  const s = start();
+  const s = await start();
   try {
     const cap = await capFor("admin-alice");
     const start1 = await fetch(`${s.base}/v1/admin/impersonate`, {
@@ -422,7 +534,7 @@ test("impersonation refuses agent tokens outright — acting as another user sta
 });
 
 test("content reads need a DM-scoped token", async () => {
-  const s = start();
+  const s = await start();
   try {
     const fromChannel = await capFor("admin-alice", { scope: scopeId("channel", "C1") });
 
@@ -505,7 +617,7 @@ test("content reads need a DM-scoped token", async () => {
 });
 
 test("revoking the admin grant cuts off an already-minted token immediately", async () => {
-  const s = start();
+  const s = await start();
   try {
     const cap = await capFor("admin-alice");
     const before = await fetch(`${s.base}/v1/admin/whoami`, { headers: { "x-agent-capability": cap } });
@@ -528,7 +640,7 @@ test("revoking the admin grant cuts off an already-minted token immediately", as
 
 for (const liveAuthor of [false, true]) {
   test(`thread author admin access (${liveAuthor}) preserves all other authorization gates`, async () => {
-    const s = start();
+    const s = await start();
     try {
       const cap = await capFor("admin-alice", { live: false, liveAuthor, scope: "channel:C1" });
       const headers = { "x-agent-capability": cap, "content-type": "application/json" };
@@ -585,21 +697,21 @@ for (const liveAuthor of [false, true]) {
 }
 
 for (const [name, input, expected] of [
-  ["human thread reply", { unprompted: true, liveActor: true }, 200],
-  ["synthetic ambient wake", { unprompted: true }, 403],
-  ["bot thread reply", { unprompted: true, botActor: true }, 403],
-  ["cron", { triggered: true, surface: "cron", liveActor: true }, 403],
-  ["webhook", { triggered: true, surface: "webhook", liveActor: true }, 403],
+  ["human thread reply", { origin: { kind: "ambient", live: true } }, 200],
+  ["synthetic ambient wake", { origin: { kind: "ambient" } }, 403],
+  ["bot thread reply", { origin: { kind: "ambient" }, botActor: true }, 403],
+  ["cron", { origin: { kind: "automation" }, surface: "cron" }, 403],
+  ["webhook", { origin: { kind: "automation" }, surface: "webhook" }, 403],
 ] satisfies Array<[string, Partial<TurnRequest>, number]>) {
   test(`orchestrator-issued ${name} token reaches the HTTP admin gate with the right authority`, async () => {
-    const s = start();
+    const s = await start();
     try {
       await selectDefaultSandbox(s.built, "admin-alice", "channel:C1");
       let cap: string | undefined;
       const provision = s.built.sandbox.provision.bind(s.built.sandbox);
-      s.built.sandbox.provision = (layers, opts) => {
+      s.built.sandbox.provision = (owner, opts) => {
         cap = opts?.env?.AGENT_API_TOKEN;
-        return provision(layers, opts);
+        return provision(owner, opts);
       };
       const admin = { externalId: "admin-alice" };
       const result = await s.built.app.turn({
@@ -631,7 +743,7 @@ for (const [name, input, expected] of [
 
 for (const room of [scopeId("channel", "C1"), scopeId("group", "G1")]) {
   test(`Open admin reads and writes from ${room} preserve live authorization and posture vetoes`, async () => {
-    const s = start();
+    const s = await start();
     try {
       await s.built.directory.replaceGroups([
         { groupId: "G1", principalId: "admin-alice" },
@@ -734,7 +846,7 @@ for (const room of [scopeId("channel", "C1"), scopeId("group", "G1")]) {
 }
 
 test("shared admin reads fail closed without a sharing config resolver", async () => {
-  const s = start(false);
+  const s = await start(false);
   try {
     await s.built.config.setSharingPosture(ORG, "open");
     const cap = await capFor("admin-alice", { scope: scopeId("channel", "C1") });
@@ -747,7 +859,7 @@ test("shared admin reads fail closed without a sharing config resolver", async (
 
 for (const room of [scopeId("personal", "admin-alice"), scopeId("channel", "C1"), scopeId("group", "G1")]) {
   test(`retired bulk import is equally unsupported from ${room}`, async () => {
-    const s = start();
+    const s = await start();
     try {
       await s.built.directory.replaceGroups([
         { groupId: "G1", principalId: "admin-alice" },
@@ -772,7 +884,7 @@ for (const room of [scopeId("personal", "admin-alice"), scopeId("channel", "C1")
 }
 
 test("shared-channel admin runtime mutations do not return a private cron prompt", async () => {
-  const s = start();
+  const s = await start();
   try {
     await s.built.config.setSharingPosture("channel:C1", "isolated");
     const cron = await s.built.app.createCron({
@@ -813,7 +925,7 @@ test("shared-channel admin runtime mutations do not return a private cron prompt
 });
 
 test("native admin tools use the authenticated handler, including its live authority, audience and audit checks", async () => {
-  const s = start();
+  const s = await start();
   const target = scopeId("personal", "U1");
   try {
     const call = createAdminCall(s.base, await capFor("admin-alice"));

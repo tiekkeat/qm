@@ -2,9 +2,11 @@
 
 Pi can route model calls through an authenticated gateway instead of holding provider keys. Set `MODEL_GATEWAY_URL`, `MODEL_GATEWAY_API_KEY`, and `MODEL_GATEWAY_API_KEY_HEADER`. The key stays server-side. No model list is required.
 
+Gateway requests also say which work they serve, so the gateway can attribute spend: `x-qm-session-id` (the session the call works for, including helper calls), `x-qm-actor` (a keyed hash of the principal the work is for, the one QM's budget charges), `x-qm-scope` (the scope the work runs in, with a personal scope's person replaced by the same hash), `x-qm-origin` (`conversation`, `cron`, `webhook`, `monitor`, `loop` or `swarm`, inherited by subagents from their parent session) and `x-qm-purpose` (`turn`, `detect`, `compaction`, `title`, `judge`, `ambient_judge`, `approval_summary`, `security_screen`, `ack_emoji`, `memory_capture`, `memory_classification`, `embedding`, `decision`, `browser`, `probe` or `sandbox`). A value is sent only when it is known and is 1 to 256 printable ASCII characters without spaces. Requests sent directly to a provider with a user's or the organization's own key never carry them, and neither does model discovery. Pi's own `x-session-affinity` cache hint is no substitute: helper calls give it a throwaway session id, and calls made outside a Pi agent session, such as compaction, embeddings and decisions, never send it. The hash is the same one sandbox code's requests carry as their end user: the first 32 hex characters of an HMAC-SHA256 of the principal id, keyed with `CAPABILITY_SECRET` (or `CORE_SIGNING_SECRET` when that is unset), so one person has one value on every path and the gateway never receives an identity. Without either secret, neither the actor nor a personal scope is sent. To find who a hash belongs to, an org admin reads the roster (`GET /v1/admin/users`, the admin Users page's data): each person carries `gatewayActor`, the hash the gateway receives for them. Channel, group and project scope ids are sent as they are, so a gateway must not forward client `x-` headers upstream. `MODEL_GATEWAY_API_KEY_HEADER` cannot be any of these header names, in any letter case.
+
 QM discovers models using authenticated `GET /v1/models` and `GET /model_group/info`, the end-user metadata endpoint implemented by LiteLLM. A base URL ending in `/v1` is supported; both endpoints retain any preceding path prefix. Discovery uses the same key as inference, rejects redirects, and ignores upstream credential and endpoint fields.
 
-Only models listed by both endpoints, marked as chat models with tool support, and carrying valid context, output and pricing metadata are offered. Discovered IDs are namespaced as `gateway/<upstream-id>`. Groups whose metadata identifies only Anthropic providers use native Messages, preserving signed thinking blocks across tool calls. Groups whose providers are exclusively OpenAI or Azure use Responses, including native file inputs. Other groups use OpenAI-compatible streaming chat completions. Reasoning controls are enabled for native Anthropic and OpenAI/Azure groups; other provider combinations use standard chat without requesting reasoning effort. They are available in Pi, not process harnesses. The gateway owns provider translation and group capabilities. QM selects the protocol from provider metadata, never model names. Gateways must expose `/v1/messages` for Anthropic groups and `/v1/responses` for OpenAI/Azure groups. PDF inputs on chat-completion routes require vision capability and a provider set consisting only of Anthropic, OpenAI, Azure, Gemini or Vertex. Unknown or mixed unsupported provider groups use bounded text extraction.
+Only models listed by both endpoints, marked as chat models with tool support, and carrying valid context, output and pricing metadata are offered. Discovered IDs are namespaced as `gateway/<upstream-id>`. Groups whose metadata identifies only Anthropic providers use native Messages, preserving signed thinking blocks across tool calls. Groups whose providers are exclusively OpenAI or Azure use Responses, including native file inputs. Other groups use OpenAI-compatible streaming chat completions. Reasoning controls are enabled for native Anthropic and OpenAI/Azure groups; other provider combinations use standard chat without requesting reasoning effort. The gateway owns provider translation and group capabilities. QM selects the protocol from provider metadata, never model names. Gateways must expose `/v1/messages` for Anthropic groups and `/v1/responses` for OpenAI/Azure groups. PDF inputs on chat-completion routes require vision capability and a provider set consisting only of Anthropic, OpenAI, Azure, Gemini or Vertex. Unknown or mixed unsupported provider groups use bounded text extraction.
 
 Availability refreshes on demand every five minutes and before inference when expired. Successful refreshes replace the catalog, including an empty catalog. After discovery has succeeded, a failed refresh disables gateway routes until recovery without interrupting independent direct providers, with retries after thirty seconds. In-flight requests are not cancelled; the gateway still enforces its key permissions on every call. Retired selections remain in conversation history but cannot issue a new request through a different provider.
 
@@ -48,14 +50,44 @@ The managed browse runner needs browser-use 0.12.9 with
 `ChatOpenAI.default_headers` support. It never requests separate browser model
 credentials or falls back to them on account or gateway errors.
 
+## Sandbox code
+
+When a gateway is configured, code the agent runs in its sandbox reaches the gateway through core instead of
+holding a provider key. Internal turns outside strict posture get `MODEL_GATEWAY_URL`, which points at core's
+`/v1/sandbox-model` prefix, and `MODEL_GATEWAY_TOKEN`, a capability token bound to the turn's actor and
+conversation scope that expires with the turn's other sandbox tokens. The agent is told both are set. Scheduled and
+other unattended turns get them too, without a grant: the token authorizes gateway inference and nothing else.
+Strict posture issues neither. The gateway key never enters the sandbox.
+
+Core forwards any JSON request under the prefix to the same path on the gateway, so `$MODEL_GATEWAY_URL/v1/...`
+behaves as an OpenAI-compatible base URL. It accepts the token as `Authorization: Bearer`, `x-api-key`, or
+`x-agent-capability`, only on these routes, and passes on `accept`, `content-type`, `anthropic-version` and
+`anthropic-beta`. `GET /v1/models` lists the models the gateway offers by the same IDs the model picker uses.
+A body naming a `model` must use one of those IDs; core rewrites it to the gateway's upstream ID. Every JSON object
+body gets its end user (`user`, or `metadata.user_id` for `/v1/messages`) replaced with a keyed hash of the actor,
+so the gateway can attribute spend without receiving identities and the client cannot name someone else. Requests also
+carry the request context headers above with purpose `sandbox`, and `x-qm-actor` is that same hash. Core adds the gateway key and streams the response back; a client disconnect
+cancels the upstream call. Strict posture and an exhausted per-actor QM budget refuse requests; the budget is
+checked but not charged, since the gateway meters spend. Upstream 401, 403 and 5xx responses are reported as 502;
+other errors keep their status and `retry-after`, with the gateway key redacted.
+
+The gateway key's permissions are the only control over which endpoints and models sandbox code can reach, since
+every path under the prefix is forwarded with that key. Give the gateway a key scoped to inference on the offered
+models, never a master or admin key, and keep client-side credentials and endpoint overrides disabled on it
+(LiteLLM's default). Without a gateway, neither variable is set and sandbox code needs its own credential.
+
 ## Ultrafast
 
 Pi offers `gpt-6-astra-ultrafast` and `gpt-6.1-sol-ultrafast`, each labeled
 **Ultrafast (6× cost)**. These are QM selection identifiers: requests use the
 corresponding base model (`gpt-6-astra` or `gpt-6.1-sol`) with
-`service_tier: "ultrafast"` through the Responses API. Standard models and their
-Fast switches retain their existing behavior. Ultrafast has its own pricing card,
-including cached input, cache writes, and long-context rates.
+`service_tier: "ultrafast"` through the Responses API. Ultrafast has its own pricing
+card, including cached input, cache writes, and long-context rates. OpenAI bills each
+call at the tier its response's `service_tier` reports, which can be lower than the
+one requested, and QM prices calls the same way with pi-ai's tier rates (flex ½×,
+priority and fast 2×). An Ultrafast request served at another tier is priced from the
+base model's card at that tier, and a Fast request whose response reports no tier is
+priced at the Fast rate.
 
 Use an OpenAI API key or explicitly map the Ultrafast model ID to your gateway's
 corresponding base-model group in `MODEL_GATEWAY_MODELS`. The gateway must support Responses and

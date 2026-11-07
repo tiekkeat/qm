@@ -1,4 +1,4 @@
-export { isBoundaryRefusal, refusalDelivery, postThenAckRunDelivery, refusalNote } from "./refusals.ts";
+export { refusalDelivery, postThenAckRunDelivery, refusalNote } from "./refusals.ts";
 export { inlineCode, clip, sleep } from "./util.ts";
 export { safeChunks } from "./safe-cut.ts";
 export {
@@ -11,6 +11,8 @@ export {
   setMentionIndex,
   isReservedMentionName,
   slackSectionBlocks,
+  plainContext,
+  blocksWithContext,
 } from "./mrkdwn.ts";
 export {
   type ActorAssertion,
@@ -47,9 +49,6 @@ export {
   dedupeKey,
   createDeduper,
   dedupedRun,
-  isBareStop,
-  createInFlightThreadMap,
-  maybeInterceptStop,
 } from "./message-gating.ts";
 export {
   type SlackFile,
@@ -70,6 +69,8 @@ export {
   APPROVAL_ACTION_IDS,
   approvalCardDestination,
   approvalMessage,
+  approvalDecisionMessage,
+  type ApprovalDecisionRecord,
   type StoredApproval,
   recoveredApprovalContext,
   createApprovalRegistry,
@@ -97,7 +98,6 @@ export {
   buildContextWindow,
   type RecentMessage,
   MAX_RECENT_MESSAGES,
-  MAX_TOP_LEVEL_CONTEXT_AGE_S,
   recentWindow,
   resolveMentions,
   type ConversationView,
@@ -141,7 +141,6 @@ export {
 export {
   DEFAULT_ACK_REACTIONS,
   CURATED_ACK_EMOJI,
-  stripAckPrefix,
   createAckPresenter,
   renderGoalNotice,
   type GoalNoticeView,

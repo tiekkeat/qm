@@ -83,20 +83,22 @@ function memoryDisclosurePolicy(input: MemoryDisclosure) {
         return false;
       }
     },
-    async allows(home: ScopeId, record: MemoryProvenance): Promise<boolean> {
-      try {
+    allows(home: ScopeId, record: MemoryProvenance): Promise<boolean> {
+      const { sensitivity, sourceUnknown, sources } = record;
+      return once(`allows:${home}:${JSON.stringify([sensitivity, sourceUnknown, sources])}`, async () => {
         const homeAllowed = async () => (await narrow(home)) || (await sourceAllowed(home, "unknown"));
-        if ((record.sourceUnknown || record.sensitivity === "unknown") && !(await homeAllowed())) return false;
-        if (!record.sources.length) return record.sourceUnknown && (await homeAllowed());
-        return (await Promise.all(record.sources.map((source) => sourceAllowed(source, record.sensitivity)))).every(
-          Boolean,
-        );
-      } catch (e) {
-        swallow("memory disclosure: allows", e);
-        return false;
-      }
+        if ((sourceUnknown || sensitivity === "unknown") && !(await homeAllowed())) return false;
+        if (!sources.length) return sourceUnknown && (await homeAllowed());
+        return (await Promise.all(sources.map((source) => sourceAllowed(source, sensitivity)))).every(Boolean);
+      });
     },
   };
+}
+
+export class MemoryRecallWithheld extends Error {
+  constructor(scope: ScopeId) {
+    super(`memory for ${scope} is withheld from this conversation`);
+  }
 }
 
 export class MemoryDisclosureDenied extends Error {
@@ -113,11 +115,19 @@ export function disclosedMemory(memory: MemoryService, access: MemoryDisclosure)
   const listed = memory.facts?.bind(memory);
   if (!listed) {
     const narrow = (scope: ScopeId) => memoryDisclosurePolicy(access).narrow(scope);
+    const withheld = async (scope: ScopeId) => {
+      if (!(await narrow(scope))) throw new MemoryRecallWithheld(scope);
+    };
     return {
       ...memory,
-      recall: async (scope, context) => ((await narrow(scope)) ? memory.recall(scope, context) : []),
-      query: async (scope, query, limit, context) =>
-        (await narrow(scope)) ? memory.query(scope, query, limit, context) : [],
+      recall: async (scope, context) => {
+        await withheld(scope);
+        return memory.recall(scope, context);
+      },
+      query: async (scope, query, limit, context) => {
+        await withheld(scope);
+        return memory.query(scope, query, limit, context);
+      },
       read: async (scope) => ((await narrow(scope)) ? memory.read(scope) : ""),
     };
   }

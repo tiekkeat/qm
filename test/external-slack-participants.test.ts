@@ -5,12 +5,12 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { createInsecureTestServer } from "../src/api/server.ts";
-import { createMemoryConfigStore, type PersistedScopedFlag } from "../src/resolution/config-store.ts";
-import { createMemoryMap } from "../src/persistence/durable-map.ts";
+import { type PersistedScopedFlag } from "../src/resolution/config-store.ts";
 import { scopeId, type TurnRequest } from "../src/types.ts";
 import { testConfig } from "./support/test-config.ts";
+import { testConfigStore, testMap } from "./support/test-database.ts";
 
 const org = scopeId("org", "default-org");
 const internalActor = { externalId: "U1" };
@@ -29,21 +29,21 @@ function freshApp() {
   return buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "esp-")) }));
 }
 
-test("external-slack-participants: default off; the org flip is what turns it on", () => {
-  const c = createMemoryConfigStore("default-org");
+test("external-slack-participants: default off; the org flip is what turns it on", async () => {
+  const c = testConfigStore("default-org");
   assert.equal(c.getExternalSlackParticipants(org), false);
-  c.setExternalSlackParticipants(org, true);
+  await c.setExternalSlackParticipants(org, true);
   assert.equal(c.getExternalSlackParticipants(org), true);
-  c.setExternalSlackParticipants(org, false);
+  await c.setExternalSlackParticipants(org, false);
   assert.equal(c.getExternalSlackParticipants(org), false);
 });
 
 test("external-slack-participants: the durable read sees a flip from another instance without a restart", async () => {
-  const store = createMemoryMap<PersistedScopedFlag>();
-  const a = createMemoryConfigStore("default-org", { externalSlackParticipants: store });
-  const b = createMemoryConfigStore("default-org", { externalSlackParticipants: store });
+  const store = testMap<PersistedScopedFlag>();
+  const a = testConfigStore("default-org", { externalSlackParticipants: store });
+  const b = testConfigStore("default-org", { externalSlackParticipants: store });
 
-  a.setExternalSlackParticipants(org, true);
+  await a.setExternalSlackParticipants(org, true);
   await Promise.resolve();
 
   assert.equal(b.getExternalSlackParticipants(org), false, "the sibling's stale read-cache hasn't seen the flip");
@@ -59,7 +59,7 @@ test("a Slack channel turn with an external in the audience is refused while the
 
 test("with the toggle on, an internal actor may drive a Slack turn in a room with an external", async () => {
   const built = freshApp();
-  built.config.setExternalSlackParticipants(org, true);
+  await built.config.setExternalSlackParticipants(org, true);
   await Promise.resolve();
   const res = await built.app.turn(externalChannelTurn("slack"));
   assert.equal(res.status, "ok");
@@ -68,7 +68,7 @@ test("with the toggle on, an internal actor may drive a Slack turn in a room wit
 
 test("the toggle relaxes only Slack: a non-Slack surface with an external audience stays refused", async () => {
   const built = freshApp();
-  built.config.setExternalSlackParticipants(org, true);
+  await built.config.setExternalSlackParticipants(org, true);
   await Promise.resolve();
   const res = await built.app.turn(externalChannelTurn("test"));
   assert.equal(res.status, "refused");
@@ -77,7 +77,7 @@ test("the toggle relaxes only Slack: a non-Slack surface with an external audien
 
 test("the toggle never lets an external actor interact", async () => {
   const built = freshApp();
-  built.config.setExternalSlackParticipants(org, true);
+  await built.config.setExternalSlackParticipants(org, true);
   await Promise.resolve();
   const res = await built.app.turn({
     surface: "slack",

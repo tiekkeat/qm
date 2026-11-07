@@ -1,5 +1,5 @@
 import type { Keychain } from "../credentials/keychain.ts";
-import { keychainCodexAuthStore, type CodexAuthStore } from "../harness/codex-auth-store.ts";
+import { keychainCodexAuthStore, type CodexAuthStore } from "../agent/codex-auth-store.ts";
 import { accessExpiresAt, authTokens, loadCodexAuthFile } from "./chatgpt-auth-file.ts";
 import type { UserOAuthTokens } from "./user-model-credential-store.ts";
 

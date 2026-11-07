@@ -8,12 +8,13 @@ import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { createServer } from "../src/api/server.ts";
 import { signRequest } from "../src/auth/source-auth.ts";
-import { buildApp } from "../src/wiring.ts";
-import { agentApiMatches } from "../src/api/agent-api-catalog.ts";
+import { buildApp } from "./support/build-app.ts";
 import { mintCapabilityToken, CAPABILITY_TTL_MS } from "../src/auth/capability-token.ts";
 import { scopeId } from "../src/types.ts";
 import { testConfig } from "./support/test-config.ts";
 import { DeploymentLayerPersistedError } from "../src/deployment/deployment-layer-store.ts";
+import { createPostgresReplayDedupe } from "../src/auth/replay-dedupe.ts";
+import { testDatabaseUrl } from "./support/test-database.ts";
 
 const SECRET = "layer-routes-secret".repeat(3);
 const PATH = "/v1/deployment-layer";
@@ -21,6 +22,7 @@ const PATH = "/v1/deployment-layer";
 function start(overrides: { deploymentLayerDir?: string } = {}, serverDeps: Record<string, unknown> = {}) {
   const built = buildApp(testConfig({ signingSecret: SECRET, ...overrides }));
   const server = createServer(built.app, {
+    replayDedupe: createPostgresReplayDedupe(testDatabaseUrl()),
     signingSecret: SECRET,
     deploymentLayer: built.deploymentLayerStore,
     auditLog: built.auditLog,
@@ -122,7 +124,7 @@ test("a correctly signed PUT replaces the layer and a signed GET reads it back",
     };
     assert.equal(putBody.ok, true);
     assert.equal(putBody.version, 1);
-    assert.equal(putBody.durable, false, "a memory-backed core reports the PUT as non-durable");
+    assert.equal(putBody.durable, true, "a Postgres-backed core reports the PUT as durable");
     assert.deepEqual(putBody.resolved.advertisedTools, ["acme CLI"]);
 
     const get = await fetch(`${srv.base}${PATH}`, { headers: signed("GET", "") });
@@ -348,9 +350,6 @@ test("a skill collision racing after validation is accepted degraded and audited
 });
 
 test("a VALID capability token is rejected on the deployment-layer routes (source-auth only)", async () => {
-  assert.equal(agentApiMatches("GET", PATH), false);
-  assert.equal(agentApiMatches("PUT", PATH), false);
-
   const srv = start();
   try {
     const cap = await mintCapabilityToken(

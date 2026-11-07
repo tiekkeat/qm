@@ -1,13 +1,17 @@
 import { LRUCache } from "lru-cache";
-import { personalScope, type LoopItem } from "../types.ts";
+import { personalScope } from "../types.ts";
+import type { LoopItem } from "./types.ts";
 import type { FeatureFlagStore } from "../feature-flags.ts";
 import type { ErrorLog } from "../admin/error-log.ts";
-import { redactSecrets } from "../harness/redact-secrets.ts";
+import { redactSecrets } from "../../plugins/chassis/src/redact-secrets.ts";
 import { errMessage } from "../util/errors.ts";
 import type { LoopItemLedger } from "./item-ledger.ts";
+import { conversationEvent, type IngressEntry } from "./ingress.ts";
 import { isResolved } from "./ledger-view.ts";
 import { isObj, tokenFor, type ConnectorTokenSource } from "./sources/adapter.ts";
 import { normalizeSlackApiUrl } from "../slack/config.ts";
+import { slackMessageContent } from "../slack/message-content.ts";
+import { GmailApiError, gmailApi } from "../connectors/gmail-api.ts";
 import type { DirectoryStore } from "../directory/directory-store.ts";
 
 interface RefreshDeps {
@@ -16,6 +20,7 @@ interface RefreshDeps {
   directory: Pick<DirectoryStore, "getBySlackId">;
   featureFlags: Pick<FeatureFlagStore, "enabled">;
   errors?: ErrorLog;
+  enqueue: (loop: { id: string; owner: string }, entries: IngressEntry[]) => Promise<unknown>;
   fetchImpl?: typeof fetch;
   slackApiUrl?: string;
   now?: () => number;
@@ -61,26 +66,33 @@ export function createInboxSourceRefresh(deps: RefreshDeps): InboxSourceRefresh 
     const method = path.split("?")[0]!;
     const key = `${owner}:${source}:${source === "slack" ? method : "read"}`;
     if (limited.has(key)) throw new Error("Source rate limited. The next refresh will retry.");
-    const base = source === "slack" ? slackBase : "https://gmail.googleapis.com/gmail/v1/users/me/";
-    const res = await fetchImpl(`${base}${path}`, {
-      headers: { authorization: `Bearer ${token}` },
-      signal: AbortSignal.timeout(Math.max(1, Math.min(3000, deadline - now()))),
-    });
-    if (res.status === 429) {
-      const retry = Number(res.headers.get("retry-after"));
+    const timeoutMs = Math.max(1, Math.min(3000, deadline - now()));
+    const rateLimit = (retry: number) =>
       limited.set(key, true, { ttl: Math.max(60, Number.isFinite(retry) ? retry : 60) * 1000 });
+    const failure = (cause: Error) =>
+      new Error("Couldn't refresh the source. Your item has not been dismissed.", { cause });
+    if (source === "gmail") {
+      try {
+        return await gmailApi(token, fetchImpl)<Record<string, unknown>>(path, { timeoutMs });
+      } catch (error) {
+        if (!(error instanceof GmailApiError)) throw error;
+        if (error.status === 429) rateLimit(error.retryAfterSeconds);
+        throw failure(error);
+      }
     }
-    if (!res.ok)
-      throw new Error("Couldn't refresh the source. Your item has not been dismissed.", {
-        cause: new Error(`${source} ${method}: HTTP ${res.status}`),
-      });
+    const res = await fetchImpl(`${slackBase}${path}`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (res.status === 429) rateLimit(Number(res.headers.get("retry-after")));
+    if (!res.ok) throw failure(new Error(`${source} ${method}: HTTP ${res.status}`));
     const body: unknown = await res.json();
     if (!isObj(body) || body.ok === false)
-      throw new Error("Couldn't refresh the source. Your item has not been dismissed.", {
-        cause: new Error(
+      throw failure(
+        new Error(
           `${source} ${method}: ${isObj(body) && typeof body.error === "string" ? body.error : "Invalid response"}`,
         ),
-      });
+      );
     return body;
   }
 
@@ -155,7 +167,7 @@ export function createInboxSourceRefresh(deps: RefreshDeps): InboxSourceRefresh 
   }
 
   async function refreshAvatars(owner: string, item: LoopItem): Promise<void> {
-    if ((item.source ?? item.sourcePayload?.source) !== "slack") return;
+    if (item.source !== "slack") return;
     const payload = item.sourcePayload ?? {};
     if (typeof payload.slackAvatarsRefreshAt === "number" && now() < payload.slackAvatarsRefreshAt) return;
     const meta = isObj(payload.slack) ? payload.slack : {};
@@ -176,8 +188,13 @@ export function createInboxSourceRefresh(deps: RefreshDeps): InboxSourceRefresh 
     );
   }
 
+  async function ownerReplied(owner: string, item: LoopItem, at: number, text: string): Promise<void> {
+    if (!Number.isFinite(at) || at <= (item.sourceAt ?? 0)) return;
+    await deps.enqueue({ id: item.loopId, owner }, [conversationEvent(item, { author: "owner", at, text })]);
+  }
+
   async function refresh(owner: string, item: LoopItem): Promise<void> {
-    const source = item.source ?? item.sourcePayload?.source;
+    const source = item.source;
     if (source !== "gmail" && source !== "slack") return;
     if (source === "gmail" && isResolved(item)) return;
     const payload = item.sourcePayload ?? {};
@@ -193,12 +210,12 @@ export function createInboxSourceRefresh(deps: RefreshDeps): InboxSourceRefresh 
         .sort((a, b) => Number(a.internalDate) - Number(b.internalDate))
         .at(-1);
       if (latest && Array.isArray(latest.labelIds) && latest.labelIds.includes("SENT")) {
-        await deps.items.recordAction(item.id, {
-          kind: "replied",
-          outcome: "dismissed",
-          sourceAt: Number(latest.internalDate),
-          ...(typeof latest.snippet === "string" ? { result: latest.snippet.slice(0, 500) } : {}),
-        });
+        await ownerReplied(
+          owner,
+          item,
+          Number(latest.internalDate),
+          typeof latest.snippet === "string" ? latest.snippet : "",
+        );
       }
       if (payload.sourceRefreshError)
         await deps.items.annotate(item.id, { sourceRefreshError: null }, { expectedSourceAt: item.sourceAt });
@@ -258,7 +275,7 @@ export function createInboxSourceRefresh(deps: RefreshDeps): InboxSourceRefresh 
         author: person?.name ?? String(m.user ?? m.username ?? "Slack"),
         ...(person ? { authorId: person.id } : {}),
         ...(person?.avatarUrl ? { avatarUrl: person.avatarUrl } : {}),
-        text: typeof m.text === "string" ? m.text : "",
+        text: slackMessageContent(m).text,
         at: Math.round(Number(m.ts) * 1000),
         ts: m.ts,
         ...(root && m.ts !== root ? { reply: true } : {}),
@@ -304,12 +321,12 @@ export function createInboxSourceRefresh(deps: RefreshDeps): InboxSourceRefresh 
     if ((!root || !partial) && latest && !isResolved(item)) {
       const identity = await slackInfo(owner, "auth.test", token);
       if (typeof identity.user_id === "string" && latest.user === identity.user_id) {
-        await deps.items.recordAction(item.id, {
-          kind: "replied",
-          outcome: "dismissed",
-          sourceAt: Math.round(Number(latest.ts) * 1000),
-          result: typeof latest.text === "string" ? latest.text.slice(0, 500) : "",
-        });
+        await ownerReplied(
+          owner,
+          item,
+          Math.round(Number(latest.ts) * 1000),
+          typeof latest.text === "string" ? latest.text : "",
+        );
       }
     }
   }

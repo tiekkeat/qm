@@ -22,6 +22,7 @@ const API_RESOURCES = new Set([
   "keychain",
   "loops",
   "memory",
+  "personas",
   "playgrounds",
   "projects",
   "resources",
@@ -32,8 +33,8 @@ const API_RESOURCES = new Set([
   "sessions",
   "skills",
   "slack-installation",
+  "spend",
   "suggested-activities",
-  "surface-config",
   "turn",
   "ui-state",
   "user-model-auth",
@@ -82,6 +83,31 @@ export function reportRequestTiming(url: string, method: string, startMs: number
   timing("http.client", `${/^[A-Z]{3,7}$/.test(method) ? method : "GET"} ${apiRouteName(target.pathname)}`, startMs, {
     status: status === null ? "internal_error" : traceStatus(status),
     data: { url: target.href, http_status: status === null ? "network" : String(status) },
+  });
+}
+
+export function reportSessionSwitch(
+  startMs: number,
+  result: {
+    fetchedMs: number;
+    endMs: number;
+    loaded: boolean;
+    prefetched: boolean;
+    cached: boolean;
+    tracked: boolean;
+    items: number;
+  },
+): void {
+  timing("ui.action", "session_switch", startMs, {
+    status: result.loaded ? "ok" : "internal_error",
+    endMs: result.endMs,
+    data: {
+      prefetched: String(result.prefetched),
+      cached: String(result.cached),
+      tracked: String(result.tracked),
+      items: String(result.items),
+    },
+    measurements: { fetch: result.fetchedMs - startMs, render: result.endMs - result.fetchedMs },
   });
 }
 

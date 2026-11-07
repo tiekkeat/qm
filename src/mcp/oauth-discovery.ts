@@ -1,12 +1,15 @@
+import { buildDiscoveryUrls, registerClient } from "@modelcontextprotocol/sdk/client/auth.js";
+import { OAuthMetadataSchema, type OAuthMetadata } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { errMessage } from "../util/errors.ts";
+import { publicFetch, type AddressFetch } from "../util/network.ts";
+
+const OAUTH_REQUEST_TIMEOUT_MS = 5_000;
 
 export function httpsUrl(v: unknown): string | undefined {
   if (typeof v !== "string") return undefined;
   try {
     const u = new URL(v.trim());
-    return u.protocol === "https:" || ["localhost", "127.0.0.1", "[::1]"].includes(u.hostname)
-      ? u.toString()
-      : undefined;
+    return u.protocol === "https:" ? u.toString() : undefined;
   } catch {
     return undefined;
   }
@@ -23,13 +26,18 @@ export interface DiscoveredOAuth {
   authorize?: string;
   token?: string;
   scopes?: string[];
+  registrable?: OAuthMetadata;
   errors: string[];
 }
 
-async function fetchMeta(url: string, errors: string[]): Promise<Record<string, unknown> | undefined> {
+async function fetchMeta(
+  fetchFn: AddressFetch,
+  url: string,
+  errors: string[],
+): Promise<Record<string, unknown> | undefined> {
   let r: Response;
   try {
-    r = await fetch(url, { redirect: "error", signal: AbortSignal.timeout(5_000) });
+    r = await fetchFn(url, { redirect: "error", signal: AbortSignal.timeout(OAUTH_REQUEST_TIMEOUT_MS) });
   } catch (e) {
     errors.push(`${url}: ${errMessage(e)}`);
     return undefined;
@@ -49,31 +57,49 @@ function wellKnown(base: URL, suffix: string): string[] {
   return [...new Set([`${base.origin}/.well-known/${suffix}${path}`, `${base.origin}/.well-known/${suffix}`])];
 }
 
-export async function discoverOAuth(resource: URL): Promise<DiscoveredOAuth> {
+export async function discoverOAuth(resource: URL, fetchFn: AddressFetch = publicFetch): Promise<DiscoveredOAuth> {
   const errors: string[] = [];
   for (const url of wellKnown(resource, "oauth-protected-resource")) {
-    const meta = await fetchMeta(url, errors);
+    const meta = await fetchMeta(fetchFn, url, errors);
     const issuer = Array.isArray(meta?.authorization_servers) ? httpsUrl(meta.authorization_servers[0]) : undefined;
     if (!issuer) {
       if (meta) errors.push(`${url}: no HTTPS authorization_servers entry`);
       continue;
     }
     const scopes = parseScopes(meta?.scopes_supported);
-    const base = new URL(issuer);
-    const path = base.pathname.replace(/\/+$/, "");
-    for (const candidate of [
-      `${base.origin}/.well-known/oauth-authorization-server${path}`,
-      `${base.origin}/.well-known/openid-configuration${path}`,
-      ...(path ? [`${base.origin}${path}/.well-known/openid-configuration`] : []),
-    ]) {
-      const server = await fetchMeta(candidate, errors);
+    for (const { url } of buildDiscoveryUrls(issuer)) {
+      const candidate = url.href;
+      const server = await fetchMeta(fetchFn, candidate, errors);
       if (!server) continue;
       const authorize = httpsUrl(server.authorization_endpoint);
       const token = httpsUrl(server.token_endpoint);
       if (!authorize || !token) errors.push(`${candidate}: missing or non-HTTPS authorization/token endpoint`);
-      return { authorize, token, scopes, errors };
+      const registrable = httpsUrl(server.registration_endpoint)
+        ? OAuthMetadataSchema.safeParse(server).data
+        : undefined;
+      return { authorize, token, scopes, ...(registrable ? { registrable } : {}), errors };
     }
     return { scopes, errors };
   }
   return { errors };
+}
+
+export async function registerPublicClient(
+  metadata: OAuthMetadata,
+  redirectUris: string[],
+  fetchFn: AddressFetch = publicFetch,
+): Promise<string> {
+  const client = await registerClient(metadata.issuer, {
+    metadata,
+    clientMetadata: {
+      client_name: "QM",
+      redirect_uris: redirectUris,
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+      token_endpoint_auth_method: "none",
+    },
+    fetchFn: (url, init) =>
+      fetchFn(url, { ...init, redirect: "error", signal: AbortSignal.timeout(OAUTH_REQUEST_TIMEOUT_MS) }),
+  });
+  return client.client_id;
 }

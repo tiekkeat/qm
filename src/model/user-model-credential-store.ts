@@ -1,7 +1,7 @@
 import type { DerivedOAuthAuth, Keychain } from "../credentials/keychain.ts";
-import { createMemoryMap, type DurableMap } from "../persistence/durable-map.ts";
+import { type DurableMap } from "../persistence/durable-map.ts";
 import { personKey } from "../directory/person.ts";
-import { createMemoryAdvisoryLock, type AdvisoryLock } from "../persistence/advisory-lock.ts";
+import { type AdvisoryLock } from "../persistence/advisory-lock.ts";
 import type { ModelProvider } from "./pi-models.ts";
 
 type UserCredentialKind = "apikey" | "oauth";
@@ -14,7 +14,6 @@ export interface UserOAuthTokens {
   expiresAt?: number;
 }
 
-/** Connection summary. Never carries token material. */
 export interface UserModelCredential {
   provider: ModelProvider;
   kind: UserCredentialKind;
@@ -33,11 +32,6 @@ export interface UserModelCredentialStore {
   connections(userId: string): Promise<UserCredentialConnection[]>;
   setApiKey(userId: string, provider: ModelProvider, apiKey: string): Promise<void>;
   setOAuth(userId: string, provider: ModelProvider, tokens: UserOAuthTokens): Promise<void>;
-  /**
-   * Fresh derived material for the user's subscription login (access + id
-   * token + account id) — refreshed inside the keychain (single-flight, CAS)
-   * when stale. The refresh token never leaves the keychain record.
-   */
   derivedOAuth(userId: string, provider: ModelProvider): Promise<DerivedOAuthAuth | null>;
   delete(userId: string, provider: ModelProvider): Promise<void>;
   sharedStatus(): Promise<{ connected: boolean; needsReconnect?: boolean; grantees: string[] }>;
@@ -62,16 +56,10 @@ export interface SharedCodexLogin {
 
 const PROVIDERS: ModelProvider[] = ["anthropic", "openai"];
 const ORIGIN = "individual-model-auth";
-/**
- * OAuth logins are keyed by the provider's auth host, so the keychain's own
- * connector-token machinery (encryption, expiry margin, single-flight refresh
- * via the wired refresh dispatch) covers them with no parallel implementation.
- */
 const AI_OAUTH_HOSTS: Record<"anthropic" | "openai", string> = {
   anthropic: "claude.ai",
   openai: "auth.openai.com",
 };
-/** Segregates AI subscription logins from any other connector use of the same host. */
 const AI_ACCOUNT_TYPE = "individual-model";
 const SHARED_ACCOUNT_TYPE = "shared-model";
 const SHARED_OWNER = "org-codex-model";
@@ -85,27 +73,16 @@ function oauthHostFor(provider: ModelProvider): string | null {
   return provider === "anthropic" || provider === "openai" ? AI_OAUTH_HOSTS[provider] : null;
 }
 
-/**
- * Per-user AI-account custody, backed by the org keychain — NOT a parallel
- * secret store.
- *
- * - Subscription (OAuth) logins are keychain connector tokens: the keychain
- *   encrypts them, tracks expiry, and refreshes them centrally; callers only
- *   ever receive derived material without the refresh token.
- * - API keys are ordinary keychain credentials owned by the user (service
- *   `model-<provider>`, origin `individual-model-auth`), so admin visibility
- *   and "remove my credentials" apply.
- */
 export function createUserModelCredentialStore(input: {
   keychain: Keychain;
-  sharedGrants?: DurableMap<{ userId: string; enabled: boolean }>;
-  sharedLogins?: DurableMap<SharedCodexLogin>;
-  lock?: AdvisoryLock;
+  sharedGrants: DurableMap<{ userId: string; enabled: boolean }>;
+  sharedLogins: DurableMap<SharedCodexLogin>;
+  lock: AdvisoryLock;
 }): UserModelCredentialStore {
   const { keychain } = input;
-  const sharedGrants = input.sharedGrants ?? createMemoryMap<{ userId: string; enabled: boolean }>();
-  const sharedLogins = input.sharedLogins ?? createMemoryMap<SharedCodexLogin>();
-  const lock = input.lock ?? createMemoryAdvisoryLock();
+  const sharedGrants = input.sharedGrants;
+  const sharedLogins = input.sharedLogins;
+  const lock = input.lock;
 
   async function findApiKey(userId: string, provider: ModelProvider) {
     const all = await keychain.listByOwner(userId);
@@ -153,7 +130,6 @@ export function createUserModelCredentialStore(input: {
     async setApiKey(userId, provider, apiKey) {
       const secret = apiKey.trim();
       if (!secret) throw new Error("API key is required");
-      // One connection per provider: an API key replaces a subscription login.
       const host = oauthHostFor(provider);
       if (host) await keychain.deleteConnectorToken(host, userId, AI_ACCOUNT_TYPE);
       await keychain.save({ ownerId: userId, service: serviceFor(provider), secret, origin: ORIGIN });
@@ -175,7 +151,6 @@ export function createUserModelCredentialStore(input: {
         },
         AI_ACCOUNT_TYPE,
       );
-      // One connection per provider: a subscription login replaces an API key.
       const apiKeyMeta = await findApiKey(userId, provider);
       if (apiKeyMeta) await keychain.remove(userId, apiKeyMeta.id);
     },

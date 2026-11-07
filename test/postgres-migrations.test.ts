@@ -9,6 +9,7 @@ import {
   migrateRegisteredPgSchemas,
   PG_MIGRATIONS_TABLE,
 } from "../src/persistence/pg-pool.ts";
+import { settle } from "./support/settle.ts";
 
 const databaseUrl = process.env.DATABASE_URL;
 const skip = !databaseUrl;
@@ -23,7 +24,10 @@ test("concurrent index migrations adopt prebuilt indexes and serialize retries",
   const b = new pg.Pool({ connectionString: databaseUrl });
   const { id, table } = names();
   const index = `${table}_idx`;
-  const migration = definePgMigration(id, [`CREATE INDEX CONCURRENTLY IF NOT EXISTS ${index} ON ${table}(value)`]);
+  const migration = definePgMigration({
+    id,
+    statements: [`CREATE INDEX CONCURRENTLY IF NOT EXISTS ${index} ON ${table}(value)`],
+  });
   try {
     await a.query(`CREATE TABLE ${table}(value INT NOT NULL)`);
     await a.query(`CREATE INDEX CONCURRENTLY ${index} ON ${table}(value)`);
@@ -44,9 +48,10 @@ test("failed concurrent index builds are unrecorded and rebuild invalid indexes 
   const pool = new pg.Pool({ connectionString: databaseUrl });
   const { id, table } = names();
   const index = `${table}_idx`;
-  const migration = definePgMigration(id, [
-    `CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS ${index} ON ${table}(value)`,
-  ]);
+  const migration = definePgMigration({
+    id,
+    statements: [`CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS ${index} ON ${table}(value)`],
+  });
   try {
     await pool.query(`CREATE TABLE ${table}(value INT NOT NULL)`);
     await pool.query(`INSERT INTO ${table} VALUES (1), (1)`);
@@ -73,10 +78,13 @@ test("concurrent index migrations reject mixed transactional statements before e
   try {
     await assert.rejects(
       applyPgMigrations(pool, [
-        definePgMigration(id, [
-          `CREATE TABLE ${table}(value INT)`,
-          `CREATE INDEX CONCURRENTLY IF NOT EXISTS ${table}_idx ON ${table}(value)`,
-        ]),
+        definePgMigration({
+          id,
+          statements: [
+            `CREATE TABLE ${table}(value INT)`,
+            `CREATE INDEX CONCURRENTLY IF NOT EXISTS ${table}_idx ON ${table}(value)`,
+          ],
+        }),
       ]),
       /must contain only concurrent indexes/,
     );
@@ -91,9 +99,10 @@ test("concurrent index retry resolves indexes in the target table schema", { ski
   const { id, table } = names();
   const schema = `s_${table}`;
   const index = `${table}_idx`;
-  const migration = definePgMigration(id, [
-    `CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS ${index} ON ${schema}.events(value)`,
-  ]);
+  const migration = definePgMigration({
+    id,
+    statements: [`CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS ${index} ON ${schema}.events(value)`],
+  });
   try {
     await pool.query(`CREATE SCHEMA ${schema}`);
     await pool.query(`CREATE TABLE ${schema}.events(value INT)`);
@@ -117,14 +126,50 @@ test("concurrent index retry resolves indexes in the target table schema", { ski
   }
 });
 
+test("an autocommit migration can commit between pages and is recorded once", { skip }, async () => {
+  const a = new pg.Pool({ connectionString: databaseUrl });
+  const b = new pg.Pool({ connectionString: databaseUrl });
+  const { id, table } = names();
+  const migration = definePgMigration({
+    id,
+    autocommit: true,
+    statements: [
+      `CREATE OR REPLACE PROCEDURE ${table}_fill() LANGUAGE plpgsql AS $fill$
+BEGIN
+  FOR page IN 1..3 LOOP
+    INSERT INTO ${table}(value) VALUES (page);
+    COMMIT;
+  END LOOP;
+END $fill$`,
+      `CALL ${table}_fill()`,
+      `DROP PROCEDURE ${table}_fill()`,
+    ],
+  });
+  try {
+    await a.query(`CREATE TABLE ${table}(value INT NOT NULL)`);
+    await Promise.all([applyPgMigrations(a, [migration]), applyPgMigrations(b, [migration])]);
+    const rows = await a.query(`SELECT value FROM ${table} ORDER BY value`);
+    assert.deepEqual(
+      rows.rows.map((row) => row.value),
+      [1, 2, 3],
+    );
+    const ledger = await a.query(`SELECT checksum FROM ${PG_MIGRATIONS_TABLE} WHERE id = $1`, [id]);
+    assert.deepEqual(ledger.rows, [{ checksum: migration.checksum }]);
+  } finally {
+    await a.query(`DROP TABLE IF EXISTS ${table}`);
+    await a.query(`DELETE FROM ${PG_MIGRATIONS_TABLE} WHERE id = $1`, [id]);
+    await Promise.all([a.end(), b.end()]);
+  }
+});
+
 test("concurrent migrators apply one version exactly once", { skip }, async () => {
   const a = new pg.Pool({ connectionString: databaseUrl });
   const b = new pg.Pool({ connectionString: databaseUrl });
   const { id, table } = names();
-  const migration = definePgMigration(id, [
-    `CREATE TABLE ${table}(value INT NOT NULL)`,
-    `INSERT INTO ${table}(value) VALUES (1)`,
-  ]);
+  const migration = definePgMigration({
+    id,
+    statements: [`CREATE TABLE ${table}(value INT NOT NULL)`, `INSERT INTO ${table}(value) VALUES (1)`],
+  });
   try {
     await Promise.all([applyPgMigrations(a, [migration]), applyPgMigrations(b, [migration])]);
     const rows = await a.query(`SELECT value FROM ${table}`);
@@ -142,9 +187,11 @@ test("an applied migration rejects checksum drift", { skip }, async () => {
   const pool = new pg.Pool({ connectionString: databaseUrl });
   const { id, table } = names();
   try {
-    await applyPgMigrations(pool, [definePgMigration(id, [`CREATE TABLE ${table}(value INT NOT NULL)`])]);
+    await applyPgMigrations(pool, [
+      definePgMigration({ id, statements: [`CREATE TABLE ${table}(value INT NOT NULL)`] }),
+    ]);
     await assert.rejects(
-      applyPgMigrations(pool, [definePgMigration(id, [`CREATE TABLE ${table}(value TEXT NOT NULL)`])]),
+      applyPgMigrations(pool, [definePgMigration({ id, statements: [`CREATE TABLE ${table}(value TEXT NOT NULL)`] })]),
       /checksum mismatch/,
     );
   } finally {
@@ -160,7 +207,10 @@ test("a failed migration rolls back and is not recorded", { skip }, async () => 
   try {
     await assert.rejects(
       applyPgMigrations(pool, [
-        definePgMigration(id, [`CREATE TABLE ${table}(value INT NOT NULL)`, `INSERT INTO missing_${table} VALUES (1)`]),
+        definePgMigration({
+          id,
+          statements: [`CREATE TABLE ${table}(value INT NOT NULL)`, `INSERT INTO missing_${table} VALUES (1)`],
+        }),
       ]),
     );
     const tableState = await pool.query("SELECT to_regclass($1) AS name", [table]);
@@ -209,26 +259,53 @@ test("repeatable maintenance runs once per store instance after migrations", { s
   }
 });
 
-test("pre-migration maintenance can repair schema before a released migration", { skip }, async () => {
-  const admin = new pg.Pool({ connectionString: databaseUrl });
-  const { id, table } = names();
-  const store = createPgPool(
-    databaseUrl!,
-    [{ id, statements: [`INSERT INTO ${table}(value) VALUES (1)`] }],
-    [
-      {
-        id: `${id}/repair`,
-        beforeMigrations: true,
-        statements: [`CREATE TABLE IF NOT EXISTS ${table}(value INT NOT NULL)`],
-      },
-    ],
-  );
-  try {
-    assert.deepEqual(await store.q(`SELECT value FROM ${table}`), [{ value: 1 }]);
-  } finally {
-    await store.close();
-    await admin.query(`DROP TABLE IF EXISTS ${table}`);
-    await admin.query(`DELETE FROM ${PG_MIGRATIONS_TABLE} WHERE id = $1`, [id]);
-    await admin.end();
-  }
-});
+for (const lock of ["qm:schema-maintenance", "qm:schema-migrations"]) {
+  test(`waiting for the ${lock} lock does not deadlock a concurrent index build`, { skip }, async () => {
+    const admin = new pg.Pool({ connectionString: databaseUrl });
+    const holder = new pg.Client({ connectionString: databaseUrl });
+    const { id, table } = names();
+    const store = createPgPool(
+      databaseUrl!,
+      [{ id, statements: [`ALTER TABLE ${table} ADD COLUMN extra INT`] }],
+      [{ id: `${id}/repair`, statements: ["SELECT 1"] }],
+    );
+    await holder.connect();
+    try {
+      await admin.query(`CREATE TABLE ${table}(value INT NOT NULL)`);
+      await admin.query(`INSERT INTO ${table}(value) VALUES (1)`);
+      const holderPid = (await holder.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")).rows[0]!.pid;
+      await holder.query("SELECT pg_advisory_lock(hashtext($1))", [lock]);
+      const ready = store.pool();
+      let startFailure: unknown;
+      ready.catch((error: unknown) => {
+        startFailure = error;
+      });
+      let waiting = 0;
+      await settle(async () => {
+        const waiters = await admin.query(
+          "SELECT 1 FROM pg_stat_activity WHERE pid NOT IN (pg_backend_pid(), $1) AND query LIKE '%advisory_lock(hashtext(%'",
+          [holderPid],
+        );
+        waiting = waiters.rowCount ?? 0;
+        return waiting > 0;
+      });
+      assert.ok(
+        waiting,
+        `the store never waited for the schema lock${startFailure ? `: ${String(startFailure)}` : ""}`,
+      );
+      try {
+        await holder.query(`CREATE INDEX CONCURRENTLY ${table}_idx ON ${table}(value)`);
+      } finally {
+        await holder.query("SELECT pg_advisory_unlock(hashtext($1))", [lock]);
+      }
+      await ready;
+      assert.deepEqual(await store.q(`SELECT value, extra FROM ${table}`), [{ value: 1, extra: null }]);
+    } finally {
+      await holder.end();
+      await store.close();
+      await admin.query(`DROP TABLE IF EXISTS ${table}`);
+      await admin.query(`DELETE FROM ${PG_MIGRATIONS_TABLE} WHERE id = $1`, [id]);
+      await admin.end();
+    }
+  });
+}

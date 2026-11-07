@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { createSkillPackStore, type NewSkillPack } from "../src/skills/skill-pack-store.ts";
 import { createSkillSyncEngine } from "../src/skills/skill-sync-engine.ts";
 import type { SkillPackFetcher } from "../src/skills/pack-fetcher.ts";
+import { singleProcessDeps } from "./support/single-process.ts";
+import { testMap } from "./support/test-database.ts";
 
 const base: NewSkillPack = {
   kind: "git",
@@ -29,11 +31,12 @@ function fakeFetcher(headBySource: Record<string, string>): SkillPackFetcher {
 }
 
 test("tracked pack: fast-path skips reconcile when HEAD == last good commit", async () => {
-  const packs = createSkillPackStore();
+  const packs = createSkillPackStore({ backing: testMap() });
   const s = await packs.create(base);
   await packs.recordImport(s.id, { at: 0, commit: "c1", status: "ok" });
   const calls: string[] = [];
   const engine = createSkillSyncEngine({
+    ...singleProcessDeps(),
     packs,
     fetcher: fakeFetcher({ [s.id]: "c1" }),
     reconcile: async (id) => void calls.push(id),
@@ -43,11 +46,12 @@ test("tracked pack: fast-path skips reconcile when HEAD == last good commit", as
 });
 
 test("tracked pack: reconciles when HEAD has advanced", async () => {
-  const packs = createSkillPackStore();
+  const packs = createSkillPackStore({ backing: testMap() });
   const s = await packs.create(base);
   await packs.recordImport(s.id, { at: 0, commit: "c1", status: "ok" });
   const calls: string[] = [];
   const engine = createSkillSyncEngine({
+    ...singleProcessDeps(),
     packs,
     fetcher: fakeFetcher({ [s.id]: "c2" }),
     reconcile: async (id) => void calls.push(id),
@@ -57,11 +61,12 @@ test("tracked pack: reconciles when HEAD has advanced", async () => {
 });
 
 test("pinned pack: sets updateAvailable when the line advanced past the pinned commit", async () => {
-  const packs = createSkillPackStore();
+  const packs = createSkillPackStore({ backing: testMap() });
   const s = await packs.create({ ...base, syncMode: "pinned", ref: "c1" });
   await packs.recordImport(s.id, { at: 0, commit: "c1", status: "ok" });
   const calls: string[] = [];
   const engine = createSkillSyncEngine({
+    ...singleProcessDeps(),
     packs,
     fetcher: fakeFetcher({ [s.id]: "c2" }),
     reconcile: async (id) => void calls.push(id),
@@ -72,23 +77,29 @@ test("pinned pack: sets updateAvailable when the line advanced past the pinned c
 });
 
 test("pinned pack: clears a stale updateAvailable when HEAD == pinned commit", async () => {
-  const packs = createSkillPackStore();
+  const packs = createSkillPackStore({ backing: testMap() });
   const s = await packs.create({ ...base, syncMode: "pinned", ref: "c1" });
   await packs.recordImport(s.id, { at: 0, commit: "c1", status: "ok" });
   await packs.update(s.id, { updateAvailable: true });
-  const engine = createSkillSyncEngine({ packs, fetcher: fakeFetcher({ [s.id]: "c1" }), reconcile: async () => {} });
+  const engine = createSkillSyncEngine({
+    ...singleProcessDeps(),
+    packs,
+    fetcher: fakeFetcher({ [s.id]: "c1" }),
+    reconcile: async () => {},
+  });
   await engine.tick();
   assert.equal((await packs.get(s.id))?.updateAvailable, false, "no advance ⇒ flag cleared");
 });
 
 test("one failing pack never aborts the tick", async () => {
-  const packs = createSkillPackStore();
+  const packs = createSkillPackStore({ backing: testMap() });
   const bad = await packs.create(base);
   await packs.recordImport(bad.id, { at: 0, commit: "c1", status: "ok" });
   const good = await packs.create(base);
   await packs.recordImport(good.id, { at: 0, commit: "c1", status: "ok" });
   const calls: string[] = [];
   const engine = createSkillSyncEngine({
+    ...singleProcessDeps(),
     packs,
     fetcher: fakeFetcher({ [good.id]: "c2" }),
     reconcile: async (id) => void calls.push(id),

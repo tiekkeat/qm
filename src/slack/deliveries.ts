@@ -1,6 +1,7 @@
+import { escapeSlackText } from "./mrkdwn.ts";
 import { extractPrivateContinuation } from "./external-access.ts";
 import { deployAccessMessage } from "./deploy-access.ts";
-import { approvalDeliveryKey, approvalDeliveryRecipient } from "../core/approval-store.ts";
+import { approvalDeliveryKey, approvalDeliveryRecipient } from "./approval-store.ts";
 import { samePerson } from "../directory/person.ts";
 import { approvalMessage } from "./approval-cards.ts";
 import { deliverKeychainCard } from "./keychain-approvals.ts";
@@ -21,6 +22,8 @@ import {
   recoveryVerifyOldest,
   slackReplyArgs,
   slackSectionBlocks,
+  plainContext,
+  blocksWithContext,
   stripReactionDirectives,
   toSlackMrkdwn,
   uploadAttachments,
@@ -43,6 +46,13 @@ const PERMANENT_POST_ERRORS = new Set([
   "user_not_found",
   "cannot_reply_to_message",
   "message_not_found",
+]);
+
+const TERMINAL_POST_ERRORS = new Set([
+  "cannot_dm_bot",
+  "cant_update_message",
+  "edit_window_closed",
+  "edit_target_not_found",
 ]);
 
 const SETTLED_PIN_ERRORS = new Set(["already_pinned", "no_pin", "not_pinned"]);
@@ -159,16 +169,20 @@ export function createDeliveryPoller(deps: {
     const base = deps.webUiPublicUrl?.trim().replace(/\/+$/, "");
     const id = d.provenance?.trigger === "cron" ? cronIdOf(d.provenance.sourceThreadRef) : null;
     const sender = d.destination.relaySender?.trim().replace(/^@+/, "");
-    const attribution = sender ? [{ type: "plain_text", text: `Sent for @${sender}`, emoji: false }] : [];
-    if (!base || !id) return attribution;
-    const title = (d.provenance?.sourceTitle?.trim() || "Cron")
-      .replaceAll("&", "&amp;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;");
-    return [
-      ...attribution,
-      { type: "mrkdwn", text: `${title} · <${base}/crons/${encodeURIComponent(id)}|Settings>`, verbatim: true },
+    const attribution = [
+      ...(sender ? [plainContext(`Sent for @${sender}`)] : []),
+      ...(d.destination.editNote ? [plainContext(d.destination.editNote)] : []),
     ];
+    const persona = d.destination.persona;
+    const personaName = persona ? escapeSlackText(persona.name.trim() || "Persona") : "";
+    const parts = persona
+      ? [`Persona: ${base ? `<${base}/personas/${encodeURIComponent(persona.id)}|${personaName}>` : personaName}`]
+      : [];
+    if (base && id) {
+      const title = escapeSlackText(d.provenance?.sourceTitle?.trim() || "Cron");
+      parts.push(`${title} · <${base}/crons/${encodeURIComponent(id)}|Settings>`);
+    }
+    return parts.length ? [...attribution, { type: "mrkdwn", text: parts.join(" · "), verbatim: true }] : attribution;
   }
 
   const deliveryTracker = createDeliveryTracker();
@@ -178,6 +192,15 @@ export function createDeliveryPoller(deps: {
     (id: string) =>
     (stage: "post" | "ack", err: unknown, gaveUp: boolean): void => {
       const code = slackErrorCode(err);
+      if (stage === "post" && code && TERMINAL_POST_ERRORS.has(code)) {
+        deliveryTracker.clear(id);
+        console.error(
+          `[slack-plugin] delivery ${id} post refused permanently (${code}) — failing it, no retry:`,
+          (err as Error).message,
+        );
+        void core.failDelivery(id, code).catch(swallowAs("slack-plugin: fail delivery", undefined));
+        return;
+      }
       if (stage === "post" && gaveUp && code && PERMANENT_POST_ERRORS.has(code) && !undeliverableReported.has(id)) {
         if (undeliverableReported.size >= 5000) undeliverableReported.clear();
         undeliverableReported.add(id);
@@ -192,9 +215,9 @@ export function createDeliveryPoller(deps: {
     };
 
   function deliveryClient(defaultClient: any, destination: Delivery["destination"]): any {
-    if (deps.clientForAccount)
-      return deps.clientForAccount(destination.slackAccountId ?? "default", destination.slackTeamId);
-    return destination.slackAccountId ? undefined : defaultClient;
+    const account = destination.account;
+    if (deps.clientForAccount) return deps.clientForAccount(account?.id ?? "default", account?.workspace);
+    return account ? undefined : defaultClient;
   }
 
   async function deliverToConversations(defaultClient: any, leaseLost?: () => boolean): Promise<number> {
@@ -205,11 +228,12 @@ export function createDeliveryPoller(deps: {
         if (!destinationClient) return;
         const client = destinationClient;
         const runId = d.idempotencyKey?.startsWith("run:") ? d.idempotencyKey.slice("run:".length) : undefined;
-        const namespace = deps.externalNamespace?.(d.destination.slackAccountId ?? "default");
+        const account = d.destination.account;
+        const namespace = deps.externalNamespace?.(account?.id ?? "default");
         if (
           namespace &&
           (parseDeliveryTarget(d.destination.target).channel.startsWith("D")
-            ? runId && d.destination.slackPolicyNamespace !== namespace
+            ? runId && account?.policyNamespace !== namespace
             : !d.provenance?.sourceThreadRef.startsWith(`${namespace}:`))
         ) {
           await ackDelivery(d.id);
@@ -276,6 +300,37 @@ export function createDeliveryPoller(deps: {
                 }
                 return undefined;
               }
+              if (d.destination.edit) {
+                const text = toSlackMrkdwn(stripSlackDirectives(d.text));
+                if (!text.trim()) {
+                  console.error(`[slack-plugin] delivery ${d.id} edit skipped: no text left to write`);
+                  return undefined;
+                }
+                const footer = [
+                  ...deliveryFooter(d),
+                  ...(d.destination.debugFooter ? [{ type: "mrkdwn", text: d.destination.debugFooter }] : []),
+                ];
+                const unfurlLinks = d.destination.unfurlLinks;
+                await client.chat
+                  .update({
+                    channel,
+                    ts: d.destination.edit.messageTs,
+                    text,
+                    blocks: [
+                      ...slackSectionBlocks(text),
+                      ...(footer.length ? [{ type: "context", elements: footer }] : []),
+                    ],
+                    ...botIdentityArgs(),
+                    ...(unfurlLinks !== undefined ? { unfurl_links: unfurlLinks, unfurl_media: unfurlLinks } : {}),
+                  })
+                  .catch((err: unknown) => {
+                    if (slackErrorCode(err) !== "message_not_found") throw err;
+                    throw Object.assign(new Error(`edit target not found: ${(err as Error).message}`, { cause: err }), {
+                      data: { error: "edit_target_not_found" },
+                    });
+                  });
+                return undefined;
+              }
               let editRef = d.destination.editRef;
               if (!editRef && runId) {
                 const placeholder = await findPostedByKey(
@@ -311,9 +366,7 @@ export function createDeliveryPoller(deps: {
                 ...messageFooter,
                 ...(d.destination.debugFooter ? [{ type: "mrkdwn", text: d.destination.debugFooter }] : []),
               ];
-              const footerBlocks = footer.length
-                ? [...(text.trim() ? slackSectionBlocks(text) : []), { type: "context", elements: footer }]
-                : undefined;
+              const footerBlocks = footer.length ? blocksWithContext(text, footer) : undefined;
               if (!text.trim() && !(messageFooter.length && d.attachments?.length)) {
                 if (editRef) {
                   await client.chat
@@ -420,18 +473,24 @@ export function createDeliveryPoller(deps: {
               let card: { text: string; blocks: Array<Record<string, unknown>> } | null = null;
               if (d.destination.deploymentAccess) card = deployAccessMessage(d.destination.deploymentAccess, d.text);
               if (commandApproval)
-                card = approvalMessage([{ ...commandApproval, reason: commandApproval.reason ?? "Approval required" }]);
+                card = approvalMessage([
+                  {
+                    ...commandApproval,
+                    reason: commandApproval.reason ?? "Approval required",
+                    ...(deps.webUiPublicUrl && commandApproval.sessionId
+                      ? {
+                          originUrl: `${deps.webUiPublicUrl.trim().replace(/\/+$/, "")}/s/${encodeURIComponent(commandApproval.sessionId)}`,
+                        }
+                      : {}),
+                  },
+                ]);
               let text = card?.text ?? toSlackMrkdwn(stripReactionDirectives(d.text));
               if (!text.trim() && !d.attachments?.length) return undefined;
               const channel = await openConversationFor(client, [d.destination.target]);
               const threadTs = d.destination.threadTs;
               const footer = deliveryFooter(d);
               if (!text.trim() && !footer.length && d.attachments?.length) text = "Files attached.";
-              const blocks =
-                card?.blocks ??
-                (footer.length
-                  ? [...(text.trim() ? slackSectionBlocks(text) : []), { type: "context", elements: footer }]
-                  : undefined);
+              const blocks = card?.blocks ?? (footer.length ? blocksWithContext(text, footer) : undefined);
               let uploadError: unknown;
               let reused = false;
               if (text.trim() || blocks) {

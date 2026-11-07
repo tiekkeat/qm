@@ -1,13 +1,15 @@
 import { isEmbeddingModel, type EmbeddingModel } from "./model-overlay.ts";
-import type { ModelGatewayTransportConfig } from "./provider-endpoints.ts";
+import { gatewayRoot, type ModelGatewayTransportConfig } from "./provider-endpoints.ts";
 import { GATEWAY_MODEL_PREFIX, GATEWAY_PROVIDER, setGatewayModels, type GatewayModel } from "./gateway-models.ts";
 import { modelOfferedInWebui, selectableBaseModels } from "./pi-models.ts";
+import { readBoundedText } from "../util/bytes.ts";
 
 const MAX_BYTES = 2 * 1024 * 1024;
 const MAX_MODELS = 1_000;
 const TTL_MS = 5 * 60_000;
 const RETRY_MS = 30_000;
 const STALE_MS = 15 * 60_000;
+const UNRELIABLE_OUTPUT_LIMIT_FALLBACK = 65_536;
 
 function transientFailure(error: unknown): boolean {
   const status = (error as { status?: unknown } | null)?.status;
@@ -50,11 +52,15 @@ function parseModel(value: unknown, allowed: Set<string>, baseUrl: string): Gate
   }
   if (info.mode !== "chat" || info.supports_function_calling !== true) return undefined;
   const contextWindow = tokens(info.max_input_tokens);
-  const maxTokens = tokens(info.max_output_tokens);
+  const reportedMaxTokens = tokens(info.max_output_tokens);
   const input = price(info.input_cost_per_token);
   const output = price(info.output_cost_per_token);
-  if (!contextWindow || !maxTokens || maxTokens >= contextWindow || input === undefined || output === undefined)
-    return undefined;
+  if (!contextWindow || !reportedMaxTokens || input === undefined || output === undefined) return undefined;
+  const maxTokens =
+    reportedMaxTokens < contextWindow
+      ? reportedMaxTokens
+      : Math.min(UNRELIABLE_OUTPUT_LIMIT_FALLBACK, Math.floor(contextWindow / 2));
+  if (maxTokens < 1) return undefined;
   const providers = Array.isArray(info.providers) ? info.providers : [];
   const anthropic = providers.length > 0 && providers.every((provider) => provider === "anthropic");
   const openai = providers.length > 0 && providers.every((provider) => provider === "openai" || provider === "azure");
@@ -73,7 +79,7 @@ function parseModel(value: unknown, allowed: Set<string>, baseUrl: string): Gate
     name: info.model_group,
     provider: GATEWAY_PROVIDER,
     api,
-    baseUrl: anthropic ? baseUrl.replace(/\/v1$/, "") : baseUrl,
+    baseUrl: anthropic ? gatewayRoot(baseUrl) : baseUrl,
     reasoning: (anthropic || openai) && info.supports_reasoning === true,
     input: info.supports_vision === true ? ["text", "image"] : ["text"],
     contextWindow,
@@ -115,25 +121,7 @@ async function readCatalog(
   });
   if (!response.ok)
     throw Object.assign(new Error(`Gateway catalog returned HTTP ${response.status}`), { status: response.status });
-  if (!response.body || Number(response.headers.get("content-length")) > MAX_BYTES)
-    throw new Error("Gateway catalog exceeds size limit");
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let bytes = 0;
-  let body = "";
-  try {
-    while (true) {
-      const chunk = await reader.read();
-      if (chunk.done) break;
-      bytes += chunk.value.byteLength;
-      if (bytes > MAX_BYTES) throw new Error("Gateway catalog exceeds size limit");
-      body += decoder.decode(chunk.value, { stream: true });
-    }
-    body += decoder.decode();
-  } finally {
-    void reader.cancel().catch(() => {});
-    reader.releaseLock();
-  }
+  const body = await readBoundedText(response, MAX_BYTES, () => new Error("Gateway catalog exceeds size limit"));
   const data = record(JSON.parse(body))?.data;
   if (!Array.isArray(data) || data.length > MAX_MODELS) throw new Error("Invalid gateway catalog");
   return data;
@@ -144,7 +132,7 @@ export function createGatewayCatalog(
   fetcher: typeof fetch = fetch,
   now: () => number = Date.now,
 ) {
-  const root = config.url.replace(/\/v1$/, "");
+  const root = gatewayRoot(config.url);
   const baseUrl = `${root}/v1`;
   let routes: Readonly<Record<string, string>> = { ...config.models };
   let discovered = false;

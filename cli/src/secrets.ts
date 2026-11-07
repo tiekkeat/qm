@@ -1,7 +1,8 @@
+import { generateKeyPairSync, randomBytes } from "node:crypto";
 import { hostedServiceEnv, serviceHost, type DeclaredServiceName } from "./services.ts";
 import { effectiveModelProvider, type ModelProvider, type QmConfig } from "./config.ts";
 import { TARGET_ENV_DEFAULTS } from "./target-env-defaults.ts";
-import { deploymentSecretValue } from "./util.ts";
+import { deploymentSecretValue, isInvalidSecret } from "./util.ts";
 
 type SecretCondition =
   | { kind: "background-work-control" }
@@ -24,7 +25,14 @@ export interface SecretSpec {
   required: boolean | { when: SecretCondition; optional?: true; optionalOtherwise?: true };
   description: string;
   generate?: string;
-  managedBy?: "operator" | "terraform";
+  managedBy?: ManagedBy | Partial<Record<QmConfig["target"] | "default", ManagedBy>>;
+}
+
+type ManagedBy = "operator" | "terraform" | "render";
+
+export function managedByFor(spec: SecretSpec, target: QmConfig["target"]): ManagedBy {
+  if (typeof spec.managedBy === "string") return spec.managedBy;
+  return spec.managedBy?.[target] ?? spec.managedBy?.default ?? "operator";
 }
 
 export interface ComputedSecret {
@@ -33,15 +41,46 @@ export interface ComputedSecret {
   description: string;
   required: boolean;
   generate?: string;
-  managedBy: "operator" | "terraform";
+  managedBy: ManagedBy;
   aliases?: Array<{ service: DeclaredServiceName; name: string }>;
 }
 
-export const MINT_LOCALLY = "openssl rand -hex 32";
+export function missingRequiredSecrets(
+  secrets: readonly ComputedSecret[],
+  valueFor: (name: string) => string | undefined,
+): string[] {
+  return secrets
+    .filter((secret) => secret.required && isInvalidSecret(secret.name, valueFor(secret.name)))
+    .map((secret) => secret.name);
+}
+
+const MINT_LOCALLY = "openssl rand -hex 32";
 export const MINT_JWK =
   "node -e \"const {generateKeyPairSync}=require('node:crypto');process.stdout.write(JSON.stringify(generateKeyPairSync('ec',{namedCurve:'P-256'}).privateKey.export({format:'jwk'})))\"";
 
+export function mintLocalSecret(secret: { generate?: string }): string | undefined {
+  if (secret.generate === MINT_LOCALLY) return randomBytes(32).toString("hex");
+  if (secret.generate === MINT_JWK)
+    return JSON.stringify(generateKeyPairSync("ec", { namedCurve: "P-256" }).privateKey.export({ format: "jwk" }));
+  return undefined;
+}
+
 export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
+  {
+    name: "RENDER_API_KEY",
+    service: "core",
+    required: {
+      when: {
+        kind: "any",
+        conditions: [
+          { kind: "target", target: "render" },
+          { kind: "env-equals", service: "core", name: "SANDBOX_BACKEND", value: "render" },
+          { kind: "env-equals", service: "core", name: "DEPLOY_PROVIDER", value: "render" },
+        ],
+      },
+    },
+    description: "Render API key for this deployment, sandboxes, and published apps.",
+  },
   {
     name: "ANTHROPIC_API_KEY",
     service: "core",
@@ -66,8 +105,9 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
   {
     name: "PUBLIC_API_URL",
     service: "core",
-    required: { when: { kind: "env-equals", service: "core", name: "HARNESS", value: "pi" } },
+    required: true,
     description: "Public core self-API URL reachable from agent sandboxes.",
+    managedBy: { render: "render" },
   },
   {
     name: "CORE_SIGNING_SECRET",
@@ -80,7 +120,7 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
     name: "DEPLOYMENT_CONTROL_SECRET",
     service: "core",
     required: { when: { kind: "background-work-control" } },
-    description: "Deployment ownership credential held only by core and the privileged deployment operator.",
+    description: "Deployment control credential held only by core and the privileged deployment operator.",
     generate: MINT_LOCALLY,
   },
   {
@@ -192,15 +232,7 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
   {
     name: "AGENT37_API_KEY",
     service: "core",
-    required: {
-      when: {
-        kind: "any",
-        conditions: [
-          { kind: "sandbox-backend", backend: "agent37" },
-          { kind: "env-equals", service: "core", name: "SANDBOX_SECONDARY_BACKEND", value: "agent37" },
-        ],
-      },
-    },
+    required: { when: { kind: "sandbox-backend", backend: "agent37" } },
     description: "Agent37 API key for the agent-computer substrate.",
     generate: "mint a key in the Agent37 dashboard (https://agent37.com/dashboard/cloud/api-keys)",
   },
@@ -216,7 +248,7 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
     service: "core",
     required: { when: { kind: "target", target: "aws" } },
     description: "Postgres connection string for durable state.",
-    managedBy: "terraform",
+    managedBy: { default: "terraform", render: "render" },
   },
   {
     name: "DATABASE_POOL_URL",
@@ -296,40 +328,20 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
     generate: MINT_LOCALLY,
   },
   {
-    name: "CORE_SIGNING_SECRET",
-    service: "web-ui",
-    required: true,
-    description: "HMAC key shared by core and surface plugins.",
-    generate: MINT_LOCALLY,
-  },
-  {
     name: "INBOX_USERS",
-    service: "web-ui",
-    required: false,
-    description: "Comma-separated principals allowed to access Inbox, Calendar, and Design System.",
-  },
-  {
-    name: "CORE_SIGNING_SECRET",
-    service: "admin",
-    required: true,
-    description: "HMAC key shared by core and surface plugins.",
-    generate: MINT_LOCALLY,
-  },
-  {
-    name: "INBOX_USERS",
-    service: "admin",
+    service: "core",
     required: false,
     description: "Comma-separated principals allowed to access Inbox, Calendar, and Design System.",
   },
   {
     name: "OIDC_CLIENT_ID",
-    service: "portal",
+    service: "core",
     required: {
       when: {
         kind: "all",
         conditions: [
           { kind: "service-absent", service: "auth" },
-          { kind: "env-absent", service: "portal", name: "OIDC_CLIENT_ID" },
+          { kind: "env-absent", service: "core", name: "OIDC_CLIENT_ID" },
         ],
       },
     },
@@ -337,14 +349,14 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
   },
   {
     name: "OIDC_CLIENT_SECRET",
-    service: "portal",
+    service: "core",
     required: { when: { kind: "service-absent", service: "auth" } },
     description:
       "Client secret issued by an external identity provider; the built-in auth broker mints its own instead.",
   },
   {
     name: "PORTAL_EXPECTED_TEAM_ID",
-    service: "portal",
+    service: "core",
     required: {
       when: {
         kind: "all",
@@ -352,7 +364,7 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
           { kind: "service-absent", service: "auth" },
           {
             kind: "env-all-absent",
-            service: "portal",
+            service: "core",
             names: ["OIDC_ALLOWED_EMAILS", "OIDC_ALLOWED_EMAIL_DOMAIN", "PORTAL_EXPECTED_TEAM_ID"],
           },
         ],
@@ -362,42 +374,21 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
   },
   {
     name: "PORTAL_SESSION_SECRET",
-    service: "portal",
+    service: "core",
     required: true,
     description: "Cookie-signing secret for portal sessions.",
     generate: MINT_LOCALLY,
   },
   {
-    name: "CORE_SIGNING_SECRET",
-    service: "portal",
+    name: "CAPABILITY_SECRET",
+    service: "egress-proxy",
     required: true,
-    description: "HMAC key shared by core and surface plugins.",
-    generate: MINT_LOCALLY,
-  },
-  {
-    name: "PORTAL_IDENTITY_SECRET",
-    service: "portal",
-    required: true,
-    description: "Signing key shared with core for portal-bound user identity.",
-    generate: MINT_LOCALLY,
-  },
-  {
-    name: "PORTAL_IDENTITY_SECRET",
-    service: "web-ui",
-    required: true,
-    description: "Signing key shared with core for portal-bound user identity.",
-    generate: MINT_LOCALLY,
-  },
-  {
-    name: "PORTAL_IDENTITY_SECRET",
-    service: "admin",
-    required: true,
-    description: "Signing key shared with core for portal-bound user identity.",
+    description: "Signing key for scoped agent capabilities and egress grants; must differ from every other key.",
     generate: MINT_LOCALLY,
   },
   {
     name: "CORE_SIGNING_SECRET",
-    service: "auth",
+    service: "egress-proxy",
     required: true,
     description: "HMAC key shared by core and surface plugins.",
     generate: MINT_LOCALLY,
@@ -427,7 +418,7 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
   },
   {
     name: "AUTH_CLIENT_SECRET",
-    service: "portal",
+    service: "core",
     envName: "OIDC_CLIENT_SECRET",
     required: { when: { kind: "service-enabled", service: "auth" } },
     description: "Client secret the portal presents to the built-in auth broker.",
@@ -454,7 +445,7 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
   },
   {
     name: "AUTH_ALLOWED_EMAILS",
-    service: "portal",
+    service: "core",
     envName: "OIDC_ALLOWED_EMAILS",
     required: {
       when: {
@@ -485,7 +476,7 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
     service: "core",
     required: false,
     description:
-      "Sender for external-user invitations sent from the admin Users tab or by chatting with QM; the same verified sender the sign-in broker uses.",
+      "Sender for external-user invitations sent from the Users settings page or by chatting with QM; the same verified sender the sign-in broker uses.",
   },
   {
     name: "RESEND_API_KEY",
@@ -501,7 +492,7 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
     service: "core",
     required: false,
     description:
-      "Resend API key for invitations from the admin Users tab or by chatting with QM when core selects the Resend email transport.",
+      "Resend API key for invitations from the Users settings page or by chatting with QM when core selects the Resend email transport.",
   },
   {
     name: "SMTP_HOST",
@@ -632,7 +623,7 @@ export function computedSecrets(config: QmConfig): ComputedSecret[] {
       description: spec.description,
       required,
       ...(spec.generate ? { generate: spec.generate } : {}),
-      managedBy: spec.managedBy ?? "operator",
+      managedBy: managedByFor(spec, config.target),
       ...(spec.envName ? { aliases: [{ service: spec.service, name: spec.envName }] } : {}),
     });
   }
@@ -825,7 +816,8 @@ export function renderEnvExample(config: QmConfig): string {
     ].sort();
     lines.push(`# ${secret.description} (${consumers.join(", ")})`);
     if (secret.generate) lines.push(`# Generate with: ${generate(secret.generate)}`);
-    if (secret.managedBy === "terraform") lines.push(`# ${secret.name}=  # populated by Terraform`);
+    if (secret.managedBy === "render") lines.push(`# ${secret.name}=  # supplied by qm up on Render`);
+    else if (secret.managedBy === "terraform") lines.push(`# ${secret.name}=  # populated by Terraform`);
     else if (secret.required) lines.push(`${secret.name}=`);
     else lines.push(`# ${secret.name}=  # optional`);
     lines.push("");
@@ -845,7 +837,11 @@ export function renderEnvExample(config: QmConfig): string {
     lines.push(`# ${spec.description} (${spec.service})`);
     lines.push(`# Needed when ${clauses.join(" and ")}${spec.required === false ? " (optional even then)" : ""}.`);
     if (spec.generate) lines.push(`# Generate with: ${generate(spec.generate)}`);
-    lines.push(spec.managedBy === "terraform" ? `# ${spec.name}=  # populated by Terraform` : `# ${spec.name}=`);
+    lines.push(
+      managedByFor(spec, config.target) === "terraform"
+        ? `# ${spec.name}=  # populated by Terraform`
+        : `# ${spec.name}=`,
+    );
     lines.push("");
   }
   return `${lines.join("\n").trimEnd()}\n`;

@@ -7,7 +7,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { createInsecureTestServer } from "../src/api/server.ts";
-import { buildApp, type BuiltApp } from "../src/wiring.ts";
+import { type BuiltApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { testConfig } from "./support/test-config.ts";
 import { mintCapabilityToken, CAPABILITY_TTL_MS, CONTROL_PLANE_AUD } from "../src/auth/capability-token.ts";
 
@@ -47,7 +48,7 @@ async function put(base: string, cap: string): Promise<Response> {
   return fetch(`${base}/v1/runtime-config`, {
     method: "PUT",
     headers: { "content-type": "application/json", "x-agent-capability": cap },
-    body: JSON.stringify({ harnessId: "pi", modelId: "claude-sonnet-5" }),
+    body: JSON.stringify({ modelId: "claude-sonnet-5" }),
   });
 }
 
@@ -55,15 +56,12 @@ test("runtime-config accepts a liveAuthor capability (a human replying in a thre
   const srv = start();
   try {
     await srv.built.directory.replaceGroups([{ groupId: "C123", principalId: "alice@default-org" }]);
-    srv.built.config.setApprovedHarnesses(["pi"]);
-    await srv.built.config.flushScope("org:default-org");
     const res = await put(srv.base, await token({ liveAuthor: true }));
     assert.equal(res.status, 200);
     const body = (await res.json()) as {
-      effective: { harnessId: string; modelId: string; effortLevel: string; fastMode: boolean };
+      effective: { modelId: string; effortLevel: string; fastMode: boolean };
     };
     assert.deepEqual(body.effective, {
-      harnessId: "pi",
       modelId: "claude-sonnet-5",
       effortLevel: "auto",
       fastMode: false,
@@ -77,8 +75,6 @@ test("runtime-config still refuses an automated trigger with neither liveActor n
   const srv = start();
   try {
     await srv.built.directory.replaceGroups([{ groupId: "C123", principalId: "alice@default-org" }]);
-    srv.built.config.setApprovedHarnesses(["pi"]);
-    await srv.built.config.flushScope("org:default-org");
     const res = await put(srv.base, await token({ triggered: true }));
     assert.equal(res.status, 403);
     assert.deepEqual(await res.json(), { error: "live_actor_required" });

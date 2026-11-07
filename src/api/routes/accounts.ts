@@ -10,7 +10,7 @@ import type { LoginPolicy } from "../../../plugins/chassis/src/accounts.ts";
 import { externalMemberActive } from "../../identity/external-members.ts";
 import { sendJson } from "../http.ts";
 import { activePrincipal, audit, authorizeAdmin, isObj, orgScope } from "./shared.ts";
-import type { ApiCtx, Route } from "./route.ts";
+import { withAdmin, type ApiCtx, type Route } from "./route.ts";
 
 async function passwordAccountActive(ctx: ApiCtx, email: string): Promise<boolean> {
   const { deps } = ctx;
@@ -27,7 +27,7 @@ async function passwordAccountActive(ctx: ApiCtx, email: string): Promise<boolea
       );
 }
 async function passwordAttempt(ctx: ApiCtx, email: string): Promise<boolean> {
-  if (!ctx.deps.replayDedupe?.durable || !ctx.secret) {
+  if (!ctx.deps.replayDedupe || !ctx.secret) {
     sendJson(ctx.res, 503, { error: "not_configured" });
     return false;
   }
@@ -75,7 +75,8 @@ async function accounts(ctx: ApiCtx): Promise<void> {
   }
   if (suffix === "/self") {
     const principal = ctx.actor?.p;
-    if (!principal || !validEmail(principal) || !(await passwordAccountActive(ctx, principal)))
+    if (!principal) return sendJson(res, 401, { error: "unauthorized" });
+    if (!validEmail(principal) || !(await passwordAccountActive(ctx, principal)))
       return sendJson(res, 403, {
         error: "forbidden",
         message: "Sign in with your email account to manage its password.",
@@ -244,12 +245,27 @@ async function adminPasswordReset(ctx: ApiCtx): Promise<void> {
 }
 export const accountRoutes: ReadonlyArray<Route<ApiCtx>> = [
   ...["policy", "session", "self"].map(
-    (path) => ({ method: "GET", path: `/v1/auth/accounts/${path}`, auth: "source", handle: accounts }) as Route<ApiCtx>,
+    (path) =>
+      ({
+        method: "GET",
+        path: `/v1/auth/accounts/${path}`,
+        auth: "source",
+        actor: "system",
+        handle: accounts,
+      }) as Route<ApiCtx>,
   ),
   ...["verify", "complete", "import", "reset", "self", "begin"].map(
     (path) =>
-      ({ method: "POST", path: `/v1/auth/accounts/${path}`, auth: "source", handle: accounts }) as Route<ApiCtx>,
+      ({
+        method: "POST",
+        path: `/v1/auth/accounts/${path}`,
+        auth: "source",
+        actor: "system",
+        handle: accounts,
+      }) as Route<ApiCtx>,
   ),
-  { method: "POST", path: "/v1/admin/users/login-policy", auth: "either", handle: setLoginPolicy },
-  { method: "POST", path: "/v1/admin/users/password", auth: "either", handle: adminPasswordReset },
+  ...withAdmin([
+    { method: "POST", path: "/v1/admin/users/login-policy", auth: "either", handle: setLoginPolicy },
+    { method: "POST", path: "/v1/admin/users/password", auth: "either", handle: adminPasswordReset },
+  ]).map((route) => ({ ...route, browser: "self" as const })),
 ];

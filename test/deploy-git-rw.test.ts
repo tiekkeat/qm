@@ -13,12 +13,16 @@ import { createServer } from "../src/api/server.ts";
 import { createDeployStore } from "../src/deploy/deploy-store.ts";
 import { createDeployService } from "../src/deploy/deploy-service.ts";
 import { createAclStore, type AclStore } from "../src/acl/acl-store.ts";
-import { createDirectoryStore } from "../src/directory/directory-store.ts";
 import { createIdentityService } from "../src/identity/identity-service.ts";
-import { createMemorySessionStore } from "../src/sessions/memory-session-store.ts";
 import { mintDeployGitAccess, verifyDeployGitAccess } from "../src/deploy/access-token.ts";
 import { mintCapabilityToken, CAPABILITY_TTL_MS, CONTROL_PLANE_AUD } from "../src/auth/capability-token.ts";
 import { scopeId } from "../src/types.ts";
+import { singleProcessDeps } from "./support/single-process.ts";
+import { createPostgresDirectoryStore } from "../src/directory/postgres-directory-store.ts";
+import { createPostgresSessionStore } from "../src/sessions/postgres-session-store.ts";
+import { testDatabaseUrl, testDeployBackings, testMap } from "./support/test-database.ts";
+import { createPostgresReplayDedupe } from "../src/auth/replay-dedupe.ts";
+import { createPostgresGrantStore } from "../src/acl/postgres-grant-store.ts";
 
 const execFileP = promisify(execFile);
 const SECRET = "deploy-git-rw-secret".repeat(3);
@@ -31,9 +35,12 @@ const GIT_ENV = {
 };
 
 function fixture(urls: { apiBaseUrl?: string; publicUrl?: string } = {}) {
-  const deployStore = createDeployStore({ git: { repoRoot: mkdtempSync(join(tmpdir(), "git-rw-repo-")) } });
-  const acl: AclStore = createAclStore();
+  const deployStore = createDeployStore(
+    testDeployBackings({ git: { repoRoot: mkdtempSync(join(tmpdir(), "git-rw-repo-")) } }),
+  );
+  const acl: AclStore = createAclStore(createPostgresGrantStore(testDatabaseUrl()));
   const deploy = createDeployService({
+    ...singleProcessDeps(),
     deployStore,
     provider: {
       profile: { managedScaleToZero: false },
@@ -44,15 +51,20 @@ function fixture(urls: { apiBaseUrl?: string; publicUrl?: string } = {}) {
     acl,
     deployDir: mkdtempSync(join(tmpdir(), "git-rw-deploy-")),
   });
-  const identity = createIdentityService();
+  const identity = createIdentityService(testMap(), { externalMembers: testMap() });
   const app = createApp({
     deploy,
     acl,
-    directory: createDirectoryStore(),
-    sessions: createMemorySessionStore(),
+    directory: createPostgresDirectoryStore(testDatabaseUrl()),
+    sessions: createPostgresSessionStore(testDatabaseUrl()),
     identity,
   } as unknown as Parameters<typeof createApp>[0]);
-  const server: Server = createServer(app, { signingSecret: SECRET, identity, ...urls });
+  const server: Server = createServer(app, {
+    replayDedupe: createPostgresReplayDedupe(testDatabaseUrl()),
+    signingSecret: SECRET,
+    identity,
+    ...urls,
+  });
   server.listen(0);
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   return { app, deploy, acl, identity, base, close: () => new Promise<void>((r) => server.close(() => r())) };
@@ -71,19 +83,21 @@ async function gitUrl(base: string, deploymentId: string, permission: "read" | "
   return url.toString();
 }
 
-async function pushStatus(url: string): Promise<number> {
+async function gitPost(url: string, service: string, body: Buffer): Promise<Response> {
   const parsed = new URL(url);
   const authorization = `Basic ${Buffer.from(`${decodeURIComponent(parsed.username)}:${decodeURIComponent(parsed.password)}`).toString("base64")}`;
   parsed.username = "";
   parsed.password = "";
-  parsed.pathname += "/git-receive-pack";
-  return (
-    await fetch(parsed, {
-      method: "POST",
-      headers: { authorization, "content-type": "application/x-git-receive-pack-request" },
-      body: Buffer.alloc(0),
-    })
-  ).status;
+  parsed.pathname += `/${service}`;
+  return fetch(parsed, {
+    method: "POST",
+    headers: { authorization, "content-type": `application/x-${service}-request` },
+    body,
+  });
+}
+
+async function pushStatus(url: string): Promise<number> {
+  return (await gitPost(url, "git-receive-pack", Buffer.alloc(0))).status;
 }
 
 const capFor = (actorId: string, scope?: string) =>
@@ -124,6 +138,24 @@ test("a read token can clone but cannot push (403 on receive-pack)", async () =>
 
     const after = await f.deploy.listDeployments();
     assert.equal(after[0]!.versions.length, 1);
+  } finally {
+    await f.close();
+  }
+});
+
+test("a git request whose body the backend stops reading completes and leaves the endpoint working", async () => {
+  const f = fixture();
+  try {
+    const d = await f.app.deploy({
+      ownerScopeId: scopeId("personal", "U1"),
+      createdBy: "U1",
+      entrypoint: "node server.js",
+      files: [{ path: "server.js", data: "console.log('v1')" }],
+    });
+    const url = await gitUrl(f.base, d.id, "read");
+    await (await gitPost(url, "git-upload-pack", Buffer.alloc(16 * 1024 * 1024, "z"))).arrayBuffer();
+    const work = mkdtempSync(join(tmpdir(), "git-rw-clone-"));
+    await execFileP("git", ["clone", "--quiet", url, work], { env: GIT_ENV });
   } finally {
     await f.close();
   }

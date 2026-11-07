@@ -28,6 +28,7 @@ const VIEW_TITLES: Record<View, string> = {
   memory: "Memory",
   skills: "Skills",
   agents: "Agents",
+  personas: "Personas",
   settings: "Settings",
 };
 

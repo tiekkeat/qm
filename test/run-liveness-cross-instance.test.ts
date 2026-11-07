@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { testConfig } from "./support/test-config.ts";
 
 test("a run executing on another instance still reports alive", async () => {
@@ -28,7 +28,7 @@ test("a run executing on another instance still reports alive", async () => {
         origin: { kind: "human" },
       },
     });
-    const claimed = await built.runs.claim("some-other-instance", 60_000);
+    const claimed = (await built.runs.claim("some-other-instance", 60_000))[0] ?? null;
     assert.equal(claimed?.id, run.id, "the foreign worker holds the run");
 
     const view = await built.app.getRun(run.id);

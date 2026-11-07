@@ -9,10 +9,9 @@ import {
   validateCustomProviderSpec,
 } from "../src/model/custom-providers.ts";
 import { builtInModelCatalog } from "../src/model/model-catalog.ts";
-import { createCustomProviderStore } from "../src/model/custom-provider-store.ts";
-import { modelSupportedByHarness, modelServiceable, resolveModel } from "../src/model/pi-models.ts";
-import { createMemoryMap } from "../src/persistence/durable-map.ts";
-import type { StoredCustomProvider } from "../src/model/custom-provider-store.ts";
+import { createCustomProviderStore, type StoredCustomProvider } from "../src/model/model-credential-store.ts";
+import { modelSupported, modelServiceable, resolveModel } from "../src/model/pi-models.ts";
+import { testMap } from "./support/test-database.ts";
 
 afterEach(() => setCustomProviders([]));
 
@@ -26,7 +25,7 @@ const GATEWAY = {
 
 test("a registered custom model resolves with the provider's protocol and base URL", () => {
   setCustomProviders([GATEWAY]);
-  const model = resolveCustomModel("acme-large");
+  const model = resolveCustomModel("custom/acme-gateway/acme-large");
   assert.ok(model);
   assert.equal(model.provider, "acme-gateway");
   assert.equal(model.api, "openai-completions");
@@ -45,7 +44,7 @@ test("anthropic-protocol providers produce anthropic-messages models with defaul
       models: [{ id: "eu-claude" }],
     },
   ]);
-  const model = resolveCustomModel("eu-claude");
+  const model = resolveCustomModel("custom/eu-anthropic/eu-claude");
   assert.ok(model);
   assert.equal(model.api, "anthropic-messages");
   assert.equal(model.contextWindow, 128_000);
@@ -62,36 +61,39 @@ test("openai-responses survives both custom model mappings", () => {
       models: [{ id: "responses-model" }],
     },
   ]);
-  assert.equal(resolveCustomModel("responses-model")?.api, "openai-responses");
+  assert.equal(resolveCustomModel("custom/responses-gateway/responses-model")?.api, "openai-responses");
   const generated = customModelsJson() as { providers: Record<string, { api: string }> };
   assert.equal(generated.providers["responses-gateway"]?.api, "openai-responses");
 });
 
-test("resolveModel falls back to custom models; built-ins shadow custom ids", () => {
+test("custom models resolve in their own namespace, so they never shadow a built-in of the same name", () => {
   setCustomProviders([{ ...GATEWAY, models: [{ id: "acme-large" }, { id: "claude-opus-5", name: "impostor" }] }]);
-  assert.equal(resolveModel("acme-large")?.provider, "acme-gateway");
-  // The built-in claude-opus-5 must win over a custom model claiming its id.
+  assert.equal(resolveModel("custom/acme-gateway/acme-large")?.provider, "acme-gateway");
+  assert.equal(resolveModel("custom/acme-gateway/claude-opus-5")?.name, "impostor");
   assert.equal(String(resolveModel("claude-opus-5")?.provider), "anthropic");
 });
 
-test("custom models are gated to pi and mock harnesses", () => {
+test("custom models are gated to the agent", () => {
   setCustomProviders([GATEWAY]);
-  assert.equal(modelSupportedByHarness("acme-large", "pi"), true);
-  assert.equal(modelSupportedByHarness("acme-large", "mock"), true);
-  assert.equal(modelSupportedByHarness("acme-large", "claude"), false);
+  assert.equal(modelSupported("custom/acme-gateway/acme-large"), true);
 });
 
 test("a registered custom model is serviceable regardless of built-in key availability", () => {
   setCustomProviders([GATEWAY]);
-  assert.equal(modelServiceable("acme-large", { anthropic: false, openai: false, openrouter: false }), true);
+  assert.equal(
+    modelServiceable("custom/acme-gateway/acme-large", { anthropic: false, openai: false, openrouter: false }),
+    true,
+  );
 });
 
 test("catalog lists custom models; clearing the registry removes them", () => {
   setCustomProviders([GATEWAY]);
-  assert.deepEqual(customModelCatalog(), [{ id: "acme-large", name: "Acme Large", provider: "acme-gateway" }]);
+  assert.deepEqual(customModelCatalog(), [
+    { id: "custom/acme-gateway/acme-large", name: "Acme Large", provider: "acme-gateway" },
+  ]);
   setCustomProviders([]);
-  assert.equal(isCustomModelId("acme-large"), false);
-  assert.equal(resolveModel("acme-large"), undefined);
+  assert.equal(isCustomModelId("custom/acme-gateway/acme-large"), false);
+  assert.equal(resolveModel("custom/acme-gateway/acme-large"), undefined);
 });
 
 test("spec validation rejects reserved ids, bad slugs, bad URLs, and empty model lists", () => {
@@ -104,7 +106,7 @@ test("spec validation rejects reserved ids, bad slugs, bad URLs, and empty model
 });
 
 test("store round-trip: upsert encrypts the key, statuses never leak it, delete disables", async () => {
-  const backing = createMemoryMap<StoredCustomProvider>();
+  const backing = testMap<StoredCustomProvider>();
   const store = createCustomProviderStore({ backing, keyMaterial: "test-key-material" });
 
   await store.upsert(GATEWAY, "sk-secret-123", "admin@example.com");
@@ -133,7 +135,7 @@ test("store round-trip: upsert encrypts the key, statuses never leak it, delete 
 
 test("store validates specs on upsert", async () => {
   const store = createCustomProviderStore({
-    backing: createMemoryMap<StoredCustomProvider>(),
+    backing: testMap<StoredCustomProvider>(),
     keyMaterial: "k",
   });
   await assert.rejects(store.upsert({ ...GATEWAY, id: "anthropic" }, "k", "a@b.c"), /reserved/);
@@ -150,11 +152,11 @@ test("registered models surface in the catalog and vanish on unregister", () => 
     },
   ]);
   const catalog = builtInModelCatalog();
-  const entry = catalog.find((m) => m.id === "deepseek-chat");
+  const entry = catalog.find((m) => m.id === "custom/deepseek/deepseek-chat");
   assert.ok(entry, "custom model appears in the catalog");
   assert.equal(entry!.provider, "deepseek");
   setCustomProviders([]);
-  assert.ok(!builtInModelCatalog().some((m) => m.id === "deepseek-chat"));
+  assert.ok(!builtInModelCatalog().some((m) => m.id === "custom/deepseek/deepseek-chat"));
 });
 
 test("catalog cache invalidates immediately when the custom registry changes", async () => {
@@ -162,7 +164,7 @@ test("catalog cache invalidates immediately when the custom registry changes", a
   const fetcher: typeof fetch = async () => new Response(JSON.stringify({ data: [] }), { status: 200 });
   setCustomProviders([]);
   const before = await selectableModelCatalog(fetcher);
-  assert.ok(!before.some((m) => m.id === "fresh-model"));
+  assert.ok(!before.some((m) => m.id === "custom/freshco/fresh-model"));
   setCustomProviders([
     {
       id: "freshco",
@@ -175,14 +177,14 @@ test("catalog cache invalidates immediately when the custom registry changes", a
   try {
     const after = await selectableModelCatalog(fetcher);
     assert.ok(
-      after.some((m) => m.id === "fresh-model"),
+      after.some((m) => m.id === "custom/freshco/fresh-model"),
       "new registration visible without waiting out the TTL",
     );
   } finally {
     setCustomProviders([]);
   }
   const cleared = await selectableModelCatalog(fetcher);
-  assert.ok(!cleared.some((m) => m.id === "fresh-model"), "removal visible immediately too");
+  assert.ok(!cleared.some((m) => m.id === "custom/freshco/fresh-model"), "removal visible immediately too");
 });
 
 for (const field of ["contextWindow", "maxTokens"] as const) {
@@ -207,19 +209,19 @@ for (const protocol of ["openai", "openai-responses", "anthropic"] as const) {
   for (const reasoning of [undefined, false, true]) {
     test(`custom ${protocol} reasoning=${reasoning} survives persistence and runtime mappings`, async () => {
       const spec = { ...GATEWAY, protocol, models: [{ ...GATEWAY.models[0]!, reasoning }] };
-      const backing = createMemoryMap<StoredCustomProvider>();
+      const backing = testMap<StoredCustomProvider>();
       const store = createCustomProviderStore({ backing, keyMaterial: "reasoning-test" });
       await store.upsert(spec, "local", "admin@example.com");
       const reloaded = createCustomProviderStore({ backing, keyMaterial: "reasoning-test" });
       setCustomProviders(await reloaded.enabled());
-      const model = resolveCustomModel("acme-large")!;
+      const model = resolveCustomModel("custom/acme-gateway/acme-large")!;
       assert.equal(model.reasoning, reasoning ?? false);
       const json = customModelsJson() as {
         providers: Record<string, { models: Array<{ reasoning: boolean; cost: typeof model.cost }> }>;
       };
       assert.equal(json.providers[spec.id]!.models[0]!.reasoning, reasoning ?? false);
       assert.deepEqual(json.providers[spec.id]!.models[0]!.cost, model.cost);
-      assert.deepEqual((await reloaded.statuses())[0]!.models, spec.models);
+      assert.deepEqual((await reloaded.statuses())[0]!.models, JSON.parse(JSON.stringify(spec.models)));
     });
   }
 }

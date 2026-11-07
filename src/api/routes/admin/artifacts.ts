@@ -8,6 +8,7 @@ import { audit, requireScopedAdmin } from "../shared.ts";
 import { type ApiCtx } from "../route.ts";
 import { notifyOwnerOfCronEdit } from "../../../triggers/edit-notice.ts";
 import { requireScopedResource } from "./common.ts";
+import { unattendedGrantRefusal } from "../../../cron/authority.ts";
 
 function isAdminCronDestination(v: unknown): v is Destination {
   if (typeof v !== "object" || v === null) return false;
@@ -136,6 +137,15 @@ export async function putAdminCronDestination(ctx: ApiCtx): Promise<void> {
   const { actor, record: cron } = scoped;
   if (typeof body !== "object" || body === null || !("destination" in body)) {
     return sendJson(res, 400, { error: "bad_request", message: "destination is required; use null to clear" });
+  }
+  if ((cron.unattendedGrants?.length ?? 0) > 0) {
+    const refusal = await unattendedGrantRefusal(
+      app,
+      deps.admin,
+      cron,
+      ctx.capability ?? { actorId: actor.id, liveActor: true },
+    );
+    if (refusal) return sendJson(res, 409, { error: "conflict", message: refusal.message });
   }
   const destination = (body as { destination: unknown }).destination;
   if (destination !== null && !isAdminCronDestination(destination)) {

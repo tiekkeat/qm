@@ -8,6 +8,7 @@ export type ModelMetadata = Pick<
   label: string;
   buttonLabel: string;
   fastMode: boolean;
+  effortLevels?: string[];
   effortLevelsByHarness?: Record<string, string[]>;
 };
 

@@ -3,13 +3,16 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createDeployStore } from "../src/deploy/deploy-store.ts";
+import { createDeployStore, type DeployStore } from "../src/deploy/deploy-store.ts";
 import { createDeployService } from "../src/deploy/deploy-service.ts";
 import { createAclStore } from "../src/acl/acl-store.ts";
 import type { LeaderLease } from "../src/persistence/leader-lease.ts";
-import type { AdvisoryLock } from "../src/persistence/advisory-lock.ts";
+import { createNoopAdvisoryLock, type AdvisoryLock } from "../src/persistence/advisory-lock.ts";
 import type { DeployProvider } from "../src/deploy/deploy-provider.ts";
 import { scopeId } from "../src/types.ts";
+import { singleProcessDeps } from "./support/single-process.ts";
+import { testDeployBackings, testDatabaseUrl, testAdvisoryLock } from "./support/test-database.ts";
+import { createPostgresGrantStore } from "../src/acl/postgres-grant-store.ts";
 
 const nonLeaderLease: LeaderLease = {
   async hold() {
@@ -18,7 +21,7 @@ const nonLeaderLease: LeaderLease = {
 };
 
 function svc(opts: { lease?: LeaderLease; lock?: AdvisoryLock; managed?: boolean } = {}) {
-  const deployStore = createDeployStore();
+  const deployStore = createDeployStore(testDeployBackings());
   let destroys = 0;
   const provider: DeployProvider = {
     profile: { managedScaleToZero: opts.managed ?? false },
@@ -28,10 +31,11 @@ function svc(opts: { lease?: LeaderLease; lock?: AdvisoryLock; managed?: boolean
     },
   };
   const deploy = createDeployService({
+    ...singleProcessDeps(),
     deployStore,
     provider,
     auditLog: { record() {}, events: async () => [], tail: async () => [] },
-    acl: createAclStore(),
+    acl: createAclStore(createPostgresGrantStore(testDatabaseUrl())),
     deployDir: mkdtempSync(join(tmpdir(), "concurrency-")),
     ...(opts.lease ? { leaderLease: opts.lease } : {}),
     ...(opts.lock ? { advisoryLock: opts.lock } : {}),
@@ -78,6 +82,7 @@ test("reaper: the leader (default no-op lease) reaps as before", async () => {
 function spyLock(): { lock: AdvisoryLock; keys: string[] } {
   const keys: string[] = [];
   const lock: AdvisoryLock = {
+    ...createNoopAdvisoryLock(),
     async withLock(key, fn) {
       keys.push(key);
       return fn();
@@ -106,7 +111,7 @@ test("withDeployLock: redeploy/rollback/archive each acquire the advisory mutex 
 });
 
 test("withDeployLock: same-instance lifecycle ops still serialize (no overlap)", async () => {
-  const deployStore = createDeployStore();
+  const deployStore = createDeployStore(testDeployBackings());
   let active = 0;
   let maxActive = 0;
   const provider: DeployProvider = {
@@ -121,10 +126,11 @@ test("withDeployLock: same-instance lifecycle ops still serialize (no overlap)",
     destroy: async () => {},
   };
   const deploy = createDeployService({
+    ...singleProcessDeps(),
     deployStore,
     provider,
     auditLog: { record() {}, events: async () => [], tail: async () => [] },
-    acl: createAclStore(),
+    acl: createAclStore(createPostgresGrantStore(testDatabaseUrl())),
     deployDir: mkdtempSync(join(tmpdir(), "serialize-")),
   });
   const d = await deploy.deploy({
@@ -141,8 +147,8 @@ test("withDeployLock: same-instance lifecycle ops still serialize (no overlap)",
 });
 
 test("first publication and an update discovered while it deploys serialize across service instances", async () => {
-  const store = createDeployStore();
-  const lock = (await import("../src/persistence/advisory-lock.ts")).createMemoryAdvisoryLock();
+  const store = createDeployStore(testDeployBackings());
+  const lock = testAdvisoryLock();
   const entered = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
   const applied: number[] = [];
@@ -159,10 +165,11 @@ test("first publication and an update discovered while it deploys serialize acro
     },
   };
   const deps = {
+    ...singleProcessDeps(),
     deployStore: store,
     provider,
     advisoryLock: lock,
-    acl: createAclStore(),
+    acl: createAclStore(createPostgresGrantStore(testDatabaseUrl())),
     auditLog: { record() {}, events: async () => [], tail: async () => [] },
     deployDir: mkdtempSync(join(tmpdir(), "initial-publish-lock-")),
   };
@@ -185,3 +192,69 @@ test("first publication and an update discovered while it deploys serialize acro
   assert.deepEqual(applied, [1, 2]);
   assert.equal((await store.get(app.id))!.appliedVersion, 2);
 });
+function copyingDeployStore(): DeployStore {
+  return createDeployStore(testDeployBackings());
+}
+
+for (const [visit, stop, status] of [
+  ["reach", "archive", "archived"],
+  ["reach", "idle reap", "stopped"],
+  ["keep-warm", "archive", "archived"],
+] as const) {
+  test(`withDeployLock: a ${visit} waiting on the ${stop} leaves the app ${status} and never re-applies it`, async () => {
+    const deployStore = copyingDeployStore();
+    let applies = 0;
+    const destroying = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const resolving = Promise.withResolvers<void>();
+    const provider: DeployProvider = {
+      profile: { managedScaleToZero: false },
+      apply: async () => {
+        applies++;
+        return { host: "127.0.0.1", port: 5000 };
+      },
+      resolveEndpoint: async () => {
+        resolving.resolve();
+        return null;
+      },
+      destroy: async () => {
+        destroying.resolve();
+        await release.promise;
+      },
+    };
+    const deploy = createDeployService({
+      ...singleProcessDeps(),
+      deployStore,
+      provider,
+      auditLog: { record() {}, events: async () => [], tail: async () => [] },
+      acl: createAclStore(createPostgresGrantStore(testDatabaseUrl())),
+      deployDir: mkdtempSync(join(tmpdir(), "reach-stop-")),
+    });
+    const d = await deploy.deploy({
+      ownerScopeId: scopeId("personal", "U1"),
+      createdBy: "U1",
+      entrypoint: "x",
+      files: [],
+      alwaysOn: visit === "keep-warm",
+    });
+    const stopping = stop === "archive" ? deploy.archiveDeployment(d.id) : deploy.reapIdleDeployments(60_000, future);
+    await destroying.promise;
+    let settled = false;
+    const visiting = (visit === "reach" ? deploy.reachDeployment(d.id, "U1") : deploy.maintainDeployments()).finally(
+      () => {
+        settled = true;
+      },
+    );
+    await resolving.promise;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(settled, false, `the ${visit} waits while the ${stop} holds the deploy lock`);
+    release.resolve();
+    await stopping;
+    const result = await visiting;
+    assert.equal(applies, 1, `the waiting ${visit} does not re-apply the ${status} app`);
+    const after = (await deployStore.get(d.id))!;
+    assert.equal(after.status, status, `the app stays ${status}`);
+    assert.equal(after.endpoint, null);
+    assert.deepEqual(result, visit === "reach" ? { status: "not_found" } : 0);
+  });
+}

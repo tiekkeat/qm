@@ -8,14 +8,14 @@ import { createLoopItemLedger } from "../src/loops/item-ledger.ts";
 import { createLoopOutputStore } from "../src/loops/output-store.ts";
 import { createShipGrantStore } from "../src/loops/ship-grant-store.ts";
 import { createCronStore } from "../src/cron/cron-store.ts";
-import { createMemoryConfigStore } from "../src/resolution/config-store.ts";
-import { ensureInboxLoop, INBOX_SYNC_TASK_VERSION, renderSourceInboxTask } from "../src/loops/inbox-loop.ts";
-import type { Cron, Loop, LoopItem } from "../src/types.ts";
+import { ensureDefaultInboxLoops, renderSourceInboxTask } from "../src/loops/inbox-loop.ts";
+import type { Cron } from "../src/triggers/types.ts";
+import type { Loop, LoopItem } from "../src/loops/types.ts";
 import type { LedgerItemView } from "../src/loops/ledger-view.ts";
 import type { SlackUserClient } from "../src/loops/sources/adapter.ts";
-import { createMemoryAdvisoryLock } from "../src/persistence/advisory-lock.ts";
-import { ensureDefaultInboxLoops } from "../src/loops/inbox-loop.ts";
 import { sleep } from "../src/util/async.ts";
+import { testConfigStore, testDatabaseUrl, testMap } from "./support/test-database.ts";
+import { createPostgresCronFireStore } from "../src/cron/fire-store.ts";
 
 function fakeRes() {
   const out = { status: 0, body: undefined as unknown };
@@ -50,12 +50,12 @@ let cronSeq = 0;
 function world(over: { tokens?: boolean; fire?: boolean } = {}): World {
   const w: World = {
     loops: {
-      store: createLoopStore(),
-      items: createLoopItemLedger(),
-      outputs: createLoopOutputStore(),
-      grants: createShipGrantStore(),
-      crons: createCronStore(),
-      config: createMemoryConfigStore("org"),
+      store: createLoopStore(testMap()),
+      items: createLoopItemLedger(testMap()),
+      outputs: createLoopOutputStore(testMap()),
+      grants: createShipGrantStore(testMap()),
+      crons: createCronStore(testMap(), { fires: createPostgresCronFireStore(testDatabaseUrl()) }),
+      config: testConfigStore("org"),
     },
     crons: new Map(),
     sent: [],
@@ -177,11 +177,11 @@ const ITEM = {
   snippet: "can you review my launch post?",
   receivedAt: 1234,
   draft: { body: "Looking now — back to you within the hour." },
-  slack: { channelId: "C1", ts: "1.2" },
+  slack: { channelId: "C1", ts: "1.2", isDirectMessage: false },
 };
 
-async function inboxLoop(w: World): Promise<Loop> {
-  return ensureInboxLoop(w.loops.store, "josh");
+async function inboxLoop(w: World, source = "slack"): Promise<Loop> {
+  return (await ensureDefaultInboxLoops(w.loops.store, "josh")).find((loop) => loop.sources?.includes(source))!;
 }
 
 async function seed(
@@ -347,7 +347,7 @@ test("listing returns the ledger view with per-state counts and filters", async 
   assert.equal(body.items.length, 1);
   assert.equal(body.items[0]!.state, "held");
   assert.equal(body.items[0]!.dedupeKey, "C1:1.2");
-  assert.deepEqual(body.items[0]!.sourcePayload.slack, { channelId: "C1", ts: "1.2" });
+  assert.deepEqual(body.items[0]!.sourcePayload.slack, { channelId: "C1", ts: "1.2", isDirectMessage: false });
   assert.deepEqual(body.counts, { held: 1 });
   const heldOnly = await call(w, { method: "GET", path: `/v1/loops/${loop.id}/items?state=held` });
   assert.equal((heldOnly.body as { items: unknown[] }).items.length, 1);
@@ -499,71 +499,6 @@ test("a reaction slack refuses leaves the item untouched", async () => {
   assert.equal(stored?.sourcePayload?.reactions, undefined);
 });
 
-test("replied closes an item the person answered outside QM and keeps their words", async () => {
-  const w = world();
-  const { loop, item } = await seed(w);
-  const out = await call(w, {
-    method: "POST",
-    path: `/v1/loops/${loop.id}/items/${item.id}/action`,
-    body: { kind: "replied", args: { text: "  Answered in the thread.  " } },
-  });
-  assert.equal(out.status, 200, JSON.stringify(out.body));
-  const view = (out.body as { item: LedgerItemView }).item;
-  assert.equal(view.state, "dismissed");
-  assert.equal(view.actionKind, "replied");
-  assert.equal(view.actionResult, "Answered in the thread.");
-  assert.equal(w.sent.length, 0, "closing a loop externally never touches the source");
-});
-
-test("replied reopens like any dismissal and never demotes what was sent from here", async () => {
-  const w = world();
-  const { loop, item } = await seed(w);
-  await call(w, {
-    method: "POST",
-    path: `/v1/loops/${loop.id}/items/${item.id}/action`,
-    body: { kind: "replied", args: { text: "handled it" } },
-  });
-  const reopened = await call(w, {
-    method: "POST",
-    path: `/v1/loops/${loop.id}/items/${item.id}/action`,
-    body: { kind: "reopen" },
-  });
-  const view = (reopened.body as { item: LedgerItemView }).item;
-  assert.equal(view.state, "held");
-  assert.equal(view.actionKind, undefined);
-  assert.equal(view.actionResult, undefined);
-
-  await w.loops.items.recordAction(item.id, { kind: "send", outcome: "actioned" });
-  const late = await call(w, {
-    method: "POST",
-    path: `/v1/loops/${loop.id}/items/${item.id}/action`,
-    body: { kind: "replied", args: { text: "too late" } },
-  });
-  assert.equal(late.status, 409);
-  assert.equal((await w.loops.items.get(item.id))?.actionKind, "send");
-});
-
-test("a replied text longer than the cap is clipped, and an absent one still closes the item", async () => {
-  const w = world();
-  const { loop, item } = await seed(w);
-  const clipped = await call(w, {
-    method: "POST",
-    path: `/v1/loops/${loop.id}/items/${item.id}/action`,
-    body: { kind: "replied", args: { text: "x".repeat(900) } },
-  });
-  assert.equal((clipped.body as { item: LedgerItemView }).item.actionResult?.length, 500);
-
-  const bare = await seed(world());
-  const out = await call(bare.w, {
-    method: "POST",
-    path: `/v1/loops/${bare.loop.id}/items/${bare.item.id}/action`,
-    body: { kind: "replied" },
-  });
-  const view = (out.body as { item: LedgerItemView }).item;
-  assert.equal(view.state, "dismissed");
-  assert.equal(view.actionResult, undefined);
-});
-
 test("an action kind the source does not know is handed to the agent", async () => {
   const w = world();
   const { loop, item } = await seed(w);
@@ -669,8 +604,7 @@ test("the inbox resolver reports no loop until sync is set up", async () => {
   assert.equal((before.body as { loop: Loop | null }).loop, null);
   const created = await call(w, { method: "POST", path: "/v1/loops/inbox/sync-cron", body: {} });
   assert.equal(created.status, 200);
-  const body = created.body as { loop: Loop; syncCron: { id: string; taskVersion: number } };
-  assert.equal(body.syncCron.taskVersion, INBOX_SYNC_TASK_VERSION);
+  const body = created.body as { loop: Loop; syncCron: { id: string } };
   assert.equal(body.loop.surface, "inbox:gmail");
   const stored = w.crons.get(body.syncCron.id)!;
   assert.equal(stored.ownerScopeId, "personal:josh");
@@ -686,11 +620,17 @@ test("sync-cron is created once, refreshes stale task text, and disables on requ
   const created = await call(w, { method: "POST", path: "/v1/loops/inbox/sync-cron", body: {} });
   const syncCron = (created.body as { syncCron: { id: string } }).syncCron;
   const stored = w.crons.get(syncCron.id)!;
-  w.crons.set(syncCron.id, { ...stored, action: "Inbox sync v0. old", enabled: false });
+  const loopId = (created.body as { loop: Loop }).loop.id;
+  const current = renderSourceInboxTask(loopId, "gmail");
+  w.crons.set(syncCron.id, {
+    ...stored,
+    action: "Older wording.",
+    enabled: false,
+  });
   const refreshed = await call(w, { method: "POST", path: "/v1/loops/inbox/sync-cron", body: {} });
-  const after = (refreshed.body as { syncCron: { id: string; taskVersion: number; enabled: boolean } }).syncCron;
+  const after = (refreshed.body as { syncCron: { id: string; enabled: boolean } }).syncCron;
   assert.equal(after.id, syncCron.id);
-  assert.equal(after.taskVersion, INBOX_SYNC_TASK_VERSION);
+  assert.equal(w.crons.get(syncCron.id)!.action, current);
   assert.equal(after.enabled, true);
   assert.equal(w.crons.size, 2);
   const disabled = await call(w, { method: "POST", path: "/v1/loops/inbox/sync-cron", body: { enabled: false } });
@@ -717,7 +657,7 @@ test("a send carrying the draft it saw is refused when the agent redrafted in be
     body: { kind: "send", args: { proposal: { body: "what I saw" }, expectedProposalAt: seenAt } },
   });
   assert.equal(stale.status, 409);
-  assert.match((stale.body as { message: string }).message, /draft changed/);
+  assert.equal((stale.body as { error: string }).error, "draft_changed");
   assert.equal(w.sent.length, 0, "nothing reached Slack");
   const fresh = (await w.loops.items.get(item.id))!.proposal!;
   assert.equal(fresh.by, "agent", "the stale edit did not overwrite the newer draft");
@@ -754,7 +694,7 @@ test("an edit carrying the draft it was based on is refused when the agent redra
     body: { kind: "edit", args: { proposal: { body: "typed over the old one" }, expectedProposalAt: basedOn } },
   });
   assert.equal(stale.status, 409);
-  assert.match((stale.body as { message: string }).message, /draft changed/);
+  assert.equal((stale.body as { error: string }).error, "draft_changed");
   assert.deepEqual((await w.loops.items.get(item.id))!.proposal!.data, { body: "newer agent draft" });
 });
 
@@ -769,7 +709,11 @@ test("a person's own typed mention stays live, while a capability caller's is di
   });
   assert.equal(human.status, 200, JSON.stringify(human.body));
   assert.equal((w.sent.at(-1)!.body as { text: string }).text, "Heads up <!channel>");
-  const second = await seed(w, { ...ITEM, sourceKey: "t2", slack: { channelId: "C1", ts: "9.9" } });
+  const second = await seed(w, {
+    ...ITEM,
+    sourceKey: "t2",
+    slack: { channelId: "C1", ts: "9.9", isDirectMessage: false },
+  });
   const agent = await call(w, {
     method: "POST",
     path: `/v1/loops/${second.loop.id}/items/${second.item.id}/action`,
@@ -812,27 +756,6 @@ test("concurrent source sends share a durable decision claim", async () => {
   assert.equal((await w.loops.items.get(item.id))!.decisionToken, undefined);
 });
 
-test("legacy and canonical item URLs serialize a concurrent send", async () => {
-  const w = world();
-  w.loops.lock = createMemoryAdvisoryLock();
-  const { loop, item } = await seed(w);
-  const defaults = await ensureDefaultInboxLoops(w.loops.store, "josh");
-  const target = defaults.find((value) => value.sources?.includes("slack"))!;
-  await w.loops.items.moveSource(loop.id, target.id, "slack");
-  const results = await Promise.all(
-    [loop.id, target.id].map((id) =>
-      call(w, {
-        method: "POST",
-        path: `/v1/loops/${id}/items/${item.id}/action?principalId=josh`,
-        body: { kind: "send" },
-        capability: PORTAL,
-      }),
-    ),
-  );
-  assert.deepEqual(results.map((result) => result.status).sort(), [200, 409]);
-  assert.equal(w.sent.length, 1);
-});
-
 test("a conversational send refuses a stale draft before starting an agent turn", async () => {
   const w = world();
   const { loop, item } = await seed(w);
@@ -842,6 +765,7 @@ test("a conversational send refuses a stale draft before starting an agent turn"
     body: { message: "Send it", expectedProposalAt: item.proposal!.at - 1 },
   });
   assert.equal(out.status, 409);
+  assert.equal((out.body as { error: string }).error, "draft_changed");
   assert.deepEqual(w.followUps, []);
   assert.deepEqual(w.sent, []);
   const accepted = await call(w, {
@@ -853,15 +777,18 @@ test("a conversational send refuses a stale draft before starting an agent turn"
   assert.equal(w.followUps.length, 1);
 });
 
-test("inbox list refreshes open Gmail items before returning counts, but not another owner's loop", async () => {
+test("inbox list refreshes open Gmail items before returning, but not another owner's loop", async () => {
   const w = world();
-  const loop = await ensureInboxLoop(w.loops.store, "josh");
+  const loop = await inboxLoop(w, "gmail");
   const refreshes: string[] = [];
-  // Exercise the route with the real refresher via the same dependency used by wiring.
   const { createInboxSourceRefresh } = await import("../src/loops/inbox-source-refresh.ts");
+  const queued: unknown[] = [];
   w.sourceRefresh = createInboxSourceRefresh({
     featureFlags: { enabled: async () => true },
     items: w.loops.items,
+    enqueue: async (_loop, entries) => {
+      queued.push(...entries.map((entry) => entry.sourcePayload?.latestEvent));
+    },
     tokens: { connectorAccessToken: async () => "synthetic" },
     directory: { getBySlackId: async () => null },
     fetchImpl: async (url) => {
@@ -889,70 +816,28 @@ test("inbox list refreshes open Gmail items before returning counts, but not ano
   assert.equal(refreshes.length, 0);
   const result = await call(w, { method: "GET", path: `/v1/loops/${loop.id}/items` });
   assert.equal(result.status, 200);
-  assert.equal((result.body as { counts: Record<string, number> }).counts.dismissed, 1);
+  assert.deepEqual(queued, [{ author: "owner", at: 2000, text: "Already replied" }]);
   assert.equal(refreshes.length, 1);
 });
 
-test("Slack thread keys reuse a legacy item's identity, edits, and replied watermark", async () => {
+test("ordinary item reads only hydrate Slack with the refresh flag", async () => {
   const w = world();
-  const loop = await ensureInboxLoop(w.loops.store, "josh");
-  await w.loops.items.ingest([
-    {
-      loopId: loop.id,
-      dedupeKey: "D1",
-      source: "slack",
-      sourceAt: 2000,
-      sourcePayload: { slack: { channelId: "D1", ts: "1.0", threadTs: "1.0" } },
-      proposal: { by: "human", data: { body: "Keep this edit" } },
-    },
-  ]);
-  const [original] = await w.loops.items.byLoop(loop.id);
-  const ingest = () =>
-    call(w, {
-      method: "POST",
-      path: `/v1/loops/${loop.id}/items`,
-      body: {
-        items: [
-          {
-            ...ITEM,
-            sourceKey: "D1:1.0",
-            receivedAt: 2000,
-            slack: { channelId: "D1", ts: "2.0", threadTs: "1.0" },
-            draft: { body: "Agent replacement" },
-          },
-        ],
-      },
-    });
-  assert.equal((await ingest()).status, 200);
-  assert.equal((await w.loops.items.byLoop(loop.id)).length, 1);
-  assert.equal((await w.loops.items.get(original!.id))!.proposal!.data.body, "Keep this edit");
-  await w.loops.items.recordAction(original!.id, { kind: "replied", outcome: "dismissed", sourceAt: 3000 });
-  await ingest();
-  assert.equal((await w.loops.items.byLoop(loop.id)).length, 1);
-  assert.equal((await w.loops.items.get(original!.id))!.status, "skipped");
+  const loop = await inboxLoop(w);
+  await w.loops.items.ingest([{ loopId: loop.id, dedupeKey: "slack", source: "slack", sourcePayload: {} }]);
+  const [item] = await w.loops.items.byLoop(loop.id);
+  let refreshes = 0;
+  w.sourceRefresh = async () => {
+    refreshes++;
+  };
+  await call(w, { method: "GET", path: `/v1/loops/${loop.id}/items/${item!.id}` });
+  assert.equal(refreshes, 0);
+  await call(w, { method: "GET", path: `/v1/loops/${loop.id}/items/${item!.id}?refreshSource=1` });
+  assert.equal(refreshes, 1);
 });
-
-for (const migrated of [false, true])
-  test(`ordinary item reads only hydrate Slack with the refresh flag (migrated=${migrated})`, async () => {
-    const w = world();
-    const loop = migrated
-      ? (await ensureDefaultInboxLoops(w.loops.store, "josh")).find((loop) => loop.sources?.includes("slack"))!
-      : await ensureInboxLoop(w.loops.store, "josh");
-    await w.loops.items.ingest([{ loopId: loop.id, dedupeKey: "slack", source: "slack", sourcePayload: {} }]);
-    const [item] = await w.loops.items.byLoop(loop.id);
-    let refreshes = 0;
-    w.sourceRefresh = async () => {
-      refreshes++;
-    };
-    await call(w, { method: "GET", path: `/v1/loops/${loop.id}/items/${item!.id}` });
-    assert.equal(refreshes, 0);
-    await call(w, { method: "GET", path: `/v1/loops/${loop.id}/items/${item!.id}?refreshSource=1` });
-    assert.equal(refreshes, 1);
-  });
 
 test("a new Slack thread cannot overwrite an unrelated unthreaded DM card", async () => {
   const w = world();
-  const loop = await ensureInboxLoop(w.loops.store, "josh");
+  const loop = await inboxLoop(w);
   await w.loops.items.ingest([
     {
       loopId: loop.id,
@@ -987,7 +872,7 @@ test("a new Slack thread cannot overwrite an unrelated unthreaded DM card", asyn
 test("followup accepts only typed runtime and staged attachment fields", async () => {
   const w = world();
   const { loop, item } = await seed(w);
-  const path = `/v1/loops/${loop.id}/items/${item.id}/followup`;
+  const path = `/v1/loops/${loop.id}/items/${item.id}/followup?principalId=josh`;
   let received: unknown;
   w.loops.fire!.followUp = async (_loop, held, _message, _actor, options) => {
     received = options;
@@ -995,7 +880,6 @@ test("followup accepts only typed runtime and staged attachment fields", async (
   };
   const options = {
     model: "gpt-5.6-terra",
-    harness: "pi",
     thinkingLevel: "high",
     fastMode: true,
     attachments: [{ name: "notes.txt", mimetype: "text/plain", sizeBytes: 20, blobId: "opaque-upload" }],
@@ -1007,18 +891,21 @@ test("followup accepts only typed runtime and staged attachment fields", async (
       message: "",
       ...options,
       model: ` ${options.model} `,
-      harness: " pi ",
       thinkingLevel: " high ",
       attachments: [{ ...options.attachments[0], path: "/ignored" }],
       scopeId: "personal:other",
     },
+    capability: PORTAL,
   });
   assert.equal(out.status, 200);
   assert.deepEqual(received, options);
+  received = undefined;
+  const agent = await call(w, { method: "POST", path, body: { message: "hi", attachments: options.attachments } });
+  assert.equal(agent.status, 403);
+  assert.equal(received, undefined);
   for (const invalid of [
     { model: 5 },
     { model: " " },
-    { harness: " " },
     { thinkingLevel: " " },
     { fastMode: null },
     { attachments: null },
@@ -1027,7 +914,6 @@ test("followup accepts only typed runtime and staged attachment fields", async (
     { attachments: [{ ...options.attachments[0], blobId: "" }] },
     { attachments: [{ ...options.attachments[0], sizeBytes: 1.5 }] },
     { attachments: [{ ...options.attachments[0], sizeBytes: 1_000_000_001 }] },
-    { harness: "unknown" },
     { thinkingLevel: "unsupported" },
     { fastMode: "true" },
     { attachments: [{ path: "/etc/passwd" }] },
@@ -1035,14 +921,14 @@ test("followup accepts only typed runtime and staged attachment fields", async (
     { attachments: Array(11).fill(options.attachments[0]) },
   ]) {
     received = undefined;
-    const bad = await call(w, { method: "POST", path, body: { message: "hello", ...invalid } });
+    const bad = await call(w, { method: "POST", path, body: { message: "hello", ...invalid }, capability: PORTAL });
     assert.equal(bad.status, 400, JSON.stringify(invalid));
     assert.equal(received, undefined);
   }
 });
 
 test("email classification is scoped to the owner's flagged personal inbox", async () => {
-  for (const surface of [undefined, "inbox", "inbox:gmail", "inbox:slack"]) {
+  for (const surface of [undefined, "inbox:gmail", "inbox:slack"]) {
     for (const enabled of [false, true]) {
       for (const source of ["gmail", "slack"]) {
         const w = world();
@@ -1055,7 +941,7 @@ test("email classification is scoped to the owner's flagged personal inbox", asy
           successCondition: "Messages reviewed",
           surface,
         });
-        const classified = enabled && source === "gmail" && (surface === "inbox" || surface === "inbox:gmail");
+        const classified = enabled && source === "gmail" && surface === "inbox:gmail";
         const flagEnabled = async (flag: string, scope: string) => {
           assert.equal(flag, "inbox_loops");
           assert.equal(scope, "personal:josh");
@@ -1134,7 +1020,7 @@ test("only a person overrides triage, and archiving a whole group resolves its m
   await call(w, {
     method: "POST",
     path: `/v1/loops/${loop.id}/items`,
-    body: { items: [{ ...ITEM, sourceKey: "C2:1.3", slack: { channelId: "C2", ts: "1.3" } }] },
+    body: { items: [{ ...ITEM, sourceKey: "C2:1.3", slack: { channelId: "C2", ts: "1.3", isDirectMessage: false } }] },
   });
   await w.loops.store.update(loop.id, {
     triage: { prioritize: { enabled: true }, consolidate: { enabled: true } },
@@ -1169,7 +1055,7 @@ test("only a person overrides triage, and archiving a whole group resolves its m
 test("an owner cannot trigger Slack avatar enrichment through item detail when Inbox is disabled", async () => {
   const { createInboxSourceRefresh } = await import("../src/loops/inbox-source-refresh.ts");
   const w = world();
-  const loop = await ensureInboxLoop(w.loops.store, "josh");
+  const loop = await inboxLoop(w);
   await w.loops.items.ingest([
     {
       loopId: loop.id,
@@ -1188,6 +1074,7 @@ test("an owner cannot trigger Slack avatar enrichment through item detail when I
   };
   w.sourceRefresh = createInboxSourceRefresh({
     items: w.loops.items,
+    enqueue: async () => undefined,
     featureFlags: { enabled },
     tokens: { connectorAccessToken: async () => assert.fail("disabled Inbox must not read credentials") },
     directory: { getBySlackId: async () => assert.fail("disabled Inbox must not read the directory") },

@@ -1,9 +1,9 @@
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, chmodSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { keychainCodexAuthStore } from "../src/harness/codex-auth-store.ts";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { chatgptAuthFromValue } from "../src/model/chatgpt-auth-file.ts";
 import {
   companyChatGPTAuthFromStore,

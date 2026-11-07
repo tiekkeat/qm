@@ -8,8 +8,7 @@ with a `Swarm worker` title. Worker transcripts remain read-only for ordinary me
 
 ## Deployment
 
-Use Postgres for production (`DATABASE_URL`, `SESSION_STORE=postgres`, and
-`RUN_STORE=postgres`) (sandbox resources are always on). Configure a sandbox backend with its required
+Sandbox resources are always on. Configure a sandbox backend with its required
 credentials and deployment-specific settings. Workers use the provider of the scope's selected computer, or the deployment default when none is selected. An initial
 `backend` override chooses another configured provider that supports creation and
 retirement. That choice is stored once; later default changes never move workers
@@ -29,7 +28,7 @@ mixed memory/Postgres stores so execution leases and writes share one authority.
 
 ## Agent API
 
-These routes appear in `/v1/apis` and work from every harness that can use QM's
+These routes appear in `/v1/apis` and work from every agent turn that can use QM's
 self-API. Use the existing `x-agent-capability: $AGENT_API_TOKEN` header. Swarm
 operations require a token bound to the current session and a real durable run.
 An agent using a token minted during a human turn is still an **agent**, not a
@@ -66,9 +65,11 @@ unavailable model fails closed at dispatch.
 Optional `settings` overrides the defaults below at initial spawn. The backend
 can configure defaults with `SWARM_DEFAULTS`, a JSON object such as
 `{"agents":16,"turnMs":900000}`. Values must be positive safe integers within the
-safety bounds; unknown settings are rejected. Resolved settings and the chosen
-`backend` are stored once. Identical initial requests can be retried; subsequent
-spawns inherit the settings and cannot reconfigure the swarm.
+safety bounds; unknown settings are rejected. Resolved settings and the chosen `backend` are stored once. Identical
+initial requests can be retried. Later spawns by the root session may pass
+`settings` again to change any setting except `turnMs` (for example, to raise
+`agents`); workers inherit the settings and cannot reconfigure the swarm. The
+backend cannot change after creation.
 
 Omit `count` to spawn one; `contexts` also determines the count when provided. A
 single `context` supplies the same initial JSON to every worker. Context may be any
@@ -108,14 +109,14 @@ never retires the existing forum.
 
 ### Identity, peers, and character
 
-`GET /v1/swarm` returns `id`, `self`, `peers`, `backend`, `settings`, and `expiresAt`. Peer
+`GET /v1/swarm` returns `id`, `self`, `peers`, `backend`, `settings`, and `expiresAt` when a work window is set. Peer
 records keep trusted IDs, ancestry, session links, storage selection, and lifecycle
 state separate from arbitrary `context` data. Only this swarm is listed, not every
 session with the same owner, and never all private sessions in the organization.
 
 `POST /v1/swarm` with `{"action":"context","context":{"role":"reviewer"}}`
 replaces the caller's own context. There is no update-other-peer operation. The
-character is supplied to the harness as untrusted metadata on subsequent turns.
+character is supplied to the agent as untrusted metadata on subsequent turns.
 Setting fields such as `id`, `scopeId`, or `depth` in context changes no authority.
 
 ### Messages and audience selection
@@ -144,18 +145,75 @@ them even if they were not in the intended audience. Root and worker participant
 rosters must remain the original roster; changes fail closed. Current scope and
 identity authorization is rechecked before access and execution.
 
-Notification state is persisted as `pending`, `queued` with a durable `runId`, or
-`failed`. A queued notification means the run was accepted, not that the agent has
+Notification state is persisted as `pending`, `mailbox`, `queued` with a durable
+`runId`, `handed`, or `failed`. A queued notification means the run was accepted, not that the agent has
 finished. Idle recipients wake through the normal durable worker queue. Active
 recipients receive queued unattended turns, not forged human steer signals.
 Notification enqueue uses a stable deduplication key so a crash between enqueue
 and acknowledgment does not enqueue another run. Agent-only turns have no Slack
 delivery target, and the delivery layer also refuses swarm result delivery.
 
-Set `notify:false` for a durable message without a wakeup. Sending to oneself does
-not wake oneself. There are no automatic reply-to-reply notifications: agents
-explicitly decide whether a response warrants another turn. Every generated turn
-consumes the same finite notification budget.
+By default a message wakes its recipients. With `wake:false` each recipient
+gets a `mailbox` notification instead: no turn runs,
+and the message is handed to the recipient at the start of its next turn, whatever
+starts it, or to a running goal turn like a queued message. They count as delivered
+once the turn's opening entry that carries them is saved, even if that turn later
+stops or fails, because they are already in its transcript. Wake when the recipient
+must act or answer; use `wake:false` for status, findings, and acks it can act on
+later. An idle recipient sees a `wake:false` message only when something else wakes it.
+Turns outside swarm delivery see their mailbox only while the swarm's
+participant rosters are unchanged. Sending to oneself does not wake oneself unless
+the message carries a goal. When
+`notifications` is set, every woken recipient consumes that budget; `wake:false`
+messages do not.
+
+### Worker goals
+
+A worker turn normally ends when the worker replies, and the worker then waits
+for its next message. To keep a worker working, any member can attach a goal to
+`spawn` or `send`, including a goal sent to itself:
+
+```json
+{
+  "action": "send",
+  "requestId": "lane-goal",
+  "audience": ["member-id"],
+  "text": "Work through every archive for your lane.",
+  "goal": { "objective": "Exhaust the lane's archives", "floor": { "minMs": 3600000 }, "token_cap": 2000000 }
+}
+```
+
+The goal is installed as the worker session's goal when that turn starts, and the
+turn runs under the normal goal loop: the worker is prompted to continue until the
+goal's governor approves completion or pauses it, or an optional `token_cap` is
+spent. While a worker's goal is open, every turn it runs is a goal turn, whatever
+woke it: swarm messages reach it mid-turn, it can wait on them, and it runs without
+the swarm `turnMs` deadline; when `turnMs` is set, other turns keep it. `floor` and `token_cap` take the same keys as the goal tool, and
+neither is required. Goals go to workers, not the root session (a goal sent to
+`all` skips the root and the sender), and a goal cannot be sent with `wake:false`. The worker treats the agent that sent the goal as the user for it and
+messages that agent when it needs a decision. When a goal is complete, the worker
+decides what comes next: a new goal for itself, a message to whoever must act, or
+other work. Each goal message
+installs a fresh goal once (a retried delivery does not reinstall it), so sending
+a goal again replaces a paused or finished one and starts a new token budget.
+
+While a goal turn runs, messages sent to that worker do not wait for the turn to
+end. The turn checks for the worker's queued messages after each tool call (at
+most every few seconds) and each time the worker ends a reply, including the reply
+that would end the turn. It screens them like a mid-turn message and hands them
+over in order, on the tool result or with the next prompt. When the turn returns
+without being stopped or cancelled, it marks them handed in the swarm and
+withdraws their queued turns, so they never run again; if the turn fails or is
+stopped first they stay queued and run as their own turns. A goal in one of them replaces the running goal at once,
+so any member can redirect a busy worker; its work floor counts from when the
+message was sent. A message the screen blocks stays queued, with every message
+after it, and runs as its own turn later; a blocked mailbox message reaches the
+next turn only as a notice that it was withheld.
+
+A worker blocked on another agent can call goal action update `"wait"` with a note
+naming what it waits for. The goal's clock stops and the call returns with the
+next message that reaches the worker, resuming the goal, or after 30 minutes so the
+worker can reassess.
 
 ### Ask, read, and tail
 
@@ -166,7 +224,7 @@ the stored `settings.waitMs` (10,000 by default); a timeout returns an empty
 
 To ask, send a message, keep its `id`, then read with `replyTo=<id>&waitMs=10000`.
 The responding agent sends with `replyTo` set to that ID. Replies can use
-`notify:false` when the requester is already waiting. Waiting does not hold a
+`wake:false` when the requester is already waiting. Replies an agent receives through a read with `replyTo` count as handed to it, so its next turn does not see them again; other reads leave its mailbox as it was. Waiting does not hold a
 swarm transaction, provision lock, or other agent's run lease. It does not promise
 an answer: an active recipient may finish its current turn first, and mutually
 waiting agents time out rather than holding each other indefinitely. Prefer
@@ -178,19 +236,18 @@ with different content fails. Context updates are simple replacements.
 
 ## Human API
 
-Human callers use `GET` and `POST /v1/sessions/:id/swarm` through the existing
-source-authenticated API with a signed portal identity. The caller must already
-be allowed to view that session and belong to the swarm scope. Request actor
-and provenance selector fields are rejected rather than ignored. Arbitrary keys
-inside `context` remain permitted. Bodies and read parameters match the
-agent API. Initializing a root from this endpoint additionally requires a `runId`
-belonging to that session and actor. Human-origin actions are separately recorded;
-their asynchronous notifications still run unattended.
+Human callers use `GET` and `POST /v1/sessions/:id/swarm` (the web app's
+`/api/sessions/:id/swarm`) as the signed-in person. The caller must already be
+allowed to view that session and belong to the swarm scope. People can inspect the
+swarm and send `control` actions; `spawn`, `send`, `context` and message reads are
+agent-only. Request actor and provenance selector fields are rejected rather than
+ignored. Human-origin actions are separately recorded; their asynchronous
+notifications still run unattended.
 
 Agent operations require credentials bound to the exact session, run attempt, and
 unexpired execution lease. Swarm writes recheck that lease inside their database
 transaction; credentials from replaced attempts cannot authorize new work. Completed, failed, queued, and expired runs cannot authorize agent swarm
-operations. Authenticated human initialization may reference a historical run.
+operations.
 Worker sessions never inherit the root session's command or security-screen
 approval grants; a worker must obtain its own approval. Auto screening receives host-verified swarm delegation provenance, so routine delegated tasks and in-swarm reporting are distinguished from external instructions. Delegation does not authorize credential disclosure, permission changes, or overriding higher-priority instructions; those remain screened. Frozen swarm roster checks
 apply to swarm notifications, not ordinary human follow-ups in the root session.
@@ -218,7 +275,12 @@ query settles, even when a sweep reports a selection timeout.
 `active`, or `stopped`. Humans in the swarm may control any worker; an agent may
 control only itself or its descendants. The root session cannot be controlled.
 Controls apply to descendants too. Pausing holds new notifications as pending
-until the worker is resumed; runs already queued continue. Stopping is terminal:
+until the worker is resumed and returns queued runs that never started to pending;
+retries and runs already started still run, and their goal turn is held. A goal
+turn the swarm dispatched ends at the worker's next tool result or reply instead
+of drawing keep-going prompts, and a goal wait returns; the goal stays open.
+Resuming delivers the held notifications; a worker with none waits for its next
+message. A person's own turn in the worker's thread is never held. Stopping is terminal:
 pending notifications fail, unstarted queued runs are withdrawn, running turns are
 aborted, and later turns in that worker session are refused. `inspect` reports each
 peer's `control`. The web UI shows a Swarm strip on swarm sessions: a collapsed summary of
@@ -230,40 +292,43 @@ refreshes every few seconds only while workers are active and the tab is visible
 
 ## Defaults
 
-| Setting                                          | Default              |
-| ------------------------------------------------ | -------------------- |
-| `agents` (root and failed reservations included) | 32                   |
-| `depth` below root                               | 4                    |
-| `spawnRequests`                                  | 32                   |
-| `messages` including initial work                | 128                  |
-| `notifications` including initial work           | 256                  |
-| `contextBytes` / `textBytes`                     | 8,192 each           |
-| `lifetimeMs` from first spawn                    | 3,600,000            |
-| `turnMs` per notification                        | 600,000 (10 minutes) |
-| `waitMs` per read                                | 10,000               |
+| Setting                                          | Default          |
+| ------------------------------------------------ | ---------------- |
+| `agents` (root and failed reservations included) | 32               |
+| `depth` below root                               | 4                |
+| `contextBytes` / `textBytes`                     | 8,192 each       |
+| `spawnRequests`                                  | unset (no limit) |
+| `messages` including initial work                | unset (no limit) |
+| `notifications` including initial work           | unset (no limit) |
+| `lifetimeMs` from first spawn                    | unset (no limit) |
+| `turnMs` per notification                        | unset (no limit) |
+| `waitMs` per read                                | 10,000           |
 
 The root and at least one worker require `agents >= 2`. All other settings accept
 any positive integer; `turnMs` is limited only by the 2,147,483,647 ms timer ceiling. Read requests can still use `waitMs:0`.
-Per-swarm budgets are reserved atomically with the messages and members consuming
-them. Both the orchestrator and independent worker cancellation honor the stored
-turn deadline; existing organization-wide limits can shorten it. Internal reconciliation limits, the 32-message read page, and
-bounded run retry counts are not swarm configuration.
+`spawnRequests`, `messages`, `notifications`, `lifetimeMs`, and `turnMs` are off unless a
+spawn or `SWARM_DEFAULTS` sets them. When set, they are enforced as budgets that are
+reserved atomically with the members and messages that consume them. A set `turnMs`
+is enforced as the turn's wall clock, except for workers with an open goal; existing
+organization-wide limits can shorten it. Without `turnMs` or the message budgets,
+only those organization-wide limits bound how long a turn runs or what it spends. Internal reconciliation limits,
+the 32-message read page, and bounded run retry counts are not swarm
+configuration.
 
-After expiration, history remains readable, but new work, notifications, and
-character changes are rejected. Human-initiated ordinary session turns remain
-ordinary QM actions. Workers and their durable results remain visible; computers
-can be retired through the existing sandbox inventory. There is no automatic
+When `lifetimeMs` is set and the window passes, history remains readable, but new
+work, notifications, and character changes are rejected until the root extends
+`lifetimeMs` on a later spawn. Swarms without `lifetimeMs` never expire. Human-initiated
+ordinary session turns remain ordinary QM actions.
+Workers and their durable results remain visible; computers can be retired
+through the existing sandbox inventory. There is no automatic
 filesystem export on retirement: publish useful outputs through existing Files
 or your version-control workflow first.
 
 ## Verification
 
-Run the focused suites with `node --experimental-test-module-mocks --test test/swarm*.test.ts`.
-Run `npm run test:pg` against a disposable Postgres database. The swarm suite uses
-a separate schema so migration-reset tests cannot invalidate its state.
-Set `SWARM_TEST_DATABASE_URL` when running `test/swarm-orchestrator.test.ts` to
-exercise the HTTP spawn/reply flow across an application restart with real durable
-state. These tests use deterministic model and sandbox doubles; live provider and
+Run the focused suites with `DATABASE_URL=<disposable Postgres> node scripts/run-pg-tests.mjs test/swarm*.test.ts`.
+`test/swarm-orchestrator.test.ts` exercises the HTTP spawn/reply flow across an application
+restart with real durable state. These tests use deterministic model and sandbox doubles; live provider and
 model acceptance remains a separate deployment check. The agent-board UI is
 intentionally deferred.
 

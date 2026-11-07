@@ -3,10 +3,17 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import { getBaseModel, type ModelMetadata } from "./pi-models.ts";
 
 export type ModelOptionValue = string;
+
+export function migrateStoredModelValue(value: string): string {
+  for (const prefix of ["pi:"]) {
+    if (value.startsWith(prefix)) return value.slice(prefix.length);
+  }
+  return value;
+}
+
 export interface ModelOption {
+  harnessId?: string;
   value: ModelOptionValue;
-  harnessId: string;
-  harnessLabel: string;
   model: Model<Api>;
   label: string;
   buttonLabel: string;
@@ -69,20 +76,20 @@ function gatewayPresentation(id: string, provider: string): { label: string; pro
 
 function buildOption(
   id: string,
-  harnessId = "pi",
-  qualified = false,
   catalog: Readonly<Record<string, ModelMetadata>> = {},
+  harnessId = "pi",
 ): ModelOption | null {
   try {
     const dynamic = catalog[id];
     const meta = dynamic ? { label: dynamic.label, buttonLabel: dynamic.buttonLabel } : null;
     if (!meta) return null;
     const model = getBaseModel(id, dynamic);
+    if (dynamic.effortLevelsByHarness?.[harnessId])
+      Object.assign(model, { effortLevels: dynamic.effortLevelsByHarness[harnessId] });
     const presentation = gatewayPresentation(id, String(model.provider));
     return {
-      value: qualified ? `${harnessId}:${id}` : id,
+      value: harnessId === "pi" ? id : `${harnessId}:${id}`,
       harnessId,
-      harnessLabel: HARNESS_LABELS[harnessId] ?? harnessId,
       model,
       ...meta,
       ...(presentation
@@ -94,29 +101,30 @@ function buildOption(
             displayProvider: presentation.provider,
           }
         : {}),
-      groupLabel: providerLabel(
-        id,
-        meta.label,
-        presentation?.provider ?? dynamic?.provider ?? String(model?.provider ?? model?.api ?? "other"),
-      ),
+      groupLabel:
+        (harnessId === "pi" ? "" : `${HARNESS_LABELS[harnessId] ?? harnessId} · `) +
+        providerLabel(
+          id,
+          meta.label,
+          presentation?.provider ?? dynamic?.provider ?? String(model?.provider ?? model?.api ?? "other"),
+        ),
     };
   } catch {
     return null;
   }
 }
 
-function buildOptions(
+export function runtimeModelOptions(
   ids: readonly string[],
-  harnessId = "pi",
-  qualified = false,
   catalog: Readonly<Record<string, ModelMetadata>> = {},
+  harnessId = "pi",
 ): ModelOption[] {
   const seen = new Set<string>();
   const out: ModelOption[] = [];
   for (const id of ids) {
     if (seen.has(id)) continue;
     seen.add(id);
-    const opt = buildOption(id, harnessId, qualified, catalog);
+    const opt = buildOption(id, catalog, harnessId);
     if (opt) out.push(opt);
   }
   return out;
@@ -136,8 +144,18 @@ function runtimeFor(scopeKey?: string | null): RuntimeOptions {
   let options = derived.get(config);
   if (!options) {
     options = {
-      options: runtimeModelOptions(config.approvedHarnesses, config.modelsByHarness, config.modelCatalog),
-      defaultValue: `${config.effective.harnessId}:${config.effective.modelId}`,
+      options: config.modelsByHarness
+        ? Object.entries(config.modelsByHarness).flatMap(([harnessId, ids]) =>
+            ids.flatMap((id) => {
+              const option = buildOption(id, config.modelCatalog, harnessId);
+              return option ? [option] : [];
+            }),
+          )
+        : runtimeModelOptions(config.models, config.modelCatalog),
+      defaultValue:
+        !config.effective.harnessId || config.effective.harnessId === "pi"
+          ? config.effective.modelId
+          : `${config.effective.harnessId}:${config.effective.modelId}`,
     };
     derived.set(config, options);
   }
@@ -146,22 +164,6 @@ function runtimeFor(scopeKey?: string | null): RuntimeOptions {
 
 export function getModelOptions(scopeKey?: string | null): ModelOption[] {
   return runtimeFor(scopeKey).options;
-}
-
-export function harnessOptions(options: readonly ModelOption[]): Array<{ value: string; label: string }> {
-  return [...new Map(options.map((option) => [option.harnessId, option.harnessLabel])).entries()].map(
-    ([value, label]) => ({ value, label }),
-  );
-}
-
-export function runtimeModelOptions(
-  approvedHarnesses: readonly string[],
-  modelsByHarness: Readonly<Record<string, readonly string[]>>,
-  catalog: Readonly<Record<string, ModelMetadata>> = {},
-): ModelOption[] {
-  return approvedHarnesses.flatMap((harnessId) =>
-    buildOptions(modelsByHarness[harnessId] ?? [], harnessId, true, catalog),
-  );
 }
 
 export function defaultModelValue(scopeKey?: string | null): ModelOptionValue {
@@ -173,12 +175,4 @@ export function transcriptModel(scopeKey?: string | null): Model<Api> | undefine
   return options.find((o) => o.value === defaultValue)?.model;
 }
 
-export {
-  EFFORT_LEVELS,
-  defaultEffortForModel,
-  effortLabel,
-  harnessSupportsEffort,
-  harnessSupportsFastMode,
-  harnessSupportsSteer,
-  type EffortLevel,
-} from "./runtime-capabilities.ts";
+export { EFFORT_LEVELS, defaultEffortForModel, effortLabel, type EffortLevel } from "./runtime-capabilities.ts";

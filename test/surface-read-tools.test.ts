@@ -5,16 +5,17 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import type { TurnRequest } from "../src/types.ts";
+import type { SurfaceContextResult } from "../src/reach/reach.ts";
 import { testConfig } from "./support/test-config.ts";
-import { createAgentTools, type ToolContextRef } from "../src/harness/agent-tools.ts";
+import { createAgentTools, type ToolContextRef } from "../src/agent/agent-tools.ts";
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
-function freshApp(slackContextSource?: "live" | "shadow" | "mirror") {
+function freshApp() {
   const dataDir = mkdtempSync(join(tmpdir(), "ap-readtools-"));
-  return buildApp(testConfig({ dataDir, ...(slackContextSource ? { slackContextSource } : {}) }));
+  return buildApp(testConfig({ dataDir }));
 }
 
 const actor = { externalId: "U1", displayName: "Ada" };
@@ -27,17 +28,17 @@ function mention(text: string, channel: string, root: string): TurnRequest {
     conversation: { kind: "channel", threadRef: `ch:${channel}:${root}`, channelRef: channel, audience: [actor, mate] },
     deliveryTarget: `${channel}:${root}`,
     text,
-    liveActor: true,
+    origin: { kind: "human" },
     async: true,
   };
 }
 
-function startFulfiller(app: any, messages: unknown[]) {
+function startFulfiller(app: any, messages: unknown[], extra: Partial<SurfaceContextResult> = {}) {
   let running = true;
   const loop = (async () => {
     while (running) {
       const pending = await app.pendingContextRequests("slack");
-      for (const r of pending) await app.fulfillContextRequest(r.id, { result: { messages } });
+      for (const r of pending) await app.fulfillContextRequest(r.id, { result: { messages, ...extra } });
       await sleep(20);
     }
   })();
@@ -52,9 +53,9 @@ async function subToolResult(built: any, root: string, tool: string, deadlineMs 
   while (Date.now() < deadline) {
     const sub = await built.sessions.getByThread(`ch:${root}`);
     if (sub) {
-      const entries = await built.sessions.getEntries(sub.id);
-      const hit = entries.find((e: any) => e.type === "assistant" && typeof e.payload?.text === "string");
-      if (hit) return hit.payload.text as string;
+      const items = await built.sessions.getItems(sub.id);
+      const hit = items.find((item: any) => item.kind === "AgentMessage" && item.variant === null && item.text);
+      if (hit) return hit.text as string;
     }
     await sleep(50);
   }
@@ -91,14 +92,19 @@ test("whats_new returns POINTERS (counts of new-here + other active threads), ne
   const built = freshApp();
   built.runtime.start();
   const root = "C10:1000.1";
-  const stop = startFulfiller(built.app, [
-    { ts: "1000.1", author: "Ann", text: "the anchor message" },
-    { ts: "1000.2", author: "Bob", text: "here 1", threadTs: "1000.1" },
-    { ts: "1000.3", author: "Cat", text: "here 2", threadTs: "1000.1" },
-    { ts: "2000.2", author: "Dee", text: "other 1", threadTs: "2000.1" },
-    { ts: "2000.3", author: "Eve", text: "other 2", threadTs: "2000.1" },
-    { ts: "3000.1", author: "Fay", text: "a top-level channel post" },
-  ]);
+  const stop = startFulfiller(
+    built.app,
+    [
+      { ts: "1000.1", author: "Ann", text: "the anchor message" },
+      { ts: "1000.2", author: "Bob", text: "here 1", threadTs: "1000.1" },
+      { ts: "1000.3", author: "you", text: "here 2 from a person named you", threadTs: "1000.1" },
+      { ts: "1000.4", author: "you", text: "the agent's own reply", threadTs: "1000.1" },
+      { ts: "2000.2", author: "Dee", text: "other 1", threadTs: "2000.1" },
+      { ts: "2000.3", author: "Eve", text: "other 2", threadTs: "2000.1" },
+      { ts: "3000.1", author: "Fay", text: "a top-level channel post" },
+    ],
+    { selfTs: ["1000.4"] },
+  );
   try {
     await built.app.turn(mention("!whats_new", "C10", "1000.1"));
     const reply = await subToolResult(built, root, "whats_new");
@@ -110,7 +116,7 @@ test("whats_new returns POINTERS (counts of new-here + other active threads), ne
 });
 
 test("enabled mirror search uses the current channel and returns author/snippet pointers without a live pull", async () => {
-  const built = freshApp("mirror");
+  const built = freshApp();
   built.runtime.start();
   const root = "C11:1100.1";
   await built.surfaceCache.ingest([
@@ -124,55 +130,6 @@ test("enabled mirror search uses the current channel and returns author/snippet 
     assert.match(reply, /search\(cache\) 1 hit/);
     assert.deepEqual(await built.app.pendingContextRequests("slack"), []);
     assert.match(reply, /first=Bob:the budget doc/);
-  } finally {
-    await built.runtime.stop();
-  }
-});
-
-test("read_members lists the current container's roster (its resolved audience), by display name", async () => {
-  const built = freshApp();
-  built.runtime.start();
-  const root = "C12:1200.1";
-  try {
-    await built.app.turn(mention("!read_members", "C12", "1200.1"));
-    const reply = await subToolResult(built, root, "read_members");
-    assert.match(reply, /members: /);
-    assert.match(reply, /Ada/);
-    assert.match(reply, /Bob/);
-  } finally {
-    await built.runtime.stop();
-  }
-});
-
-test("read_file returns text content for a text blob and a POINTER (never bytes) for a binary blob", async () => {
-  const built = freshApp();
-  built.runtime.start();
-  try {
-    const textBlob = await built.blobTransfer.put(Buffer.from("hello from the shared file"));
-    const binBlob = await built.blobTransfer.put(Buffer.from([0x00, 0x01, 0x02, 0x00, 0xff]));
-    const jpegLike = await built.blobTransfer.put(
-      Buffer.from([
-        0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0xff, 0xdb, 0xc0, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5,
-        0xf6, 0x87,
-      ]),
-    );
-
-    await built.app.turn(mention(`!read_file ${textBlob.blobId}`, "C13", "1300.1"));
-    const txt = await subToolResult(built, "C13:1300.1", "read_file");
-    assert.match(txt, /file: hello from the shared file/);
-
-    await built.app.turn(mention(`!read_file ${binBlob.blobId}`, "C14", "1400.1"));
-    const bin = await subToolResult(built, "C14:1400.1", "read_file");
-    assert.match(bin, /file-pointer:/);
-    assert.doesNotMatch(bin, /hello from the shared file/);
-
-    await built.app.turn(mention(`!read_file ${jpegLike.blobId}`, "C16", "1600.1"));
-    const jpg = await subToolResult(built, "C16:1600.1", "read_file");
-    assert.match(jpg, /file-pointer:/);
-
-    await built.app.turn(mention("!read_file deadbeefdeadbeefdeadbeefdeadbeef", "C15", "1500.1"));
-    const gone = await subToolResult(built, "C15:1500.1", "read_file");
-    assert.match(gone, /couldn't read file/);
   } finally {
     await built.runtime.stop();
   }
@@ -247,7 +204,7 @@ test("whats_new action appends the mirror-coverage window when known", async () 
 });
 
 test("search/whats_new surface the mirror coverage window end-to-end once the mirror has ingested history (§4.1/§4.2)", async () => {
-  const built = freshApp("mirror");
+  const built = freshApp();
   built.runtime.start();
   const root = "C30:3000.1";
   await built.app.ingestSurfaceEvents(
@@ -286,7 +243,7 @@ test("search source=slack routes through the live-search seam; an unconfigured p
     while (running) {
       for (const r of await built.app.pendingContextRequests("slack")) {
         const body = (r as any).query?.searchAll
-          ? { messages: [], note: "live-search-unconfigured" }
+          ? { messages: [], liveSearch: "unconfigured" as const }
           : { messages: [] };
         await built.app.fulfillContextRequest(r.id, { result: body });
       }
@@ -314,7 +271,7 @@ test("search source=slack with no connected login for the asker tells the agent 
       for (const r of await built.app.pendingContextRequests("slack")) {
         const q = (r as any).query ?? {};
         const body =
-          q.searchAll && !q.viewerToken ? { messages: [], note: "live-search-unconnected" } : { messages: [] };
+          q.searchAll && !q.viewerToken ? { messages: [], liveSearch: "unconnected" as const } : { messages: [] };
         await built.app.fulfillContextRequest(r.id, { result: body });
       }
       await sleep(20);

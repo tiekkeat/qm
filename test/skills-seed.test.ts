@@ -11,10 +11,11 @@ import { installSeedSkills, parseSeedSkill, upsertSeedSkill } from "../src/skill
 import { materializeSkillTree } from "../src/skills/materialize.ts";
 import { createSkillStore, safeSkillFilePath } from "../src/skills/skill-store.ts";
 import type { Sandbox, SandboxHandle } from "../src/sandbox/sandbox.ts";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { scopeId, type TurnRequest } from "../src/types.ts";
 import { testConfig } from "./support/test-config.ts";
 import { selectDefaultSandbox } from "./support/default-sandbox.ts";
+import { testAdvisoryLock, testMap } from "./support/test-database.ts";
 
 test("seed skill parser reads the repo frontmatter subset", () => {
   const manifest = parseSeedSkill(`---
@@ -36,7 +37,11 @@ Run the thing.
 });
 
 test("installSeedSkills publishes the repository starter catalog into org scope", async () => {
-  const skills = createSkillStore({ signingSecret: "seed-test-secret" });
+  const skills = createSkillStore({
+    advisoryLock: testAdvisoryLock(),
+    backing: testMap(),
+    signingSecret: "seed-test-secret",
+  });
   const result = await installSeedSkills(skills, { dir: "skills-seed", scopeId: scopeId("org", "default-org") });
   assert.deepEqual(result.skipped, []);
   assert.ok(result.installed.includes("cloud-cli"));
@@ -105,7 +110,11 @@ function writeSeedAsset(dir: string, name: string, relPath: string, content: str
 }
 
 test("installSeedSkills re-seeds a changed manifest over its own prior install, never over another author's", async () => {
-  const skills = createSkillStore({ signingSecret: "seed-test-secret" });
+  const skills = createSkillStore({
+    advisoryLock: testAdvisoryLock(),
+    backing: testMap(),
+    signingSecret: "seed-test-secret",
+  });
   const org = scopeId("org", "default-org");
   const dir = mkdtempSync(join(tmpdir(), "seed-update-"));
   writeSeedSkill(dir, "demo", "old description", "# Demo v1");
@@ -148,7 +157,11 @@ test("installSeedSkills re-seeds a changed manifest over its own prior install, 
 });
 
 test("installSeedSkills leaves an admin-archived catalog skill archived when asked to", async () => {
-  const skills = createSkillStore({ signingSecret: "seed-test-secret" });
+  const skills = createSkillStore({
+    advisoryLock: testAdvisoryLock(),
+    backing: testMap(),
+    signingSecret: "seed-test-secret",
+  });
   const org = scopeId("org", "default-org");
   const dir = mkdtempSync(join(tmpdir(), "seed-archived-"));
   writeSeedSkill(dir, "retired", "old catalog skill", "# Retired v1");
@@ -171,7 +184,11 @@ test("installSeedSkills leaves an admin-archived catalog skill archived when ask
 });
 
 test("concurrent upserts of the same scope+name serialize into one record (no duplicate creates)", async () => {
-  const skills = createSkillStore({ signingSecret: "seed-test-secret" });
+  const skills = createSkillStore({
+    advisoryLock: testAdvisoryLock(),
+    backing: testMap(),
+    signingSecret: "seed-test-secret",
+  });
   const org = scopeId("org", "default-org");
   const upsert = (body: string) =>
     upsertSeedSkill(skills, {
@@ -192,6 +209,7 @@ test("a fresh app advertises and materializes only admin-enabled connector skill
     dataDir: mkdtempSync(join(tmpdir(), "seeded-skills-")),
   });
   const built = buildApp(config);
+  await built.ownSharedState();
   await selectDefaultSandbox(built, "U1", scopeId("personal", "U1"));
   await built.config.setConnectorClient(scopeId("org", "default-org"), "google", {
     clientId: "google-client",
@@ -208,7 +226,7 @@ test("a fresh app advertises and materializes only admin-enabled connector skill
   assert.match(sys.reply ?? "", /google-workspace/);
   assert.match(sys.reply ?? "", /google-drive-sheets/);
   assert.match(sys.reply ?? "", /github-gitlab/);
-  assert.doesNotMatch(sys.reply ?? "", /\*\*dropbox\*\*|\*\*linear\*\*/);
+  assert.doesNotMatch(sys.reply ?? "", /^- (?:dropbox|linear|zoom) — /m);
 
   const channelSys = await app.turn({
     surface: "test",
@@ -218,7 +236,7 @@ test("a fresh app advertises and materializes only admin-enabled connector skill
   } as TurnRequest);
   assert.match(channelSys.reply ?? "", /google-workspace/);
   assert.match(channelSys.reply ?? "", /google-drive-sheets/);
-  assert.doesNotMatch(channelSys.reply ?? "", /\*\*dropbox\*\*|\*\*linear\*\*/);
+  assert.doesNotMatch(channelSys.reply ?? "", /^- (?:dropbox|linear|zoom) — /m);
 
   const read = await app.turn({
     surface: "test",
@@ -257,7 +275,11 @@ function fakeSandbox() {
 }
 
 test("a bundled skill round-trips seed → store → materialize, assets land beside SKILL.md", async () => {
-  const skills = createSkillStore({ signingSecret: "seed-test-secret" });
+  const skills = createSkillStore({
+    advisoryLock: testAdvisoryLock(),
+    backing: testMap(),
+    signingSecret: "seed-test-secret",
+  });
   const org = scopeId("org", "default-org");
   const dir = mkdtempSync(join(tmpdir(), "seed-tree-"));
   writeSeedSkill(dir, "tooled", "a skill with helpers", "# Tooled\n\nRun scripts/hello.py.");
@@ -286,7 +308,11 @@ test("a bundled skill round-trips seed → store → materialize, assets land be
 });
 
 test("a tampered bundled asset fails skill verification", async () => {
-  const skills = createSkillStore({ signingSecret: "seed-test-secret" });
+  const skills = createSkillStore({
+    advisoryLock: testAdvisoryLock(),
+    backing: testMap(),
+    signingSecret: "seed-test-secret",
+  });
   const org = scopeId("org", "default-org");
   const dir = mkdtempSync(join(tmpdir(), "seed-tamper-"));
   writeSeedSkill(dir, "tooled", "a skill with helpers", "# Tooled");
@@ -301,7 +327,7 @@ test("a tampered bundled asset fails skill verification", async () => {
 
 test("a text-only skill signs identically to the pre-files scheme (legacy signatures still verify)", async () => {
   const secret = "legacy-compat-secret";
-  const skills = createSkillStore({ signingSecret: secret });
+  const skills = createSkillStore({ advisoryLock: testAdvisoryLock(), backing: testMap(), signingSecret: secret });
   const org = scopeId("org", "default-org");
   const legacySig = createHmac("sha256", secret)
     .update(
@@ -331,7 +357,11 @@ test("safeSkillFilePath rejects traversal / absolute / dot segments", () => {
 });
 
 test("installSeedSkills re-seeds when only a bundled asset changes", async () => {
-  const skills = createSkillStore({ signingSecret: "seed-test-secret" });
+  const skills = createSkillStore({
+    advisoryLock: testAdvisoryLock(),
+    backing: testMap(),
+    signingSecret: "seed-test-secret",
+  });
   const org = scopeId("org", "default-org");
   const dir = mkdtempSync(join(tmpdir(), "seed-asset-change-"));
   writeSeedSkill(dir, "tooled", "helpers", "# Tooled");

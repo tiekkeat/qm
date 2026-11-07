@@ -1,14 +1,11 @@
 import { cleanupFailedProvision } from "./sandbox.ts";
 import { randomUUID } from "node:crypto";
-import type { WorkspaceLayer } from "../types.ts";
-import type { WorkspaceStore } from "../workspace/workspace-store.ts";
 import { createKeyedQueue, fetchWithRetry, sleep } from "../util/async.ts";
 import { withRequestId, swallowAs, errMessage } from "../util/errors.ts";
 import { NonRetryableTurnError } from "../core/turn-error.ts";
 import { shq } from "../util/shell.ts";
 import { nonInteractiveShellPrefix } from "./sandbox-env.ts";
 import { createExecProcessSessions, type ExecProcessIo } from "./exec-process-session.ts";
-import { materializeRoLayers } from "./ro-layers.ts";
 import { createExecExport, createBackendBlobStaging, createExecFileOps, posixJoin } from "./exec-file-ops.ts";
 import {
   ephemeralCredLinkScript,
@@ -17,7 +14,7 @@ import {
 } from "../credentials/resident-paths.ts";
 import { DROPPED_PROXY_ENV, forceThroughProxyEnv } from "./sandbox-env.ts";
 import type { BlobTransferStore } from "../persistence/blob-transfer.ts";
-import { createNoopAdvisoryLock, type AdvisoryLock } from "../persistence/advisory-lock.ts";
+import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
 import { killableScript, killScript } from "./exec-kill.ts";
 import { visibleNotInstalled, visibleTools } from "./sandbox.ts";
 import { sandboxScopeName } from "./exec-sandbox-base.ts";
@@ -33,8 +30,6 @@ import type {
 
 const HOME_DIR = "/home/node";
 const WORKSPACE_BASENAME = "workspace";
-const RO_LAYERS_TAR = ".ro-layers.tar";
-const RO_LAYERS_MANIFEST = ".ro-layers.manifest";
 const INLINE_LIMIT = 128 * 1024;
 const MAX_EXEC_OUTPUT_BYTES = 16 * 1024 * 1024;
 const READ_CHUNK = 256 * 1024;
@@ -108,7 +103,6 @@ export interface Agent37SandboxOptions {
   namePrefix?: string;
   template?: string;
   cpus?: number;
-  memoryGb?: number;
   diskGb?: number;
   defaultTimeoutSec?: number;
   egressProxyUrl?: string;
@@ -119,11 +113,11 @@ export interface Agent37SandboxOptions {
   extraTools?: string[];
   credentialPaths?: CredentialPathSpec[];
   fetchImpl?: typeof fetch;
-  advisoryLock?: AdvisoryLock;
+  advisoryLock: AdvisoryLock;
   onError?: (e: { category: string; code: string; message: string; scopeLabel?: string }) => void;
 }
 
-export function createAgent37Sandbox(workspace: WorkspaceStore, opts: Agent37SandboxOptions = {}): Sandbox {
+export function createAgent37Sandbox(opts: Agent37SandboxOptions): Sandbox {
   if (!opts.apiKey && !opts.fetchImpl) throw new Error("SANDBOX_BACKEND=agent37 requires AGENT37_API_KEY");
   const fetchImpl = opts.fetchImpl ?? fetch;
   const baseUrl = (opts.baseUrl ?? DEFAULT_AGENT37_BASE_URL).replace(/\/+$/, "");
@@ -131,11 +125,11 @@ export function createAgent37Sandbox(workspace: WorkspaceStore, opts: Agent37San
   const template = opts.template ?? DEFAULT_TEMPLATE;
   const resources = {
     cpu: opts.cpus ?? DEFAULT_CPUS,
-    memory: opts.memoryGb ?? DEFAULT_MEMORY_GB,
+    memory: DEFAULT_MEMORY_GB,
     disk: opts.diskGb ?? DEFAULT_DISK_GB,
   };
   const defaultTimeoutSec = opts.defaultTimeoutSec ?? 600;
-  const advisoryLock = opts.advisoryLock ?? createNoopAdvisoryLock();
+  const advisoryLock = opts.advisoryLock;
   const workspaceDir = `${HOME_DIR}/${WORKSPACE_BASENAME}`;
   const provisionQueue = createKeyedQueue<string>();
 
@@ -201,10 +195,17 @@ export function createAgent37Sandbox(workspace: WorkspaceStore, opts: Agent37San
     }
   }
 
-  async function createInstance(name: string): Promise<InstanceInfo> {
+  async function createInstance(name: string, memoryGb?: number): Promise<InstanceInfo> {
+    const sized = memoryGb ? { ...resources, memory: memoryGb } : resources;
     const res = await fetchWithRetry(
       (signal) =>
-        send("POST", "/v1/instances", { template, name, resources, auto_sleep: true }, CREATE_TIMEOUT_MS, signal),
+        send(
+          "POST",
+          "/v1/instances",
+          { template, name, resources: sized, auto_sleep: true },
+          CREATE_TIMEOUT_MS,
+          signal,
+        ),
       "refused",
       { timeoutMs: CREATE_TIMEOUT_MS },
     );
@@ -410,6 +411,7 @@ export function createAgent37Sandbox(workspace: WorkspaceStore, opts: Agent37San
     key: string,
     name: string,
     onStatus?: (text: string) => void,
+    memoryGb?: number,
   ): Promise<{ coldStart: boolean }> {
     return provisionQueue(key, () =>
       advisoryLock.withLock(`agent37-provision:${key}`, async () => {
@@ -420,12 +422,8 @@ export function createAgent37Sandbox(workspace: WorkspaceStore, opts: Agent37San
           if (existing.status !== "running") await ensureRunning(existing.id);
           return { coldStart: false };
         }
-        try {
-          onStatus?.("Creating the sandbox…");
-        } catch (error) {
-          void error;
-        }
-        const info = await createInstance(name);
+        onStatus?.("Creating the sandbox…");
+        const info = await createInstance(name, memoryGb);
         idByName.set(name, info.id);
         return { coldStart: true };
       }),
@@ -449,6 +447,7 @@ export function createAgent37Sandbox(workspace: WorkspaceStore, opts: Agent37San
 
   const profile: AgentComputerProfile = {
     backend: "agent37",
+    sizesMemory: true,
     writablePersistence: "resident_disk",
     processSessions: true,
     egressEnforcement: "none",
@@ -503,10 +502,8 @@ export function createAgent37Sandbox(workspace: WorkspaceStore, opts: Agent37San
     ...execFileOps,
     ...blobStaging,
 
-    async provision(layers: WorkspaceLayer[], provOpts?: ProvisionOptions): Promise<SandboxHandle> {
+    async provision(scope: string, provOpts?: ProvisionOptions): Promise<SandboxHandle> {
       const scratch = provOpts?.scratch;
-      const writable = layers.find((l) => l.mode === "rw") ?? layers[0];
-      const scope = writable?.scopeId ?? "default";
       let name: string;
       let coldStart: boolean;
       if (scratch) {
@@ -514,17 +511,14 @@ export function createAgent37Sandbox(workspace: WorkspaceStore, opts: Agent37San
       } else {
         name = sandboxScopeName(prefix, scope);
         scopeByName.set(name, scope);
-        ({ coldStart } = await ensureInstance(scope, name, provOpts?.onStatus));
+        ({ coldStart } = await ensureInstance(scope, name, provOpts?.onStatus, provOpts?.memoryGb));
       }
 
       const forceEgress = !!opts.egressProxyUrl && !!provOpts?.egressToken;
       const turnEnv = Object.fromEntries(
         Object.entries(provOpts?.env ?? {}).filter(([k]) => !DROPPED_PROXY_ENV.has(k)),
       );
-      const env = {
-        ...turnEnv,
-        ...(forceEgress ? forceThroughProxyEnv(opts.egressProxyUrl!, provOpts!.egressToken!) : {}),
-      };
+      const env = forceEgress ? forceThroughProxyEnv(opts.egressProxyUrl!, provOpts!.egressToken!, turnEnv) : turnEnv;
       const handle: SandboxHandle = {
         id: name,
         rootDir: workspaceDir,
@@ -539,18 +533,6 @@ export function createAgent37Sandbox(workspace: WorkspaceStore, opts: Agent37San
         const prep = await execRaw(name, `mkdir -p ${shq(workspaceDir)}${credLinks}`, 60);
         if (prep.code !== 0)
           throw new Error(`agent37 provision prep failed: ${(prep.stderr || prep.stdout).slice(0, 200)}`);
-
-        await materializeRoLayers(
-          workspace,
-          layers,
-          handle,
-          {
-            readFile: (h, rel) => sandbox.readFile(h, rel),
-            writeFileBytes: (h, rel, data) => sandbox.writeFileBytes(h, rel, data),
-            exec: (script, t) => execRaw(name, script, t),
-          },
-          { manifest: RO_LAYERS_MANIFEST, tar: RO_LAYERS_TAR, label: "agent37" },
-        );
 
         return handle;
       } catch (err) {

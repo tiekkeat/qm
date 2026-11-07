@@ -1,14 +1,10 @@
-import { mailerFor, type EmailSettings } from "../../plugins/chassis/src/email.ts";
+import { mailerFor, type EmailSettings, type Mailer } from "../../plugins/chassis/src/email.ts";
 import { escapeHtml } from "../../plugins/chassis/src/http.ts";
-
-export interface InviteMailer {
-  send(message: { to: string; subject: string; text: string; html: string }): Promise<string>;
-}
 
 export const INVITE_EMAIL_NOT_CONFIGURED =
   "invitation email delivery is not configured — configure the selected Resend or SMTP transport and AUTH_EMAIL_FROM on core";
 
-export function createInviteMailer(settings: EmailSettings): InviteMailer | null {
+export function createInviteMailer(settings: EmailSettings): Mailer | null {
   return mailerFor(settings);
 }
 

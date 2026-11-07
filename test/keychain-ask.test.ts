@@ -8,12 +8,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
-import { buildApp, type BuiltApp } from "../src/wiring.ts";
+import { type BuiltApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { createServer } from "../src/api/server.ts";
 import { keychainRoutes } from "../src/api/routes/keychain.ts";
 import {
   createKeychain,
-  renderKeychainManifest,
+  askResolutionEvents,
   KeychainError,
   ASK_TTL_MS,
   ASK_PRUNE_AFTER_MS,
@@ -28,23 +29,29 @@ import { createCronStore } from "../src/cron/cron-store.ts";
 import { createDeliveryStore } from "../src/delivery/delivery-store.ts";
 import { createIdempotencyStore, type IdempotencyRecord } from "../src/idempotency/idempotency-store.ts";
 import { createIdentityService } from "../src/identity/identity-service.ts";
-import { createMemoryMap } from "../src/persistence/durable-map.ts";
 import { deriveConnectorKey } from "../src/connectors/connector-client-store.ts";
 import { mintCapabilityToken, CAPABILITY_TTL_MS, type CapabilityClaims } from "../src/auth/capability-token.ts";
+import { mintSignedPayload } from "../src/auth/signed-token.ts";
 import { scopeId, type TurnRequest, type TurnResult } from "../src/types.ts";
 import { fakeSprites } from "./support/auto-fake-sprites.ts";
 import { testConfig } from "./support/test-config.ts";
 import { selectDefaultSandbox } from "./support/default-sandbox.ts";
 import { materializeGrant } from "./support/materialize-grant.ts";
+import { singleProcessDeps } from "./support/single-process.ts";
+import { testAdvisoryLock, testMap, testDatabaseUrl } from "./support/test-database.ts";
+import { createPostgresCronFireStore } from "../src/cron/fire-store.ts";
+import { createPostgresReplayDedupe } from "../src/auth/replay-dedupe.ts";
+import { USER_ITEM_KINDS } from "../src/sessions/items.ts";
 
 const KEY = deriveConnectorKey("keychain-ask-test-key");
 const SECRET = "keychain-ask-route-secret".repeat(3);
 
 function kcAt(now: () => number): Keychain {
   return createKeychain({
-    creds: createMemoryMap(),
-    grants: createMemoryMap(),
-    asks: createMemoryMap(),
+    lock: testAdvisoryLock(),
+    creds: testMap(),
+    grants: testMap(),
+    asks: testMap(),
     key: KEY,
     now,
   });
@@ -301,12 +308,13 @@ test("expiry sweep fires the resolution once and rides the scheduler tick", asyn
   assert.equal(fired[0]!.status, "expired");
 
   const swept: number[] = [];
-  const idStore = createIdempotencyStore(createMemoryMap<IdempotencyRecord>());
+  const idStore = createIdempotencyStore(testMap<IdempotencyRecord>());
   const scheduler = createScheduler({
-    crons: createCronStore(createMemoryMap()),
+    ...singleProcessDeps(),
+    crons: createCronStore(testMap(), { fires: createPostgresCronFireStore(testDatabaseUrl()) }),
     deliveries: createDeliveryStore(),
     idempotency: idStore,
-    identity: createIdentityService(createMemoryMap()),
+    identity: createIdentityService(testMap(), { externalMembers: testMap() }),
     run: async () => ({ status: "ok" }) as TurnResult,
     sweepAsks: async (now) => void swept.push(now),
   });
@@ -374,8 +382,8 @@ test("runTrigger marks every trigger-fired turn `triggered` (the consent-gate cl
   const outcome = await runTrigger(
     {
       deliveries: createDeliveryStore(),
-      idempotency: createIdempotencyStore(createMemoryMap<IdempotencyRecord>()),
-      identity: createIdentityService(createMemoryMap()),
+      idempotency: createIdempotencyStore(testMap<IdempotencyRecord>()),
+      identity: createIdentityService(testMap(), { externalMembers: testMap() }),
       run: async (req) => ((seen = req), { status: "ok" } as TurnResult),
     },
     {
@@ -388,7 +396,7 @@ test("runTrigger marks every trigger-fired turn `triggered` (the consent-gate cl
     },
   );
   assert.equal(outcome.ran, true);
-  assert.equal(seen?.triggered, true);
+  assert.equal(seen?.origin?.kind, "automation");
   assert.equal(seen?.thinkingLevel, undefined);
   assert.equal(seen?.fastMode, undefined);
   assert.equal(seen?.conversation.threadRef, "ch:C1-t1", "an explicit threadRef overrides the per-fire fireKey thread");
@@ -399,9 +407,9 @@ test("runTrigger: silent markers never silence a notification-shaped fire (keych
   const outcome = await runTrigger(
     {
       deliveries,
-      idempotency: createIdempotencyStore(createMemoryMap<IdempotencyRecord>()),
-      identity: createIdentityService(createMemoryMap()),
-      run: async () => ({ status: "ok", reply: "The keychain ask was approved.\n\n[SILENT]" }) as TurnResult,
+      idempotency: createIdempotencyStore(testMap<IdempotencyRecord>()),
+      identity: createIdentityService(testMap(), { externalMembers: testMap() }),
+      run: async () => ({ status: "ok", reply: "The keychain ask was approved." }) as TurnResult,
     },
     {
       owner: "U_ALICE",
@@ -435,8 +443,8 @@ test("fireAskResolution: a turn that fires but doesn't land falls back to a plai
     const deliveries = createDeliveryStore();
     return {
       deliveries,
-      idempotency: createIdempotencyStore(createMemoryMap<IdempotencyRecord>()),
-      identity: createIdentityService(createMemoryMap()),
+      idempotency: createIdempotencyStore(testMap<IdempotencyRecord>()),
+      identity: createIdentityService(testMap(), { externalMembers: testMap() }),
       run,
       getAsk: async () => current,
     };
@@ -504,7 +512,7 @@ test("fireAskResolution: a turn that fires but doesn't land falls back to a plai
   assert.deepEqual(await texts(ok), ["done"], "just the turn's reply, no fallback");
 });
 
-test("manifest: the requester-side ledger names no ask ids or purposes, and asks go through one route", async () => {
+test("an ask's resolution is one event line, shown only to the first turn after it resolved", async () => {
   const now = Date.now();
   const pending: KeychainAsk = {
     id: "a1b2c3d4e5f6",
@@ -524,54 +532,24 @@ test("manifest: the requester-side ledger names no ask ids or purposes, and asks
     note: "not for prod",
     resolvedAt: now - 60_000,
   };
-
-  const channel = renderKeychainManifest({
-    scopeId: "channel:C1",
-    conversationKind: "channel",
-    actorId: "U_BOB",
-    members: [{ id: "U_BOB" }],
-    entriesByOwner: new Map(),
-    scopeGrants: [],
-    scopeAsks: [pending, declined],
-  });
-  assert.match(channel, /Asks sent from this conversation:/);
-  assert.match(channel, /- waiting on U_ALICE's approval card/);
-  assert.match(channel, /- request to U_ALICE: declined/);
-  assert.match(channel, /`request-access` skill/, "the manifest names the request skill");
-  assert.match(channel, /approval card/);
-  assert.match(channel, /requires an explicit grant/);
-  assert.ok(!channel.includes("/v1/keychain/grants"), "no approval-by-POST ladder");
-  for (const leak of [pending.id, declined.id, pending.purpose, "not for prod"])
-    assert.ok(!channel.includes(leak), `manifest leaks ${leak}`);
-
-  const dm = renderKeychainManifest({
-    scopeId: scopeId("personal", "U_ALICE"),
-    conversationKind: "dm",
-    actorId: "U_ALICE",
-    members: [{ id: "U_ALICE" }],
-    entriesByOwner: new Map([
-      [
-        "U_ALICE",
-        [
-          {
-            id: "cred1",
-            ownerId: "U_ALICE",
-            service: "github",
-            kind: "env",
-            envKey: "GITHUB_TOKEN",
-            accountLabel: "alice-acme",
-            fingerprint: "f",
-            createdAt: now,
-            updatedAt: now,
-          },
-        ],
-      ],
-    ]),
-    scopeGrants: [],
-    scopeAsks: [pending, declined],
-  });
-  assert.ok(!dm.includes("Asks waiting on you"), "the owner answers on the card, not in chat");
-  for (const leak of [pending.id, pending.purpose, "/decline", "/v1/keychain/grants"]) assert.ok(!dm.includes(leak));
+  const events = (since: number) =>
+    askResolutionEvents(
+      [pending, declined],
+      since,
+      () => "alice",
+      async () => ({ service: "github" }) as never,
+    );
+  assert.equal(await events(now - 120_000), "Access request to alice for `github` was declined.");
+  assert.equal(await events(now - 60_000), "");
+  assert.equal(
+    await askResolutionEvents(
+      [declined],
+      0,
+      () => "alice",
+      async () => null,
+    ),
+    "Access request to alice for deleted credential `cred1` was declined.",
+  );
 });
 
 describe("/v1/keychain/asks — card approval end to end", async () => {
@@ -582,8 +560,8 @@ describe("/v1/keychain/asks — card approval end to end", async () => {
   const decide = (askId: string, actorId: string, decision: "once" | "standing" | "deny") =>
     approvals.decide(askId, { externalId: actorId }, decision);
   const resumeTurns = async (sessionId: string, pattern: RegExp) =>
-    (await built.sessions.getEntries(sessionId)).filter(
-      (e) => e.type === "user" && pattern.test((e.payload as { text: string }).text),
+    (await built.sessions.getItems(sessionId)).filter(
+      (item) => USER_ITEM_KINDS.includes(item.kind) && pattern.test(item.text ?? ""),
     );
 
   const capFor = (actorId: string, scope = scopeId("personal", actorId), extra: Partial<CapabilityClaims> = {}) =>
@@ -638,12 +616,12 @@ describe("/v1/keychain/asks — card approval end to end", async () => {
       resume: (ask, grant) => built.fireAskResolution!(ask, grant),
     });
     server = createServer(built.app, {
+      replayDedupe: createPostgresReplayDedupe(testDatabaseUrl()),
       signingSecret: SECRET,
       keychain: built.keychain,
       keychainApprovals: approvals,
       deliveries: built.deliveries,
       ...(built.fireAskResolution ? { fireAskResolution: built.fireAskResolution } : {}),
-      workspace: built.workspace,
       auditLog: built.auditLog,
       credentialUsage: built.credentialUsage,
     });
@@ -652,6 +630,40 @@ describe("/v1/keychain/asks — card approval end to end", async () => {
   });
   after(async () => {
     await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  it("an ask names the owner and service; the server resolves the credential or returns the candidates", async () => {
+    const alice = await capFor("U_ALICE");
+    const save = async (service: string, accountLabel?: string, envKey?: string) =>
+      (
+        (await (
+          await post("/v1/keychain/credentials", { service, secret: "s", accountLabel, envKey }, alice)
+        ).json()) as any
+      ).credential;
+    const deploy = await save("named-deploy");
+    await save("named-twin", "work", "TWIN_WORK");
+    await save("named-twin", "home", "TWIN_HOME");
+    const bob = await bobInInfra();
+    const ask = (body: Record<string, unknown>) =>
+      post("/v1/keychain/asks", { purpose: "run the deploy", ...body }, bob);
+
+    const resolved = await ask({ owner: "alice", service: "Named-Deploy" });
+    assert.equal(resolved.status, 200);
+    assert.equal(((await resolved.json()) as any).ask.credentialId, deploy.id);
+
+    const ambiguous = await ask({ owner: "U_ALICE", service: "named-twin" });
+    assert.equal(ambiguous.status, 409);
+    const { candidates } = (await ambiguous.json()) as any;
+    assert.deepEqual(candidates.map((c: any) => [c.service, c.account]).sort(), [
+      ["named-twin", "home"],
+      ["named-twin", "work"],
+    ]);
+    assert.equal((await ask({ credential: candidates[0].credential })).status, 200);
+
+    const unknown = await ask({ owner: "Alice", service: "nope" });
+    assert.equal(unknown.status, 404);
+    assert.ok(((await unknown.json()) as any).candidates.some((c: any) => c.service === "named-deploy"));
+    assert.equal((await ask({ owner: "Nobody", service: "named-deploy" })).status, 404);
   });
 
   it("the web approval route decides through the same card path, owner only, never by capability", async () => {
@@ -677,11 +689,11 @@ describe("/v1/keychain/asks — card approval end to end", async () => {
     };
     assert.deepEqual(await inline("U_ALICE"), [`keychain:${ask.id}`], "the owner sees the card inline in the session");
     const path = `/v1/keychain/approvals/${ask.id}`;
-    const signed = (principalId: string) => {
-      const body = JSON.stringify({ principalId, decision: "standing" });
+    const signed = (principalId: string, identity: Record<string, string> = {}, decision = "standing") => {
+      const body = JSON.stringify({ principalId, decision });
       return fetch(`${base}${path}`, {
         method: "POST",
-        headers: signedRequestHeaders(SECRET, "POST", path, body),
+        headers: { ...signedRequestHeaders(SECRET, "POST", path, body), ...identity },
         body,
       });
     };
@@ -690,6 +702,13 @@ describe("/v1/keychain/asks — card approval end to end", async () => {
       200,
     );
     assert.equal((await signed("U_BOB")).status, 403);
+    const impersonation = await mintSignedPayload({ p: "U_ALICE", imp: "U_BOB", exp: Date.now() + 60_000 }, SECRET);
+    const impersonated = await signed("U_ALICE", { "x-portal-identity": impersonation }, "once");
+    assert.deepEqual(
+      [impersonated.status, ((await impersonated.json()) as { message?: string }).message],
+      [403, "Sign in as yourself to decide on credential use."],
+      "an admin impersonating the owner cannot decide for them",
+    );
     const res = await signed("U_ALICE");
     assert.equal(res.status, 200);
     const view = (await res.json()) as any;
@@ -859,13 +878,22 @@ describe("/v1/keychain/asks — card approval end to end", async () => {
 
     const resolution = await waitFor(() => resumeTurns(session!.id, /The credential owner approved access/));
     assert.equal(resolution.length, 1, "exactly one resolution turn, in the original thread's session");
-    const { text: prompt, environment } = resolution[0]!.payload as { text: string; environment: string };
+    const prompt = resolution[0]!.text ?? "";
+    const environment = String(resolution[0]!.body.environment);
+    const listSystems = async () =>
+      (await built.sessions.listLlmRequests(session!.id)).map((r) => (r.promptEnvelope as { system: string }).system);
+    await waitFor(async () => ((await listSystems()).at(-1)?.includes(`\`github:${gh.id}\``) ? [true] : []));
+    const systems = await listSystems();
     assert.ok(
       !prompt.includes(ask.id) && !prompt.includes(grant.id) && !prompt.includes(gh.id),
       "no ids in the resume text",
     );
-    assert.ok(environment.includes(`github:${gh.id}`), "the credential handle belongs in the inventory");
-    assert.ok(environment.includes(grant.id), "the inventory includes the approved grant");
+    assert.ok(!systems[0]!.includes(`\`github:${gh.id}\``), "no handle before the approval");
+    assert.ok(systems.at(-1)!.includes(`\`github:${gh.id}\``), "the approved handle reaches the system prompt");
+    assert.ok(
+      !environment.includes(grant.id) && !systems.at(-1)!.includes(grant.id),
+      "grant ids stay out of the prompt",
+    );
     assert.ok(!prompt.includes("clone acme/payments"), "no purpose text in the resume text");
 
     await waitFor(async () =>
@@ -973,7 +1001,7 @@ describe("/v1/keychain/asks — card approval end to end", async () => {
         });
         const seed = await built.app.turn({
           surface: "cron",
-          triggered: true,
+          origin: { kind: "automation" },
           actor: { externalId: requesterId },
           conversation: {
             kind: kind === "channel" ? "channel" : "group",
@@ -1192,7 +1220,7 @@ describe("/v1/keychain/asks — card approval end to end", async () => {
     await built.scheduler.tick(Date.now());
     const resolved = await waitFor(() => resumeTurns(session!.id, /did not answer the access request/));
     assert.equal(resolved.length, 1, "exactly one expired-resolution turn in the asking thread");
-    assert.ok(!(resolved[0]!.payload as { text: string }).text.includes(made.ask.id));
+    assert.ok(!resolved[0]!.text!.includes(made.ask.id));
 
     await built.scheduler.tick(Date.now());
     assert.equal(
@@ -1231,7 +1259,7 @@ test("turn e2e: trigger-fired turns mint `triggered` into the capability token; 
       actor: { externalId: "U_ALICE" },
       conversation: { kind: "channel", threadRef: "ch:C9-t", channelRef: "C9", audience: [{ externalId: "U_ALICE" }] },
       text: "!run true",
-      ...(triggered ? { triggered: true } : {}),
+      ...(triggered ? { origin: { kind: "automation" } } : {}),
     }) as TurnRequest;
 
   assert.equal((await built.app.turn(turn(false))).status, "ok");

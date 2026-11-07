@@ -1,14 +1,17 @@
 locals {
-  qm_scaffold_version     = 3
-  tags                    = { Deployment = var.org_id, ManagedBy = "terraform" }
-  azs                     = length(data.aws_availability_zones.available.names) >= 2 ? slice(data.aws_availability_zones.available.names, 0, 2) : []
-  subnet_ids              = values(aws_subnet.public)[*].id
-  vpc_id                  = aws_vpc.this.id
-  has_portal              = contains(keys(var.services), "portal")
-  public_path_services    = { for name, service in var.services : name => service.public_paths if length(service.public_paths) > 0 }
-  public_service_names    = concat(local.has_portal ? concat(["portal"], length(var.core_public_hosts) > 0 ? ["core"] : []) : ["core"], keys(local.public_path_services))
-  ingress_services        = { for name, service in var.services : name => service if contains(local.public_service_names, name) }
-  direct_path_services    = merge(local.has_portal ? {} : { core = ["/v1/*"] }, local.public_path_services)
+  qm_scaffold_version  = 4
+  tags                 = { Deployment = var.org_id, ManagedBy = "terraform" }
+  azs                  = length(data.aws_availability_zones.available.names) >= 2 ? slice(data.aws_availability_zones.available.names, 0, 2) : []
+  subnet_ids           = values(aws_subnet.public)[*].id
+  vpc_id               = aws_vpc.this.id
+  public_path_services = { for name, service in var.services : name => service.public_paths if length(service.public_paths) > 0 }
+  ingress = merge(
+    { for name, paths in local.public_path_services : name => { service = name, port = var.services[name].internal_port, paths = paths, hosts = [], priority = 1 + index(sort(keys(local.public_path_services)), name) } },
+    { core-public = { service = "core", port = var.services["core"].public_port, paths = ["/*"], hosts = [], priority = 50000 } },
+    length(var.core_public_hosts) > 0 ? { core = { service = "core", port = var.services["core"].internal_port, paths = [], hosts = sort(tolist(var.core_public_hosts)), priority = 1000 } } : {},
+  )
+  service_ingress         = { for name in keys(var.services) : name => { for key, route in local.ingress : key => route if route.service == name } }
+  egress_proxy            = { for name, service in var.services : name => service if name == "egress-proxy" }
   alb_name                = "${substr(var.cluster_name, 0, 23)}-${substr(sha1(var.cluster_name), 0, 8)}"
   service_security_groups = [aws_security_group.services.id]
   default_task_role_arn   = aws_iam_role.task.arn
@@ -123,7 +126,7 @@ resource "aws_security_group" "services" {
   name   = "${var.cluster_name}-services"
   vpc_id = local.vpc_id
   dynamic "ingress" {
-    for_each = toset([for service in values(local.ingress_services) : tostring(service.internal_port)])
+    for_each = toset(concat([for route in values(local.ingress) : tostring(route.port)], [tostring(var.services["core"].internal_port)]))
     content {
       from_port       = tonumber(ingress.value)
       to_port         = tonumber(ingress.value)
@@ -319,9 +322,6 @@ resource "aws_iam_role" "github_deploy" {
       Condition = {
         StringEquals = {
           "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
-          # With a GitHub environment configured, only environment-scoped runs may assume the
-          # role (every deploy workflow declares one); the bare branch subject is the fallback
-          # for deployments that configure no environment.
           "token.actions.githubusercontent.com:sub" = compact([
             var.github_environment != "" ? "${local.github_subject_prefix}:environment:${var.github_environment}" : "",
             var.github_environment == "" ? "${local.github_subject_prefix}:ref:${var.github_ref}" : "",
@@ -699,7 +699,6 @@ resource "aws_s3_bucket_lifecycle_configuration" "objects" {
       days = 1
     }
 
-    # Keep this identical to the rule written by the core's ensureExpiry.
     abort_incomplete_multipart_upload {
       days_after_initiation = 1
     }
@@ -722,9 +721,7 @@ resource "aws_iam_role_policy" "task_objects" {
         Resource = aws_s3_bucket.objects.arn
       },
       {
-        Effect = "Allow"
-        # AbortMultipartUpload is its own action — PutObject covers Create/UploadPart/Complete but
-        # not the abort, and without it a failed staging upload strands parts that bill silently.
+        Effect   = "Allow"
         Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"]
         Resource = "${aws_s3_bucket.objects.arn}/*"
       },
@@ -787,9 +784,9 @@ resource "aws_lb" "this" {
 }
 
 resource "aws_lb_target_group" "service" {
-  for_each    = local.ingress_services
+  for_each    = local.ingress
   name        = "${substr(var.cluster_name, 0, 20)}-${substr(replace(each.key, "-", ""), 0, 4)}-${substr(sha1("${var.cluster_name}:${each.key}"), 0, 6)}"
-  port        = each.value.internal_port
+  port        = each.value.port
   protocol    = "HTTP"
   target_type = "ip"
   vpc_id      = local.vpc_id
@@ -801,9 +798,9 @@ resource "aws_lb_target_group" "service" {
 }
 
 resource "aws_lb_target_group" "alternate" {
-  for_each    = local.ingress_services
+  for_each    = local.ingress
   name        = "${substr(var.cluster_name, 0, 16)}-${substr(replace(each.key, "-", ""), 0, 4)}-g-${substr(sha1("${var.cluster_name}:${each.key}:alternate"), 0, 6)}"
-  port        = each.value.internal_port
+  port        = each.value.port
   protocol    = "HTTP"
   target_type = "ip"
   vpc_id      = local.vpc_id
@@ -826,6 +823,63 @@ resource "aws_lb_listener" "public" {
       content_type = "text/plain"
       message_body = "not found"
       status_code  = "404"
+    }
+  }
+}
+
+resource "aws_security_group" "egress_proxy" {
+  for_each = local.egress_proxy
+  name     = "${var.cluster_name}-egress-proxy"
+  vpc_id   = local.vpc_id
+  ingress {
+    from_port   = each.value.internal_port
+    to_port     = each.value.internal_port
+    protocol    = "tcp"
+    cidr_blocks = [aws_vpc.this.cidr_block]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  tags = local.tags
+}
+
+resource "aws_lb" "egress_proxy" {
+  for_each                         = local.egress_proxy
+  name                             = "${substr(var.cluster_name, 0, 20)}-egr-${substr(sha1("${var.cluster_name}:${each.key}"), 0, 6)}"
+  load_balancer_type               = "network"
+  subnets                          = local.subnet_ids
+  enable_cross_zone_load_balancing = true
+  tags                             = local.tags
+}
+
+resource "aws_lb_target_group" "egress_proxy" {
+  for_each    = local.egress_proxy
+  name        = "${substr(var.cluster_name, 0, 20)}-egr-${substr(sha1("${var.cluster_name}:${each.key}:tcp"), 0, 6)}"
+  port        = each.value.internal_port
+  protocol    = "TCP"
+  target_type = "ip"
+  vpc_id      = local.vpc_id
+  tags        = local.tags
+}
+
+resource "aws_lb_listener" "egress_proxy" {
+  for_each          = local.egress_proxy
+  load_balancer_arn = aws_lb.egress_proxy[each.key].arn
+  port              = 443
+  protocol          = "TLS"
+  certificate_arn   = var.certificate_arn
+  ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.egress_proxy[each.key].arn
+  }
+  lifecycle {
+    precondition {
+      condition     = var.certificate_arn != ""
+      error_message = "the egress-proxy service requires certificate_arn: sandboxes present capability tokens to it, so it only listens on TLS"
     }
   }
 }
@@ -876,9 +930,9 @@ resource "aws_cloudfront_distribution" "portal" {
 }
 
 resource "aws_lb_listener_rule" "production" {
-  for_each     = local.ingress_services
+  for_each     = local.ingress
   listener_arn = aws_lb_listener.public.arn
-  priority     = contains(keys(local.public_path_services), each.key) ? 1 + index(sort(keys(local.public_path_services)), each.key) : (length(local.public_path_services) > 0 ? 1000 : 10) + index(sort(keys(var.services)), each.key)
+  priority     = each.value.priority
   lifecycle {
     ignore_changes = [action]
   }
@@ -896,15 +950,15 @@ resource "aws_lb_listener_rule" "production" {
     }
   }
   dynamic "condition" {
-    for_each = each.key == "portal" || contains(keys(local.direct_path_services), each.key) ? [1] : []
+    for_each = length(each.value.paths) > 0 ? [1] : []
     content {
-      path_pattern { values = each.key == "portal" ? ["/*"] : local.direct_path_services[each.key] }
+      path_pattern { values = each.value.paths }
     }
   }
   dynamic "condition" {
-    for_each = each.key == "core" && local.has_portal ? [1] : []
+    for_each = length(each.value.hosts) > 0 ? [1] : []
     content {
-      host_header { values = sort(tolist(var.core_public_hosts)) }
+      host_header { values = each.value.hosts }
     }
   }
 }
@@ -917,7 +971,7 @@ resource "aws_cloudwatch_log_group" "service" {
 }
 
 resource "aws_cloudwatch_metric_alarm" "primary_target_5xx" {
-  for_each            = local.ingress_services
+  for_each            = local.ingress
   alarm_name          = "${var.cluster_name}-${each.key}-primary-target-5xx"
   alarm_description   = "Rollback an ECS deployment when the primary target group serves 5xx responses."
   namespace           = "AWS/ApplicationELB"
@@ -937,7 +991,7 @@ resource "aws_cloudwatch_metric_alarm" "primary_target_5xx" {
 }
 
 resource "aws_cloudwatch_metric_alarm" "alternate_target_5xx" {
-  for_each            = local.ingress_services
+  for_each            = local.ingress
   alarm_name          = "${var.cluster_name}-${each.key}-alternate-target-5xx"
   alarm_description   = "Rollback an ECS deployment when the alternate target group serves 5xx responses."
   namespace           = "AWS/ApplicationELB"
@@ -969,13 +1023,13 @@ resource "aws_ecs_task_definition" "bootstrap" {
     operating_system_family = "LINUX"
     cpu_architecture        = each.value.architecture == "amd64" ? "X86_64" : "ARM64"
   }
-  container_definitions = jsonencode([{ name = each.key, image = "public.ecr.aws/docker/library/alpine:3.20", essential = true, command = ["sh", "-c", "while true; do nc -l -p ${each.value.internal_port} -e echo ok; done"], portMappings = [{ name = each.key, containerPort = each.value.internal_port, appProtocol = "http" }], logConfiguration = { logDriver = "awslogs", options = { awslogs-group = aws_cloudwatch_log_group.service[each.key].name, awslogs-region = var.region, awslogs-stream-prefix = each.key } } }])
+  container_definitions = jsonencode([{ name = each.key, image = "public.ecr.aws/docker/library/alpine:3.20", essential = true, command = ["sh", "-c", "while true; do nc -l -p ${each.value.internal_port} -e echo ok; done"], portMappings = concat([merge({ name = each.key, containerPort = each.value.internal_port }, contains(keys(local.egress_proxy), each.key) ? {} : { appProtocol = "http" })], each.value.public_port == null ? [] : [{ name = "${each.key}-public", containerPort = each.value.public_port, appProtocol = "http" }]), logConfiguration = { logDriver = "awslogs", options = { awslogs-group = aws_cloudwatch_log_group.service[each.key].name, awslogs-region = var.region, awslogs-stream-prefix = each.key } } }])
   tags                  = local.tags
 }
 
 resource "aws_ecs_service" "service" {
   for_each        = var.services
-  depends_on      = [aws_lb_listener.public, aws_lb_listener_rule.production, aws_iam_role_policy_attachment.ecs_load_balancer]
+  depends_on      = [aws_lb_listener.public, aws_lb_listener_rule.production, aws_lb_listener.egress_proxy, aws_iam_role_policy_attachment.ecs_load_balancer]
   name            = each.value.ecs_service
   cluster         = aws_ecs_cluster.this.id
   task_definition = aws_ecs_task_definition.bootstrap[each.key].arn
@@ -983,7 +1037,7 @@ resource "aws_ecs_service" "service" {
   launch_type     = "FARGATE"
   network_configuration {
     subnets          = local.subnet_ids
-    security_groups  = local.service_security_groups
+    security_groups  = contains(keys(local.egress_proxy), each.key) ? [aws_security_group.egress_proxy[each.key].id] : local.service_security_groups
     assign_public_ip = true
   }
   service_connect_configuration {
@@ -992,9 +1046,12 @@ resource "aws_ecs_service" "service" {
     service {
       port_name      = each.key
       discovery_name = each.key
-      timeout {
-        idle_timeout_seconds        = 300
-        per_request_timeout_seconds = 0
+      dynamic "timeout" {
+        for_each = contains(keys(local.egress_proxy), each.key) ? [] : [each.key]
+        content {
+          idle_timeout_seconds        = 300
+          per_request_timeout_seconds = 0
+        }
       }
       client_alias {
         dns_name = "${each.key}.${var.cloud_map_namespace}"
@@ -1008,32 +1065,42 @@ resource "aws_ecs_service" "service" {
     rollback = true
   }
   deployment_configuration {
-    strategy             = "BLUE_GREEN"
-    bake_time_in_minutes = var.ecs_blue_green_bake_minutes
+    strategy             = contains(keys(local.egress_proxy), each.key) ? "ROLLING" : "BLUE_GREEN"
+    bake_time_in_minutes = contains(keys(local.egress_proxy), each.key) ? null : var.ecs_blue_green_bake_minutes
   }
   dynamic "alarms" {
-    for_each = contains(keys(local.ingress_services), each.key) ? [each.key] : []
+    for_each = length(local.service_ingress[each.key]) > 0 ? [each.key] : []
     content {
-      alarm_names = [
-        aws_cloudwatch_metric_alarm.primary_target_5xx[alarms.value].alarm_name,
-        aws_cloudwatch_metric_alarm.alternate_target_5xx[alarms.value].alarm_name,
-      ]
+      alarm_names = flatten([
+        for key in sort(keys(local.service_ingress[each.key])) : [
+          aws_cloudwatch_metric_alarm.primary_target_5xx[key].alarm_name,
+          aws_cloudwatch_metric_alarm.alternate_target_5xx[key].alarm_name,
+        ]
+      ])
       enable   = true
       rollback = true
     }
   }
   sigint_rollback = true
   dynamic "load_balancer" {
-    for_each = contains(keys(local.ingress_services), each.key) ? [each.key] : []
+    for_each = local.service_ingress[each.key]
     content {
-      target_group_arn = aws_lb_target_group.service[load_balancer.value].arn
+      target_group_arn = aws_lb_target_group.service[load_balancer.key].arn
       container_name   = each.key
-      container_port   = each.value.internal_port
+      container_port   = load_balancer.value.port
       advanced_configuration {
-        alternate_target_group_arn = aws_lb_target_group.alternate[load_balancer.value].arn
-        production_listener_rule   = aws_lb_listener_rule.production[load_balancer.value].arn
+        alternate_target_group_arn = aws_lb_target_group.alternate[load_balancer.key].arn
+        production_listener_rule   = aws_lb_listener_rule.production[load_balancer.key].arn
         role_arn                   = aws_iam_role.ecs_load_balancer.arn
       }
+    }
+  }
+  dynamic "load_balancer" {
+    for_each = contains(keys(local.egress_proxy), each.key) ? [each.key] : []
+    content {
+      target_group_arn = aws_lb_target_group.egress_proxy[load_balancer.value].arn
+      container_name   = each.key
+      container_port   = each.value.internal_port
     }
   }
   lifecycle {

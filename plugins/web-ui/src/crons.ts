@@ -131,7 +131,7 @@ async function refreshCrons(opts: { showLoading?: boolean } = {}): Promise<boole
   }
 }
 
-function cronText(c: CronView): string {
+function cronText(c: Pick<CronView, "action" | "message">): string {
   return c.message ?? c.action ?? "";
 }
 
@@ -152,19 +152,8 @@ function clipWords(text: string, max = 64): string {
   return `${(wordCut.length >= max * 0.55 ? wordCut : cut).trim()}…`;
 }
 
-function suggestedCronTitle(text: string): string {
-  const clean = cleanCronText(text);
-  if (!clean) return "(untitled cron)";
-  const candidate = clean
-    .replace(/^(please\s+)?(run|generate|create|send|post|deliver|summarize|check)\s+(the\s+)?/i, "")
-    .replace(/\s*[:;.!?]\s+.*$/, "")
-    .trim();
-  const clipped = clipWords(candidate || clean, 58);
-  return clipped.replace(/^[a-z]/, (ch) => ch.toUpperCase());
-}
-
-function cronTitle(c: CronView): string {
-  return c.title?.trim() || suggestedCronTitle(cronText(c));
+export function cronTitle(c: Pick<CronView, "title" | "action" | "message">): string {
+  return c.title?.trim() || clipWords(cronText(c), 58) || "(untitled cron)";
 }
 
 function cronScopeLabel(c: CronView): string {
@@ -606,7 +595,7 @@ function cronRunHistory(c: CronView): TemplateResult {
 async function loadCronRuns(id: string): Promise<void> {
   cronRunsLoading.add(id);
   try {
-    const result = await api<{ runs: CronRunView[] }>(`/api/crons/${encodeURIComponent(id)}/runs`);
+    const result = await api<{ runs: CronRunView[] }>(`/api/crons/${encodeURIComponent(id)}/runs?limit=20`);
     cronRuns.set(id, result.runs ?? []);
   } catch (error) {
     cronActionNotice = errMessage(error, "Couldn't load run history.");

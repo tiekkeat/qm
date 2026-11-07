@@ -1,16 +1,16 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { randomUUID } from "node:crypto";
-import { createMemoryRunStore } from "../src/runs/memory-run-store.ts";
 import { createPostgresRunStore } from "../src/runs/postgres-run-store.ts";
 import type { OrchestratorInput } from "../src/core/orchestrator.ts";
-const database = process.env.DATABASE_URL;
-for (const backend of ["memory", "postgres"]) {
+import { testDatabaseUrl } from "./support/test-database.ts";
+const database = testDatabaseUrl();
+for (const backend of ["postgres"]) {
   test(
     `${backend}: agent deletion withdraws only unstarted matching queued turns`,
     { skip: backend === "postgres" && !database },
     async () => {
-      const runs = backend === "memory" ? createMemoryRunStore().runs : createPostgresRunStore(database!).runs;
+      const runs = createPostgresRunStore(database).runs;
       const actor = { id: "owner", type: "internal" as const };
       const agentId = randomUUID();
       const sessionId = randomUUID();

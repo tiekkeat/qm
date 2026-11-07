@@ -7,7 +7,8 @@ import {
 } from "../../persistence/blob-transfer.ts";
 import { CAPABILITY_HEADER } from "../contract.ts";
 import { canonicalPayload } from "../../../plugins/chassis/src/source-auth-sign.ts";
-import { extendBodyDeadline, headerValue, pipeToResponse, sendJson, verifyOrReject } from "../http.ts";
+import { extendBodyDeadline, headerValue, sendJson, verifyOrReject } from "../http.ts";
+import { relayStream } from "../../../plugins/chassis/src/http.ts";
 
 const STAGE_UPLOAD_DEADLINE_MS = 1_800_000;
 import type { BaseCtx, Route } from "./route.ts";
@@ -72,7 +73,7 @@ async function putBlob(ctx: BaseCtx): Promise<void> {
   }
   const authz = await authorizeBlob(ctx, "write", null);
   if (!authz) return;
-  if (authz.via === "capability") extendBodyDeadline(req, STAGE_UPLOAD_DEADLINE_MS);
+  extendBodyDeadline(req, STAGE_UPLOAD_DEADLINE_MS);
   try {
     const info = await deps.blobTransfer.put(req, {
       maxBytes: authz.via === "capability" ? MAX_STAGE_BLOB_BYTES : MAX_BLOB_BYTES,
@@ -98,11 +99,11 @@ async function getBlob(ctx: BaseCtx): Promise<void> {
   const blob = await deps.blobTransfer.open(id);
   if (!blob) return sendJson(res, 404, { error: "not_found" });
   res.writeHead(200, { "content-type": "application/octet-stream", "content-length": String(blob.sizeBytes) });
-  pipeToResponse(res, blob.stream, "blob read failed");
+  relayStream(blob.stream, res);
   return;
 }
 
 export const blobRoutes: ReadonlyArray<Route<BaseCtx>> = [
-  { method: "POST", path: "/v1/blobs", auth: "either", handle: putBlob },
+  { method: "POST", path: "/v1/blobs", actor: "system", auth: "either", handle: putBlob },
   { method: "GET", path: "/v1/blobs/:id", auth: "either", handle: getBlob },
 ];

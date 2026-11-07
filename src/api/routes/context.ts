@@ -1,4 +1,4 @@
-import type { SurfaceContextQuery, SurfaceContextResult } from "../../types.ts";
+import type { SurfaceContextQuery, SurfaceContextResult } from "../../reach/reach.ts";
 import { BLOB_TRANSFER_AUD, mintCapabilityToken } from "../../auth/capability-token.ts";
 import { CAPABILITY_HEADER } from "../contract.ts";
 import { sendJson } from "../http.ts";
@@ -52,7 +52,7 @@ async function resolveSurfaceTarget(
     return { source: "slack", target: { channelId: r.channel.channelId, channelName: r.channel.name } };
   }
   const dest = cap.destination;
-  if (!dest?.target || dest.type !== "slack") {
+  if (!dest?.target || !app.surfaceMirrored(dest.type)) {
     sendJson(res, 400, {
       error: "no_conversation",
       message: "this conversation has no surface history to pull — name a channel instead",
@@ -94,6 +94,7 @@ async function createSurfaceContextRequest(ctx: ApiCtx): Promise<void> {
     ...(await rateLimitRecipient(ctx)),
     ...(before ? { before } : {}),
     ...(match ? { match } : {}),
+    ...(b.live === true ? { live: true } : {}),
   };
   const request = await app.createContextRequest(resolved.source, query);
   return awaitFulfillment(ctx, request.id, query.channelName);
@@ -240,6 +241,8 @@ async function fulfillContextRequest(ctx: ApiCtx): Promise<void> {
             ...(typeof b.hasMore === "boolean" ? { hasMore: b.hasMore } : {}),
             ...(typeof b.nextBefore === "string" ? { nextBefore: b.nextBefore } : {}),
             ...(typeof b.note === "string" ? { note: b.note } : {}),
+            ...(Array.isArray(b.selfTs) ? { selfTs: b.selfTs.filter((ts) => typeof ts === "string") } : {}),
+            ...(b.liveSearch === "unconfigured" || b.liveSearch === "unconnected" ? { liveSearch: b.liveSearch } : {}),
             ...(file ? { file } : {}),
             ...(group ? { group } : {}),
           } satisfies SurfaceContextResult,
@@ -253,8 +256,21 @@ async function fulfillContextRequest(ctx: ApiCtx): Promise<void> {
 }
 
 export const contextRoutes: ReadonlyArray<Route<ApiCtx>> = [
-  { method: "POST", path: "/v1/surface-context", auth: "either", handle: createSurfaceContextRequest },
-  { method: "POST", path: "/v1/surface-file", auth: "either", handle: createSurfaceFileRequest },
+  {
+    method: "POST",
+    path: "/v1/surface-context",
+    actor: "system",
+    auth: "either",
+    allowedInStrict: true,
+    handle: createSurfaceContextRequest,
+  },
+  { method: "POST", path: "/v1/surface-file", actor: "system", auth: "either", handle: createSurfaceFileRequest },
   { method: "GET", path: "/v1/surface-context/pending", auth: "source", handle: listPendingContextRequests },
-  { method: "POST", path: "/v1/surface-context/:id/result", auth: "source", handle: fulfillContextRequest },
+  {
+    method: "POST",
+    path: "/v1/surface-context/:id/result",
+    actor: "system",
+    auth: "source",
+    handle: fulfillContextRequest,
+  },
 ];

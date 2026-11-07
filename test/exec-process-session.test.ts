@@ -4,7 +4,12 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createExecProcessSessions, type ExecProcessIo, redactCommand } from "../src/sandbox/exec-process-session.ts";
+import {
+  createExecProcessSessions,
+  type ExecProcessIo,
+  ProcessSessionGoneError,
+  redactCommand,
+} from "../src/sandbox/exec-process-session.ts";
 import type { ExecResult, SandboxHandle } from "../src/sandbox/sandbox.ts";
 
 function shellIo(home: string): ExecProcessIo {
@@ -138,7 +143,7 @@ test("signalProcess(KILL) records an exit even though the launcher trap can't ca
 test("reading or writing an unknown process id is rejected", async () => {
   const { proc, handle } = fixture();
   const bogus = "00000000-0000-0000-0000-000000000000";
-  await assert.rejects(proc.readProcess(handle, bogus), /no such process/);
+  await assert.rejects(proc.readProcess(handle, bogus), ProcessSessionGoneError);
   await assert.rejects(proc.writeStdin(handle, bogus, "x"), /writeStdin failed/);
 });
 
@@ -306,4 +311,14 @@ test("a session from the current boot keeps running, and one with no boot marker
     { state: "running" },
     "sessions predating this change have no marker and must not be reaped on a guess",
   );
+});
+
+test("redactCommand hides exported secrets and stays fast on a keyword-flooded export", () => {
+  assert.equal(redactCommand("export MY_API_KEY='shh' && run"), "export MY_API_KEY='<redacted>' && run");
+  assert.equal(redactCommand("export REGION='us-east-1'"), "export REGION='us-east-1'");
+  const flooded = `export N${"TKEYP".repeat(20_000)}`;
+  const started = performance.now();
+  assert.equal(redactCommand(flooded), flooded.slice(0, 500));
+  const elapsed = performance.now() - started;
+  assert.ok(elapsed < 1_000, `keyword flood took ${Math.round(elapsed)}ms`);
 });

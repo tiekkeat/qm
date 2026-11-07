@@ -5,12 +5,15 @@ import type { AddressInfo } from "node:net";
 import test from "node:test";
 import { createServer } from "../src/api/server.ts";
 import { signRequest } from "../src/auth/source-auth.ts";
-import { createMemorySessionStore } from "../src/sessions/memory-session-store.ts";
 import type { SessionStore } from "../src/sessions/session-store.ts";
 import { scopeId } from "../src/types.ts";
-import { buildApp, serverDeps } from "../src/wiring.ts";
+import { serverDeps } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { bill } from "./support/spend-usage.ts";
 import { testConfig } from "./support/test-config.ts";
+import { createPostgresSessionStore } from "../src/sessions/postgres-session-store.ts";
+import { testDatabaseUrl } from "./support/test-database.ts";
+import { createPostgresReplayDedupe } from "../src/auth/replay-dedupe.ts";
 
 const DAY = 86_400_000;
 const sourceSecret = "source-only-secret".repeat(3);
@@ -21,9 +24,11 @@ const window = `from=${iso(today - DAY)}&to=${iso(today + DAY)}`;
 
 function fixture(options: { token?: string | null; sessions?: SessionStore | null } = {}) {
   const built = buildApp(testConfig({ signingSecret: sourceSecret }));
-  const sessions = options.sessions === null ? undefined : (options.sessions ?? createMemorySessionStore());
+  const sessions =
+    options.sessions === null ? undefined : (options.sessions ?? createPostgresSessionStore(testDatabaseUrl()));
   const token = options.token === undefined ? exportToken : options.token;
   const server = createServer(built.app, {
+    replayDedupe: createPostgresReplayDedupe(testDatabaseUrl()),
     signingSecret: sourceSecret,
     portalIdentitySecret: "portal-identity-secret".repeat(3),
     capabilitySecret: "capability-only-secret".repeat(3),
@@ -51,7 +56,7 @@ test("spend export: absent unless a token is configured", async () => {
 });
 
 test("spend export: missing, wrong, admin-identity and source-signed requests are refused before any spend read", async () => {
-  const store = createMemorySessionStore();
+  const store = createPostgresSessionStore(testDatabaseUrl());
   let reads = 0;
   store.spendRollup = async () => {
     reads++;
@@ -86,7 +91,7 @@ test("spend export: missing, wrong, admin-identity and source-signed requests ar
 test("spend export: the token authorizes the export and nothing else", async () => {
   const s = fixture();
   try {
-    for (const path of ["/v1/admin/spend", "/v1/admin/whoami", "/v1/admin/users", "/v1/background-work"]) {
+    for (const path of ["/v1/admin/spend", "/v1/admin/whoami", "/v1/admin/users"]) {
       const res = await s.get(path);
       assert.equal(res.status, 401, path);
     }
@@ -95,7 +100,7 @@ test("spend export: the token authorizes the export and nothing else", async () 
   }
 });
 
-test("spend export: rows keep the ledger grain with canonical people, origin buckets and the org scope, in code-point order", async () => {
+test("spend export: rows keep the ledger grain with canonical people, sources and the org scope, in code-point order", async () => {
   const s = fixture();
   try {
     const sessions = s.sessions!;
@@ -111,13 +116,23 @@ test("spend export: rows keep the ledger grain with canonical people, origin buc
     assert.equal(body.scopeId, "org:default-org");
     assert.deepEqual(body.window, { from: iso(today - DAY), to: iso(today + DAY) });
     assert.deepEqual(
-      body.rows.map((r: any) => [r.day, r.scopeId, r.kind, r.principalId, r.origin, r.model, r.calls, r.costUsd]),
+      body.rows.map((r: any) => [
+        r.day,
+        r.scopeId,
+        r.kind,
+        r.principalId,
+        r.source,
+        r.cronId,
+        r.model,
+        r.calls,
+        r.costUsd,
+      ]),
       [
-        [iso(today), "channel:C1", "channel", null, "live", "claude-opus-5", 1, 3],
-        [iso(today), "channel:C1", "channel", null, "background", "claude-opus-5", 1, 4],
-        [iso(today), "personal:U1", "person", "U1", "live", "claude-opus-5", 1, 1],
-        [iso(today), "personal:alice", "person", "alice", "live", "claude-opus-5", 2, 3],
-        [iso(today), "personal:alice", "person", "alice", "cron", "gpt-6-astra", 1, 0.5],
+        [iso(today), "channel:C1", "channel", null, "live", null, "claude-opus-5", 1, 3],
+        [iso(today), "channel:C1", "channel", null, "webhook", null, "claude-opus-5", 1, 4],
+        [iso(today), "personal:U1", "person", "U1", "live", null, "claude-opus-5", 1, 1],
+        [iso(today), "personal:alice", "person", "alice", "live", null, "claude-opus-5", 2, 3],
+        [iso(today), "personal:alice", "person", "alice", "cron", "nightly", "gpt-6-astra", 1, 0.5],
       ],
     );
     assert.deepEqual(
@@ -133,8 +148,52 @@ test("spend export: rows keep the ledger grain with canonical people, origin buc
   }
 });
 
+test("spend export: lists each billed cron's title, owner and schedule without its task", async () => {
+  const s = fixture();
+  try {
+    const cron = await s.built.app.createCron({
+      ownerScopeId: "personal:alice",
+      owner: "alice",
+      createdBy: "alice",
+      title: "Morning digest",
+      schedule: { cron: "0 9 * * 1-5", timezone: "America/New_York" },
+      action: "summarize my unread mail",
+    });
+    await s.built.app.createCron({
+      ownerScopeId: "personal:alice",
+      owner: "alice",
+      createdBy: "alice",
+      title: "Never billed",
+      schedule: { everyMs: 60_000 },
+      action: "idle",
+    });
+    await bill(s.sessions!, `cron:${cron.id}:fire:1`, "dm", scopeId("personal", "alice"), { costUsd: 2 }, "m1");
+    await bill(s.sessions!, "cron:deleted:fire:1", "dm", scopeId("personal", "alice"), { costUsd: 1 }, "m1");
+    const body: any = await (await s.get(`/v1/spend/export?${window}`)).json();
+    assert.deepEqual(
+      body.rows.map((r: any) => [r.cronId, r.costUsd]),
+      [
+        [cron.id, 2],
+        ["deleted", 1],
+      ].sort((a, b) => (String(a[0]) < String(b[0]) ? -1 : 1)),
+    );
+    assert.deepEqual(body.crons, [
+      {
+        id: cron.id,
+        title: "Morning digest",
+        owner: "alice",
+        ownerScopeId: "personal:alice",
+        schedule: { cron: "0 9 * * 1-5", timezone: "America/New_York" },
+        enabled: true,
+      },
+    ]);
+  } finally {
+    await s.close();
+  }
+});
+
 test("spend export: passes through the saved report's freshness", async () => {
-  const store = createMemorySessionStore();
+  const store = createPostgresSessionStore(testDatabaseUrl());
   const asOf = Date.UTC(2026, 0, 1);
   store.spendReport = async (range) => ({ rows: await store.spendRollup(range), asOf });
   const s = fixture({ sessions: store });

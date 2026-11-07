@@ -1,3 +1,4 @@
+import { item } from "./item-fixture.ts";
 import { browserEnv } from "./browser-env.ts";
 import type { Conversation } from "../src/conv-types.ts";
 import type { CoreContext, CoreSession, TranscriptPage } from "../src/core-bridge.ts";
@@ -15,9 +16,11 @@ export interface Harness {
   sessionsReady: () => Promise<void>;
   refreshSessions: () => Promise<boolean>;
   boot: () => Promise<void>;
+  openChatSearch: () => void;
   switchView: (view: "chats" | "settings") => void;
   renderList: () => void;
   drawChatsPage: () => void;
+  renderChatsPage: () => Promise<void>;
   appState: { currentView: string };
   sessionsState: { list: Array<{ id: string }>; loaded: boolean; openingKey: string | null };
   visibleConversation: () => Conversation;
@@ -26,6 +29,7 @@ export interface Harness {
 }
 
 interface HarnessOptions {
+  api?: (path: string, init?: RequestInit) => Response | Promise<Response> | undefined;
   path: string;
   session?: CoreSession;
   messageLink?: boolean;
@@ -33,17 +37,19 @@ interface HarnessOptions {
   transcriptFailures?: number;
   holdTranscript?: boolean;
   holdApprovals?: boolean;
+  approvals?: (sessionId: string) => unknown[];
   holdRuntimeConfig?: boolean;
   holdRemoteSplit?: boolean;
   remoteCanvas?: unknown;
   listSessions?: unknown[];
   contexts?: CoreContext[];
-  entries?: unknown[];
+  items?: unknown[];
   savedCanvas?: boolean;
   welcome?: boolean;
   connectionReturn?: boolean;
   slackReturn?: "success" | "expired" | "cancelled" | "wrong-account";
   returnWidget?: string;
+  returnReplaces?: string;
   openNewChat?: boolean;
 }
 
@@ -63,8 +69,8 @@ export async function harness(opts: HarnessOptions): Promise<Harness> {
   const env = await browserEnv({
     dom: { url: `http://localhost${opts.path}` },
     html: '<!doctype html><div id="app"></div>',
-    fetch: (input) => {
-      const answer = respond(input);
+    fetch: (input, init) => {
+      const answer = respond(input, init);
       inFlight.add(answer);
       void answer.finally(() => inFlight.delete(answer)).catch(() => {});
       return answer;
@@ -105,6 +111,7 @@ export async function harness(opts: HarnessOptions): Promise<Harness> {
         path: "/s/sess-deep",
         service: { id: "gmail", name: "Gmail" },
         accountId: "ca_test",
+        ...(opts.returnReplaces ? { replaces: opts.returnReplaces } : {}),
         widget: opts.returnWidget ?? "welcome",
         expiresAt: Date.now() + 60000,
         picker: { query: "mail", expanded: true },
@@ -125,9 +132,11 @@ export async function harness(opts: HarnessOptions): Promise<Harness> {
   const sessionsHeld = new Promise<void>((resolve) => (releaseSessions = resolve));
   const transcriptHeld = new Promise<void>((resolve) => (releaseTranscript = resolve));
   let failuresLeft = opts.transcriptFailures ?? (opts.transcriptStatus ? Number.POSITIVE_INFINITY : 0);
-  const respond = async (input: RequestInfo | URL): Promise<Response> => {
+  const respond = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const path = String(input);
     requests.push(path);
+    const custom = opts.api?.(path, init);
+    if (custom) return custom;
     if (path === "/me")
       return Response.json({
         user: "tester",
@@ -146,12 +155,11 @@ export async function harness(opts: HarnessOptions): Promise<Harness> {
       if (opts.holdRuntimeConfig) await runtimeHeld;
       return Response.json({
         scopeId: new URL(path, "http://localhost").searchParams.get("scopeId") ?? "personal:tester",
-        approvedHarnesses: [],
-        modelsByHarness: {},
+        models: [],
         modelCatalog: {},
-        orgDefault: { harnessId: "pi", modelId: "m", revision: 1 },
+        orgDefault: { modelId: "m", revision: 1 },
         scopeOverride: null,
-        effective: { harnessId: "pi", modelId: "m" },
+        effective: { modelId: "m" },
         upgradeAvailable: false,
       });
     }
@@ -164,7 +172,33 @@ export async function harness(opts: HarnessOptions): Promise<Harness> {
     }
     if (path.startsWith("/api/sessions/") && path.includes("/approvals")) {
       if (opts.holdApprovals) await approvalsHeld;
-      return Response.json({ approvals: [] });
+      const sessionId = decodeURIComponent(path.split("/")[3] ?? "");
+      return Response.json({ approvals: opts.approvals?.(sessionId) ?? [] });
+    }
+    if (path.startsWith("/api/sessions/") && path.endsWith("/side-chats")) {
+      const sourceId = decodeURIComponent(path.split("/")[3] ?? "");
+      const all = (opts.listSessions ?? []) as CoreSession[];
+      return Response.json({ sessions: all.filter((row) => row.sideChat && row.forkedFrom?.sessionId === sourceId) });
+    }
+    if (path.startsWith("/api/sessions/") && path.endsWith("/children")) {
+      const all = (opts.listSessions ?? []) as CoreSession[];
+      const below = new Set([decodeURIComponent(path.split("/")[3] ?? "")]);
+      for (let grew = true; grew;) {
+        grew = false;
+        for (const row of all)
+          if (row.parentSessionId && below.has(row.parentSessionId) && !below.has(row.id)) {
+            below.add(row.id);
+            grew = true;
+          }
+      }
+      return Response.json({ sessions: all.filter((row) => row.parentSessionId && below.has(row.id)) });
+    }
+    if (path.startsWith("/api/sessions/row?")) {
+      const params = new URL(path, "http://test").searchParams;
+      const row = ((opts.listSessions ?? []) as CoreSession[]).find(
+        (candidate) => candidate.id === params.get("id") || candidate.threadRef === params.get("threadRef"),
+      );
+      return row ? Response.json({ session: row }) : Response.json({ error: "not_found" }, { status: 404 });
     }
     if (path.startsWith(`/api/sessions/${session.id}`)) {
       if (opts.holdTranscript) await transcriptHeld;
@@ -177,20 +211,23 @@ export async function harness(opts: HarnessOptions): Promise<Harness> {
         const seqs = older ? [10, 11] : [80, 81];
         return Response.json({
           session,
-          entries: seqs.map((seq) => ({
-            seq,
-            type: seq % 2 ? "assistant" : "user",
-            createdAt: Date.now(),
-            payload: { text: `Linked QA message ${seq}` },
-          })),
-          earlierEntries: older ? 0 : 80,
+          items: seqs.map((seq) =>
+            item(seq % 2 ? "AgentMessage" : "UserMessage", {
+              seq,
+              createdAt: Date.now(),
+              text: `Linked QA message ${seq}`,
+            }),
+          ),
+          earlierItems: older ? 0 : 80,
         });
       }
-      return Response.json({ session, entries: opts.entries ?? [] });
+      return Response.json({ session, items: opts.items ?? [] });
     }
-    if (path === "/api/sessions") {
+    if (path.startsWith("/api/sessions?")) {
       await sessionsHeld;
-      return Response.json({ sessions: opts.listSessions ?? [] });
+      return Response.json(
+        sessionPage((opts.listSessions ?? []) as CoreSession[], new URL(path, "http://test").searchParams),
+      );
     }
     return Response.json({ contexts: opts.contexts ?? [], items: [], crons: [] });
   };
@@ -199,6 +236,7 @@ export async function harness(opts: HarnessOptions): Promise<Harness> {
   const sessions = await vite.ssrLoadModule("/src/sessions.ts");
   const conversations = await vite.ssrLoadModule("/src/conversations.ts");
   const split = await vite.ssrLoadModule("/src/split.ts");
+  const search = await vite.ssrLoadModule("/src/search.ts");
   return {
     requests,
     setTranscriptStatus: (status) => {
@@ -218,9 +256,11 @@ export async function harness(opts: HarnessOptions): Promise<Harness> {
     sessionsReady: sessions.sessionsReady as () => Promise<void>,
     refreshSessions: sessions.refreshSessions as () => Promise<boolean>,
     boot: shell.boot as () => Promise<void>,
+    openChatSearch: search.openChatSearch as () => void,
     switchView: shell.switchView as Harness["switchView"],
     renderList: sessions.renderList as () => void,
     drawChatsPage: sessions.drawChatsPage as () => void,
+    renderChatsPage: sessions.renderChatsPage as () => Promise<void>,
     appState: shell.appState as Harness["appState"],
     sessionsState: sessions.sessionsState as Harness["sessionsState"],
     visibleConversation: () =>
@@ -243,5 +283,32 @@ export async function harness(opts: HarnessOptions): Promise<Harness> {
       }
       await env.close();
     },
+  };
+}
+
+function sessionPage(all: CoreSession[], params: URLSearchParams) {
+  const activity = (row: CoreSession): number => row.lastActivityAt ?? row.createdAt ?? 0;
+  const archived = params.get("status") === "archived";
+  const before = params.get("before");
+  const limit = Number(params.get("limit") ?? 50);
+  let rows = all
+    .filter((row) => !row.parentSessionId && Boolean(row.archived) === archived)
+    .filter((row) => !params.get("q") || (row.title ?? "").toLowerCase().includes(params.get("q")!.toLowerCase()))
+    .filter((row) => !params.get("scope") || row.scopeId === params.get("scope"))
+    .filter((row) => params.get("status") !== "waiting" || row.awaitingInput)
+    .sort((a, b) => activity(b) - activity(a) || (b.id < a.id ? -1 : 1));
+  const pinned = !before && !archived ? rows.filter((row) => row.pinned) : undefined;
+  if (!archived) rows = rows.filter((row) => !row.pinned);
+  if (before) {
+    const dot = before.indexOf(".");
+    const [at, id] = [Number(before.slice(0, dot)), before.slice(dot + 1)];
+    rows = rows.filter((row) => activity(row) < at || (activity(row) === at && row.id < id));
+  }
+  const sessions = rows.slice(0, limit);
+  const last = sessions[sessions.length - 1];
+  return {
+    sessions,
+    ...(pinned ? { pinned, hasArchived: all.some((row) => row.archived) } : {}),
+    nextCursor: rows.length > limit && last ? `${activity(last)}.${last.id}` : null,
   };
 }

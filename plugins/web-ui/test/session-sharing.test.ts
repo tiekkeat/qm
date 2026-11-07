@@ -1,20 +1,11 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { readFileSync } from "node:fs";
+import { releaseFiles } from "./release-fixture.ts";
 import { sharedSessionHtml } from "../server/shared-session.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { mintPortalIdentity, PORTAL_IDENTITY_HEADER } from "../../chassis/src/portal-identity.ts";
-
-const sharedTemplate = new URL("../dist-web/shared.html", import.meta.url);
-const createdTemplate = !existsSync(sharedTemplate);
-if (createdTemplate) {
-  mkdirSync(new URL("../dist-web", import.meta.url), { recursive: true });
-  writeFileSync(sharedTemplate, readFileSync(new URL("../shared.html", import.meta.url), "utf8"));
-}
-test.after(() => {
-  if (createdTemplate) unlinkSync(sharedTemplate);
-});
 
 const calls: Array<{ path: string; method: string; body: string; actor: string | undefined }> = [];
 const core = createServer(async (req, res) => {
@@ -43,7 +34,8 @@ const core = createServer(async (req, res) => {
 await new Promise<void>((resolve) => core.listen(0, resolve));
 process.env.CORE_API_URL = `http://localhost:${(core.address() as AddressInfo).port}`;
 process.env.CORE_SIGNING_SECRET = "sharing-route-test-secret";
-const { handler } = await import("../server/index.ts");
+const { handler, serveReleasesFrom } = await import("../server/index.ts");
+serveReleasesFrom(releaseFiles({ "shared.html": readFileSync(new URL("../shared.html", import.meta.url), "utf8") }));
 const web = createServer(handler);
 await new Promise<void>((resolve) => web.listen(0, resolve));
 const base = `http://localhost:${(web.address() as AddressInfo).port}`;
@@ -54,19 +46,14 @@ test.after(() => {
   core.close();
 });
 
-test("sharing proxy binds identity and shared page loads only the filtered endpoint", async () => {
-  await fetch(`${base}/api/sessions/s1/share`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ principalId: "mallory", audience: "external" }),
-  });
-  assert.deepEqual(JSON.parse(calls.at(-1)!.body), { principalId: "alice", audience: "external" });
+test("the shared page loads only the filtered endpoint", async () => {
   const before = calls.length;
   const response = await fetch(`${base}/share/internal/11111111-1111-4111-8111-111111111111`, { headers });
   assert.equal(response.status, 200);
-  assert.equal(calls.length, before + 1);
-  assert.ok(calls.at(-1)!.path.startsWith("/v1/shared-sessions/11111111-1111-4111-8111-111111111111?viewer=alice"));
-  assert.equal(calls.at(-1)!.actor, token);
+  const reads = calls.slice(before).filter((call) => call.path.startsWith("/v1/shared-sessions/"));
+  assert.equal(reads.length, 1);
+  assert.ok(reads[0]!.path.startsWith("/v1/shared-sessions/11111111-1111-4111-8111-111111111111?viewer=alice"));
+  assert.equal(reads[0]!.actor, token);
   const html = await response.text();
   assert.ok(html.includes("\\u003cscript>"));
   assert.equal(html.includes('<script>alert("secret")</script>'), false);

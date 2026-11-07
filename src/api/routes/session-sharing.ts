@@ -7,7 +7,8 @@ import {
   type SharedMessage,
 } from "../../sessions/session-share.ts";
 import { MAX_ATTACHMENT_BYTES } from "../../core/attachments.ts";
-import { pipeToResponse, sendJson } from "../http.ts";
+import { sendJson } from "../http.ts";
+import { relayStream } from "../../../plugins/chassis/src/http.ts";
 import { audit, isObj } from "./shared.ts";
 import type { ApiCtx, Route } from "./route.ts";
 
@@ -41,7 +42,8 @@ async function createShare(ctx: ApiCtx): Promise<void> {
     const ids = (delivery.attachments ?? []).flatMap((file) => (file.artifactId ? [file.artifactId] : []));
     deliveredAttachments.set(seq, [...(deliveredAttachments.get(seq) ?? []), ...ids]);
   }
-  const projected = sharedMessages(source.entries, deliveredAttachments);
+  if (source.session.readOnly) return sendJson(res, 403, { error: "read_only" });
+  const projected = sharedMessages(source.items, deliveredAttachments);
   if (!projected.length) return sendJson(res, 400, { error: "empty_conversation" });
   const ids = [...new Set(projected.flatMap((m) => m.attachmentIds ?? []))];
   if (ids.length > 100 || Buffer.byteLength(JSON.stringify(projected)) > 2_000_000)
@@ -88,12 +90,12 @@ async function createShare(ctx: ApiCtx): Promise<void> {
     audience,
     createdBy: viewer,
     createdAt: Date.now(),
-    visibility: source.entries.reduce(
-      (bounds, entry) => ({
-        minSeq: Math.min(bounds.minSeq, entry.seq),
-        maxSeq: Math.max(bounds.maxSeq, entry.seq),
-        minCreatedAt: Math.min(bounds.minCreatedAt, entry.createdAt),
-        maxCreatedAt: Math.max(bounds.maxCreatedAt, entry.createdAt),
+    visibility: source.items.reduce(
+      (bounds, item) => ({
+        minSeq: Math.min(bounds.minSeq, item.seq),
+        maxSeq: Math.max(bounds.maxSeq, item.seq),
+        minCreatedAt: Math.min(bounds.minCreatedAt, item.createdAt),
+        maxCreatedAt: Math.max(bounds.maxCreatedAt, item.createdAt),
       }),
       { minSeq: Infinity, maxSeq: -Infinity, minCreatedAt: Infinity, maxCreatedAt: -Infinity },
     ),
@@ -141,16 +143,26 @@ async function readShare(ctx: ApiCtx): Promise<void> {
       "x-content-type-options": "nosniff",
       "referrer-policy": "no-referrer",
     });
-    pipeToResponse(res, opened.stream, "shared attachment read failed");
+    relayStream(opened.stream, res);
     return;
   }
   return sendJson(res, 200, { createdAt: share.createdAt, audience: share.audience, messages: share.messages });
 }
 
 export const sessionSharingRoutes: ReadonlyArray<Route> = [
-  { method: "POST", path: "/v1/sessions/:id/share", auth: "source", handle: createShare },
-  ...["shared-sessions", "public-shares"].flatMap((prefix): Route[] => [
-    { method: "GET", path: `/v1/${prefix}/:token`, auth: "source", handle: readShare },
-    { method: "GET", path: `/v1/${prefix}/:token/files/:fileId`, auth: "source", handle: readShare },
-  ]),
+  {
+    method: "POST",
+    path: "/v1/sessions/:id/share",
+    browser: true,
+    actor: "body.principalId",
+    auth: "source",
+    handle: createShare,
+  },
+  ...(["shared-sessions", "public-shares"] as const).flatMap((prefix): Route[] => {
+    const actor = prefix === "shared-sessions" ? ("query.viewer" as const) : undefined;
+    return [
+      { method: "GET", path: `/v1/${prefix}/:token`, actor, auth: "source", handle: readShare },
+      { method: "GET", path: `/v1/${prefix}/:token/files/:fileId`, actor, auth: "source", handle: readShare },
+    ];
+  }),
 ];

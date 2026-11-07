@@ -1,3 +1,4 @@
+import { parseSpendLimit, type SpendLimit } from "../../ratelimit/spend-limits.ts";
 import type { TeamChange } from "../../teams/teams.ts";
 import { decisionsResource } from "./decisions-resource.ts";
 import { parseAckEmoji } from "../../slack/config.ts";
@@ -7,24 +8,18 @@ import type { ApiCtx } from "./route.ts";
 import { parseCommandPolicy } from "../../policy/command-policy.ts";
 import { parseScopeId, scopeId, type CommandPolicy, type Grant, type ScopeId } from "../../types.ts";
 import {
-  defaultModelForHarness,
+  defaultModel,
   fastModeModelIds,
-  harnessSupportsFastMode,
-  HARNESS_IDS,
-  harnessIdOrPi,
-  isHarnessId,
-  modelSupportedByHarness,
+  modelSupported,
   modelServiceable,
-  modelProviderAvailabilityFor,
   resolveModel,
   resolveEmbeddingModel,
   embeddingModelCatalog,
-  thinkingLevelsForHarness,
+  thinkingLevelsFor,
   selectableBaseModels,
   ALL_PROVIDERS_AVAILABLE,
-  type HarnessId,
 } from "../../model/pi-models.ts";
-import { resolveRuntimeChoiceDurable } from "../../harness/harness-router.ts";
+import { resolveRuntimeChoice } from "../../agent/runtime-choice.ts";
 import { sanitizeBranding } from "../../resolution/branding.ts";
 import {
   credentialInjectionError,
@@ -39,70 +34,15 @@ import {
   type ServiceCredentialInput,
 } from "../../credentials/keychain.ts";
 import { parseBotLedger } from "../../surface-cache/channel-policy-store.ts";
-import { authorizeUrl, PROVIDERS, type ConsentMode } from "../../connectors/oauth.ts";
-import { resolverFor } from "./connectors.ts";
+import { PROVIDERS, type ConsentMode } from "../../connectors/oauth.ts";
 import { encodeRef, serviceCredRef } from "../../acl/resource-ref.ts";
 import { audit } from "./shared.ts";
-import { errMessage, reportFailure } from "../../util/errors.ts";
-import {
-  DEFAULT_SECURITY_SCREEN_RUBRIC,
-  parseSecurityPosture,
-  SECURITY_POSTURES,
-  type SecurityPosture,
-} from "../../security/security-posture.ts";
+import { reportFailure, swallowAs } from "../../util/errors.ts";
+import { parseSecurityPosture, SECURITY_POSTURES, type SecurityPosture } from "../../security/security-posture.ts";
 import type { ApprovalGrantModes } from "../../types.ts";
 import { parseEgressPolicy } from "../../resolution/egress-policy.ts";
-import { FEATURE_NAMES, type FeatureName } from "../../feature-flags.ts";
+import { FEATURE_NAMES, FEATURES, type FeatureName } from "../../feature-flags.ts";
 import { parseSharingPosture, SHARING_POSTURES, type SharingPosture } from "../../resolution/sharing-posture.ts";
-
-export interface AutoFlaggerDraft {
-  harnessId: HarnessId;
-  modelId: string;
-  rubric: string;
-}
-
-const AUTO_FLAGGER_MAX_RUBRIC_CHARS = 20_000;
-
-/** The flagger a deployment falls back to when nothing is configured. */
-export function defaultAutoFlaggerConfig(deps: Pick<ServerDeps, "harnessId" | "baseModelDefault">): AutoFlaggerDraft {
-  const harnessId = harnessIdOrPi(deps.harnessId);
-  return {
-    harnessId,
-    modelId: defaultModelForHarness(harnessId, deps.baseModelDefault),
-    rubric: DEFAULT_SECURITY_SCREEN_RUBRIC,
-  };
-}
-
-/**
- * Validate an Auto flagger configuration — shared by the governance save and the test run, so a
- * rubric that tests cleanly is exactly the one that can be applied.
- */
-export async function parseAutoFlaggerDraft(
-  deps: Pick<ServerDeps, "providerKeys" | "modelCredentials">,
-  body: { harnessId?: unknown; modelId?: unknown; rubric?: unknown },
-): Promise<{ value: AutoFlaggerDraft } | { error: string }> {
-  if (typeof body.harnessId !== "string" || !isHarnessId(body.harnessId) || body.harnessId === "mock") {
-    return { error: "auto-flagger requires a valid harnessId" };
-  }
-  if (typeof body.modelId !== "string" || !body.modelId.trim()) {
-    return { error: "auto-flagger requires a modelId" };
-  }
-  const modelId = body.modelId.trim();
-  if (!modelSupportedByHarness(modelId, body.harnessId)) {
-    return { error: `model ${modelId} is not supported by ${body.harnessId}` };
-  }
-  if (typeof body.rubric !== "string" || !body.rubric.trim() || body.rubric.length > AUTO_FLAGGER_MAX_RUBRIC_CHARS) {
-    return {
-      error: `auto-flagger requires a non-empty rubric of at most ${AUTO_FLAGGER_MAX_RUBRIC_CHARS} characters`,
-    };
-  }
-  const configuredKeys = deps.providerKeys ?? ALL_PROVIDERS_AVAILABLE;
-  const managedKeys = deps.modelCredentials ? await deps.modelCredentials.availability() : configuredKeys;
-  if (!modelServiceable(modelId, modelProviderAvailabilityFor(body.harnessId, configuredKeys, managedKeys))) {
-    return { error: `model ${modelId} isn't serviceable on this deployment` };
-  }
-  return { value: { harnessId: body.harnessId, modelId, rubric: body.rubric.trim() } };
-}
 
 type Actor = { id: string };
 
@@ -122,6 +62,7 @@ export interface AdminResource {
   authz?: "scope-admin" | "org-admin";
   label?: string;
   enumValues?: readonly unknown[];
+  refreshesModels?: true;
 }
 
 function generic<V>(
@@ -129,12 +70,12 @@ function generic<V>(
     body: unknown,
     ctx: { scope: string; deps: ServerDeps },
   ) => { value: V } | { error: string; code?: string; status?: number },
-  set: (deps: ServerDeps, scope: string, value: V) => unknown,
+  set: (deps: ServerDeps, scope: string, value: V) => Promise<void>,
 ): AdminResource["apply"] {
   return async (ctx, _actor, scope) => {
     const parsed = parse(ctx.body, { scope, deps: ctx.deps });
     if ("error" in parsed) return parsed;
-    await Promise.resolve(set(ctx.deps, scope, parsed.value));
+    await set(ctx.deps, scope, parsed.value);
     return { ok: true };
   };
 }
@@ -157,7 +98,7 @@ export const ADMIN_RESOURCES: readonly AdminResource[] = [
     id: "security-posture",
     kind: "enum",
     target: "any",
-    label: "Harness security posture. The org value is a minimum; narrower scopes may tighten it but cannot weaken it.",
+    label: "Security posture. The org value is a minimum; narrower scopes may tighten it but cannot weaken it.",
     readKey: "securityPosture",
     enumValues: SECURITY_POSTURES,
     get: (deps, scope) => deps.config!.getSecurityPostureDurable(scope),
@@ -191,29 +132,6 @@ export const ADMIN_RESOURCES: readonly AdminResource[] = [
       (deps, scope, posture) =>
         posture === null ? deps.config!.clearSharingPosture(scope) : deps.config!.setSharingPosture(scope, posture),
     ),
-  },
-  {
-    id: "auto-flagger",
-    kind: "custom",
-    target: "org",
-    clearable: true,
-    label:
-      "The model and classification rubric used to screen external content when the deployment enables model screening.",
-    readKey: "autoFlagger",
-    get: (deps) => deps.config!.getAutoFlaggerConfig(),
-    apply: async (ctx, _actor, scope) => {
-      const bad = orgOnly(scope, "the Auto flagger is org-wide");
-      if (bad) return bad;
-      const body = ctx.body as { reset?: unknown };
-      if (body.reset === true) {
-        ctx.deps.config!.setAutoFlaggerConfig(null);
-        return { ok: true };
-      }
-      const parsed = await parseAutoFlaggerDraft(ctx.deps, ctx.body as Record<string, unknown>);
-      if ("error" in parsed) return parsed;
-      ctx.deps.config!.setAutoFlaggerConfig(parsed.value);
-      return { ok: true };
-    },
   },
   decisionsResource,
   {
@@ -258,7 +176,7 @@ export const ADMIN_RESOURCES: readonly AdminResource[] = [
       if (typeof body.content !== "string") return { error: "soul requires { content: string }" };
       if (body.content.length > MAX_SOUL_CHARS) return { error: `SOUL must be at most ${MAX_SOUL_CHARS} characters` };
       if (body.expectedVersion === undefined) {
-        await ctx.deps.config!.setSoulLatest(scope, body.content, actor.id);
+        await ctx.deps.config!.setSoul(scope, body.content, actor.id);
         return { ok: true };
       }
       if (typeof body.expectedVersion !== "number")
@@ -281,7 +199,7 @@ export const ADMIN_RESOURCES: readonly AdminResource[] = [
     get: async (deps, scope) => {
       const ref = channelContainer(scope);
       if (!deps.channelPolicy || !ref) return undefined;
-      const p = await deps.channelPolicy.get(ref).catch(() => undefined);
+      const p = await deps.channelPolicy.get(ref).catch(swallowAs("admin: read channel ambient policy", undefined));
       if (p === undefined) return undefined;
       return {
         orders: p?.orders ?? "",
@@ -346,7 +264,14 @@ export const ADMIN_RESOURCES: readonly AdminResource[] = [
     target: "org",
     readKey: "featureFlags",
     label: "Live feature rollout table. Each feature maps to the scopes where it is enabled.",
-    get: (deps) => deps.featureFlags?.list(),
+    get: async (deps) => {
+      if (!deps.featureFlags) return undefined;
+      const rows = await deps.featureFlags.list();
+      return FEATURE_NAMES.map((featureName) => ({
+        ...FEATURES[featureName],
+        ...(rows.find((row) => row.featureName === featureName) ?? { featureName, enabledScopes: [] }),
+      }));
+    },
     apply: async (ctx, actor, scope) => {
       if (!ctx.deps.featureFlags) return { error: "not available on this deployment", status: 404 };
       const body = (ctx.body ?? {}) as { featureName?: unknown; scopeId?: unknown; on?: unknown };
@@ -395,13 +320,6 @@ export const ADMIN_RESOURCES: readonly AdminResource[] = [
     },
   },
   {
-    id: "unfulfilled-insights",
-    kind: "boolean",
-    readKey: "unfulfilledInsights",
-    get: (deps, scope) => deps.config!.getUnfulfilledInsights(scope),
-    apply: generic(boolBody, (deps, scope, on) => deps.config!.setUnfulfilledInsights(scope, on)),
-  },
-  {
     id: "external-slack-participants",
     kind: "boolean",
     target: "org",
@@ -419,35 +337,6 @@ export const ADMIN_RESOURCES: readonly AdminResource[] = [
     ),
   },
   {
-    id: "internal-member-overrides",
-    kind: "string-list",
-    target: "org",
-    clearable: true,
-    label:
-      "Members listed here (lowercased emails or Slack user ids) are treated as internal even if Slack marks them guest/restricted or the directory sync removed them; use it for contractor accounts that are genuinely internal.",
-    readKey: "internalMemberOverrides",
-    get: (deps) => deps.config!.getInternalMemberOverrides(),
-    apply: async (ctx, actor, scope) => {
-      const bad = orgOnly(scope, "internal member overrides are org-wide");
-      if (bad) return bad;
-      const raw = (ctx.body as { members?: unknown }).members;
-      if (!Array.isArray(raw)) return { error: "internal-member-overrides requires { members: string[] }" };
-      if (raw.length > 500) return { error: "internal-member-overrides accepts at most 500 entries" };
-      if (raw.some((m) => typeof m !== "string" || !m.trim() || m.length > 320))
-        return { error: "each member must be a non-empty string of at most 320 characters" };
-      const before = ctx.deps.config!.getInternalMemberOverrides();
-      ctx.deps.config!.setInternalMemberOverrides(raw as string[]);
-      const after = ctx.deps.config!.getInternalMemberOverrides();
-      audit(ctx.deps, {
-        principalId: actor.id,
-        action: "identity.internal-override.update",
-        resource: `${before.length}->${after.length}: ${after.join(", ")}`,
-        scopeLabel: scope,
-      });
-      return { ok: true };
-    },
-  },
-  {
     id: "channel-header-pin-default",
     kind: "boolean",
     target: "org",
@@ -461,7 +350,7 @@ export const ADMIN_RESOURCES: readonly AdminResource[] = [
         if (bad) return bad;
         return boolBody(body);
       },
-      (deps, scope, on) => deps.config!.setChannelHeaderPinLatest(scope, on),
+      (deps, scope, on) => deps.config!.setChannelHeaderPin(scope, on),
     ),
   },
   {
@@ -517,6 +406,7 @@ export const ADMIN_RESOURCES: readonly AdminResource[] = [
   },
   {
     id: "memory-embedding-model",
+    refreshesModels: true,
     kind: "enum",
     target: "org",
     clearable: true,
@@ -531,16 +421,15 @@ export const ADMIN_RESOURCES: readonly AdminResource[] = [
       const { modelId } = ctx.body as { modelId?: unknown };
       if (modelId !== null && (typeof modelId !== "string" || !modelId.trim()))
         return { error: "Provide an embedding modelId, or null to disable semantic recall" };
-      if (modelId !== null) {
-        await ctx.deps.refreshModels?.();
-        if (!resolveEmbeddingModel(modelId as string)) return { error: "Unknown or unverified embedding model" };
-      }
+      if (modelId !== null && !resolveEmbeddingModel(modelId))
+        return { error: "Unknown or unverified embedding model" };
       await ctx.deps.config!.setEmbeddingModel(modelId as string | null);
       return { ok: true };
     },
   },
   {
     id: "base-model",
+    refreshesModels: true,
     kind: "enum",
     target: "any",
     clearable: true,
@@ -557,53 +446,24 @@ export const ADMIN_RESOURCES: readonly AdminResource[] = [
       if (modelId && !resolveModel(modelId)) return { error: `unknown model id: ${modelId}` };
       const configuredKeys = ctx.deps.providerKeys ?? ALL_PROVIDERS_AVAILABLE;
       const managedKeys = ctx.deps.modelCredentials ? await ctx.deps.modelCredentials.availability() : configuredKeys;
-      const unserviceable = (harness: string): { error: string } | null =>
-        modelId && !modelServiceable(modelId, modelProviderAvailabilityFor(harness, configuredKeys, managedKeys))
-          ? {
-              error: `model ${modelId} isn't serviceable on this deployment: its provider key is not configured for the ${harness} harness`,
-            }
-          : null;
       const runtime = await ctx.deps.config!.getRuntimeSelectionDurable(scope);
-      if (!modelId) await ctx.deps.config!.setRuntimeSelectionLatest(scope, null);
-      else if (runtime) {
-        if (!isHarnessId(runtime.harnessId) || !modelSupportedByHarness(modelId, runtime.harnessId))
-          return { error: `model ${modelId} is not supported by ${runtime.harnessId}` };
-        const bad = unserviceable(runtime.harnessId);
-        if (bad) return bad;
-        await ctx.deps.config!.setRuntimeSelectionLatest(scope, {
-          harnessId: runtime.harnessId,
+      if (!modelId) await ctx.deps.config!.setRuntimeSelection(scope, null);
+      else {
+        if (!modelSupported(modelId)) return { error: `model ${modelId} is not supported` };
+        if (!modelServiceable(modelId, managedKeys))
+          return {
+            error: `model ${modelId} isn't serviceable on this deployment: its provider key is not configured`,
+          };
+        const current =
+          runtime ??
+          (await resolveRuntimeChoice(ctx.deps.config!, scopeId("org", configOrgId()), scope, {
+            modelId: defaultModel(ctx.deps.baseModelDefault),
+          }));
+        await ctx.deps.config!.setRuntimeSelection(scope, {
           modelId,
-          ...(runtime.effortLevel ? { effortLevel: runtime.effortLevel } : {}),
-          ...(typeof runtime.fastMode === "boolean"
-            ? {
-                fastMode:
-                  runtime.fastMode &&
-                  harnessSupportsFastMode(runtime.harnessId) &&
-                  fastModeModelIds().includes(modelId),
-              }
-            : {}),
-        });
-      } else {
-        const harnessId = harnessIdOrPi(ctx.deps.harnessId);
-        const effective = await resolveRuntimeChoiceDurable(ctx.deps.config!, scopeId("org", configOrgId()), scope, {
-          harnessId,
-          modelId: defaultModelForHarness(harnessId, ctx.deps.baseModelDefault),
-        });
-        if (!modelSupportedByHarness(modelId, effective.harnessId))
-          return { error: `model ${modelId} is not supported by ${effective.harnessId}` };
-        const bad = unserviceable(effective.harnessId);
-        if (bad) return bad;
-        await ctx.deps.config!.setRuntimeSelectionLatest(scope, {
-          harnessId: effective.harnessId,
-          modelId,
-          ...(effective.effortLevel ? { effortLevel: effective.effortLevel } : {}),
-          ...(typeof effective.fastMode === "boolean"
-            ? {
-                fastMode:
-                  effective.fastMode &&
-                  harnessSupportsFastMode(effective.harnessId) &&
-                  fastModeModelIds().includes(modelId),
-              }
+          ...(current.effortLevel ? { effortLevel: current.effortLevel } : {}),
+          ...(typeof current.fastMode === "boolean"
+            ? { fastMode: current.fastMode && fastModeModelIds().includes(modelId) }
             : {}),
         });
       }
@@ -612,6 +472,7 @@ export const ADMIN_RESOURCES: readonly AdminResource[] = [
   },
   ...([undefined, "cron", "subagent", "fallback"] as const).map((purpose): AdminResource => ({
     id: purpose ? `${purpose}-runtime` : "runtime",
+    refreshesModels: true,
     kind: "custom",
     target: purpose ? "org" : "any",
     clearable: true,
@@ -627,72 +488,40 @@ export const ADMIN_RESOURCES: readonly AdminResource[] = [
       }
       if ((ctx.body as { inherit?: unknown } | null)?.inherit === true || (purpose && ctx.body === null)) {
         if (purpose) await ctx.deps.config!.clearPurposeRuntime(purpose);
-        else await ctx.deps.config!.setRuntimeSelectionLatest(scope, null);
+        else await ctx.deps.config!.setRuntimeSelection(scope, null);
         return { ok: true };
       }
-      const harnessId = (ctx.body as { harnessId?: unknown }).harnessId;
       const modelId = (ctx.body as { modelId?: unknown }).modelId;
       const effortLevel = (ctx.body as { effortLevel?: unknown }).effortLevel ?? (purpose ? undefined : "auto");
       const fastMode = (ctx.body as { fastMode?: unknown }).fastMode ?? (purpose ? undefined : false);
-      if (!isHarnessId(harnessId)) return { error: `runtime requires harnessId (${HARNESS_IDS.join(" | ")})` };
-      const approved = (await ctx.deps.config!.getApprovedHarnessesDurable()) ?? [ctx.deps.harnessId ?? "pi"];
-      if (!approved.includes(harnessId)) return { error: `harness ${harnessId} is not approved` };
-      if (typeof modelId !== "string" || !modelSupportedByHarness(modelId, harnessId))
-        return { error: `model ${String(modelId)} is not supported by ${harnessId}` };
-      const thinkingLevels = thinkingLevelsForHarness(harnessId, modelId);
+      if (typeof modelId !== "string" || !modelSupported(modelId))
+        return { error: `model ${String(modelId)} is not supported` };
+      const thinkingLevels = thinkingLevelsFor(modelId);
       if (effortLevel !== undefined && (typeof effortLevel !== "string" || !thinkingLevels.includes(effortLevel)))
-        return { error: `runtime requires effortLevel (${thinkingLevels.join(" | ")}) for ${harnessId}` };
+        return { error: `runtime requires effortLevel (${thinkingLevels.join(" | ")}) for ${modelId}` };
       if (fastMode !== undefined && typeof fastMode !== "boolean")
         return { error: "runtime requires fastMode (boolean)" };
-      if (
-        purpose &&
-        fastMode === true &&
-        (!harnessSupportsFastMode(harnessId) || !fastModeModelIds().includes(modelId))
-      )
-        return { error: `fast mode is not supported by ${harnessId} with ${modelId}` };
+      if (purpose && fastMode === true && !fastModeModelIds().includes(modelId))
+        return { error: `fast mode is not supported by ${modelId}` };
       const configuredKeys = ctx.deps.providerKeys ?? ALL_PROVIDERS_AVAILABLE;
       const managedKeys = ctx.deps.modelCredentials ? await ctx.deps.modelCredentials.availability() : configuredKeys;
-      if (!modelServiceable(modelId, modelProviderAvailabilityFor(harnessId, configuredKeys, managedKeys)))
+      if (!modelServiceable(modelId, managedKeys))
         return {
-          error: `model ${modelId} isn't serviceable on this deployment: its provider key is not configured for the ${harnessId} harness`,
+          error: `model ${modelId} isn't serviceable on this deployment: its provider key is not configured`,
         };
       const choice = {
-        harnessId,
         modelId,
         ...(typeof effortLevel === "string" ? { effortLevel } : {}),
-        ...(typeof fastMode === "boolean"
-          ? { fastMode: fastMode && harnessSupportsFastMode(harnessId) && fastModeModelIds().includes(modelId) }
-          : {}),
+        ...(typeof fastMode === "boolean" ? { fastMode: fastMode && fastModeModelIds().includes(modelId) } : {}),
       };
       if (purpose) await ctx.deps.config!.setPurposeRuntime(purpose, choice);
-      else await ctx.deps.config!.setRuntimeSelectionLatest(scope, choice);
+      else await ctx.deps.config!.setRuntimeSelection(scope, choice);
       return { ok: true };
     },
   })),
   {
-    id: "approved-harnesses",
-    kind: "string-list",
-    target: "org",
-    clearable: true,
-    readKey: "approvedHarnesses",
-    enumValues: HARNESS_IDS,
-    get: (deps) => deps.config!.getApprovedHarnesses(),
-    apply: generic(
-      (body, { scope }) => {
-        const bad = orgOnly(scope, "approved harnesses are org-wide");
-        if (bad) return bad;
-        const raw = (body as { ids?: unknown }).ids;
-        if (!Array.isArray(raw)) return { error: "approved-harnesses requires { ids: string[] }" };
-        if (raw.some((id) => !isHarnessId(id)))
-          return { error: `unknown harness (expected ${HARNESS_IDS.join(" | ")})` };
-        const ids = [...new Set(raw.filter(isHarnessId))];
-        return { value: ids.length ? ids : null };
-      },
-      (deps, _scope, ids) => deps.config!.setApprovedHarnesses(ids),
-    ),
-  },
-  {
     id: "webui-models",
+    refreshesModels: true,
     kind: "string-list",
     target: "org",
     clearable: true,
@@ -718,29 +547,6 @@ export const ADMIN_RESOURCES: readonly AdminResource[] = [
         return { value: unique.length ? unique : null };
       },
       (deps, scope, ids) => deps.config!.setWebuiModels(scope, ids),
-    ),
-  },
-  {
-    id: "people-directory-url",
-    kind: "string",
-    target: "org",
-    clearable: true,
-    readKey: "peopleDirectoryUrl",
-    get: (deps, scope) => deps.config!.getPeopleDirectoryUrl(scope),
-    apply: generic<string | null>(
-      (body, { scope }) => {
-        const bad = orgOnly(scope, "the people directory is org-wide");
-        if (bad) return bad;
-        const raw = (body as { url?: unknown }).url;
-        if (raw !== undefined && raw !== null && typeof raw !== "string") {
-          return { error: "people-directory-url requires { url: string } (empty string clears it)" };
-        }
-        const url = typeof raw === "string" ? raw.trim() : "";
-        if (url && !/^https?:\/\//.test(url))
-          return { error: "people-directory-url must start with http:// or https://" };
-        return { value: url || null };
-      },
-      (deps, scope, url) => deps.config!.setPeopleDirectoryUrl(scope, url),
     ),
   },
   {
@@ -797,38 +603,7 @@ export const ADMIN_RESOURCES: readonly AdminResource[] = [
       if (markUrlInput && !value?.markUrl) {
         return { error: "branding mark image must be an https URL" };
       }
-      ctx.deps.config!.setBranding(scope, value ?? null);
-      return { ok: true };
-    },
-  },
-  {
-    id: "browse-model",
-    kind: "enum",
-    target: "org",
-    clearable: true,
-    label:
-      "The model driving the browser agent in the browse skill, org-wide (empty follows the deployment's base model; fast mode applies only on Opus models).",
-    readKey: "browseModel",
-    get enumValues() {
-      return selectableBaseModels();
-    },
-    get: (deps, scope) => deps.config!.getBrowseModel(scope),
-    apply: async (ctx, _actor, scope) => {
-      const bad = orgOnly(scope, "the browse model is org-wide");
-      if (bad) return bad;
-      const raw = (ctx.body as { modelId?: unknown }).modelId;
-      if (raw !== undefined && raw !== null && typeof raw !== "string") {
-        return { error: "browse-model requires { modelId: string } (empty string clears the override)" };
-      }
-      const modelId = typeof raw === "string" ? raw.trim() : "";
-      if (modelId && !resolveModel(modelId)) return { error: `unknown model id: ${modelId}` };
-      const configuredKeys = ctx.deps.providerKeys ?? ALL_PROVIDERS_AVAILABLE;
-      const managedKeys = ctx.deps.modelCredentials ? await ctx.deps.modelCredentials.availability() : configuredKeys;
-      const providers = modelProviderAvailabilityFor(ctx.deps.harnessId ?? "pi", configuredKeys, managedKeys);
-      if (modelId && !modelServiceable(modelId, providers)) {
-        return { error: `model ${modelId} isn't serviceable on this deployment: its provider key is not configured` };
-      }
-      await Promise.resolve(ctx.deps.config!.setBrowseModel(scope, modelId || null));
+      await ctx.deps.config!.setBranding(scope, value ?? null);
       return { ok: true };
     },
   },
@@ -855,6 +630,19 @@ export const ADMIN_RESOURCES: readonly AdminResource[] = [
         return { value: steps };
       },
       (deps, scope, steps) => deps.config!.setBrowseMaxSteps(scope, steps),
+    ),
+  },
+  {
+    id: "spend-limit",
+    kind: "custom",
+    target: "any",
+    label:
+      "Model spend caps in USD: { dailyUsd?, monthlyUsd? } per UTC day and month. On the org scope it is the default for each person's personal scope; on any other scope it caps that scope and overrides the default. {} means no cap there; { inherit: true } clears it.",
+    readKey: "spendLimit",
+    get: (deps, scope) => deps.config!.getSpendLimitDurable(scope),
+    apply: generic<SpendLimit | null>(
+      (body) => parseSpendLimit(body),
+      (deps, scope, limit) => deps.config!.setSpendLimit(scope, limit),
     ),
   },
   {
@@ -894,16 +682,6 @@ export const ADMIN_RESOURCES: readonly AdminResource[] = [
         ...(typeof b.enabled === "boolean" ? { enabled: b.enabled } : {}),
         updatedBy: actor.id,
       });
-      try {
-        const client = await resolverFor(deps)(provider, {});
-        authorizeUrl(provider, {
-          redirectUri: client.redirectAllowlist?.[0] ?? "https://example.invalid/cb",
-          state: "dry-run",
-          client,
-        });
-      } catch (e) {
-        return { error: errMessage(e), code: "connector_invalid" };
-      }
       return { ok: true };
     },
   },
@@ -1174,9 +952,7 @@ export const ADMIN_RESOURCES: readonly AdminResource[] = [
         ...(delivery === "env" ? { envKey } : {}),
         host: delivery === "env" ? "" : host,
         ...(typeof b.secret === "string" && b.secret ? { secret: b.secret } : {}),
-        ...(delivery === "broker" &&
-        effectiveInjection &&
-        (effectiveInjection.header || effectiveInjection.scheme || effectiveInjection.actor !== undefined)
+        ...(delivery === "broker" && effectiveInjection && Object.keys(effectiveInjection).length
           ? { injection: effectiveInjection }
           : {}),
         ...(delivery === "broker" ? brokerMethods : {}),

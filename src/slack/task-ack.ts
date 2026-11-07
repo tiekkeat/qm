@@ -27,7 +27,6 @@ export function createTaskAcknowledgements(
   lease: LeaderLease,
   recovery?: { runs: Pick<RunStore, "get">; deliveries: Pick<DeliveryStore, "pending"> },
 ) {
-  if (!store.update) throw new Error("Task acknowledgements require atomic updates");
   const update = store.update.bind(store);
   const queue = createKeyedQueue<string>();
   const change = (
@@ -51,7 +50,10 @@ export function createTaskAcknowledgements(
         if (!state) {
           if (next?.existing) return true;
           const emoji = next?.pick
-            ? await Promise.race([next.pick().catch(() => undefined), sleep(1500).then(() => undefined)])
+            ? await Promise.race([
+                next.pick().catch(swallowAs("slack: pick task ack emoji", undefined)),
+                sleep(1500).then(() => undefined),
+              ])
             : undefined;
           if (leaseLost) return false;
           await store.putIfAbsent(runId, {

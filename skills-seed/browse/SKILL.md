@@ -23,13 +23,13 @@ org credential delivered as sandbox env (admin UI → Service credentials → de
 env"), and it rides into every all-internal conversation — nothing here is deploy config. A
 person's own keychain key overrides the org one. A provider can also be offered as a shared
 credential you call through QM's broker without ever holding the key; the provider doc
-says so when it supports that (Kernel does, via `service_kernel`). Keys you may see today:
+says so when it supports that (Kernel does, via `kernel`). Keys you may see today:
 
 Use the absolute directory reported by the skill read for all `providers/` paths below.
 Keep the same explicit `sandbox_id` for the skill read and every `execute` command
 in this flow, including the runner.
 
-- `KERNEL_API_KEY`, or a `service_kernel` shared credential in your inventory →
+- `KERNEL_API_KEY`, or a `kernel` shared credential in your inventory →
   **Kernel** (onkernel.com). Read `providers/kernel.md`.
 - `ANCHOR_API_KEY` → **Anchor** (anchorbrowser.io). Read `providers/anchor.md`.
 - `BROWSERBASE_API_KEY` → **Browserbase** (browserbase.com). Read
@@ -68,11 +68,11 @@ becoming the default):
   org key for creating the stealth browser.
 - Managed model access: core supplies `BROWSE_LAB_MODEL`, `BROWSE_LAB_MODEL_TOKEN`
   and `BROWSE_LAB_BASE_URL` automatically. All browser model calls use this route;
-  never request a separate browser model key. Company access uses the deployment's
-  default model credentials, through its gateway when configured or directly otherwise.
-  Personal access uses the person's connected account. Claude subscription access is
-  unsupported. If model access is missing or fails, report the error and ask the person
-  to correct their AI access in Settings; never switch accounts or models yourself.
+  never request a separate browser model key. The browser runs on the session's own
+  model and account, so it bills whatever the turn bills. Claude subscription access is
+  unsupported. If model access is missing or fails, report the error (it names the model
+  and the account it billed) and ask the person to correct their AI access in Settings;
+  never switch accounts or models yourself.
 - The person's OWN browser-profile name, under the env key your provider doc names. The
   provider doc's header has an `export PROFILE_ENV=… PROFILE_SERVICE=…` line the profile
   snippets below depend on — run it first. **The profile name is the credential that decides
@@ -110,9 +110,8 @@ of them (asks and drops are refused only on trigger-fired turns).
    person whose approval you're waiting on. The approved grant's handle then works in
    `credentials`.
 4. **Not registered anywhere** → the person can supply their own keys on the spot: mint a
-   drop link per key (`POST /v1/keychain/drops` with
-   `{"service":"<your provider doc's keychain service>","envKey":"<the provider key name>","purpose":"browse"}`)
-   and hand the link over — the secret lands in
+   drop link per key with the `secret-drop` skill (service = your provider doc's keychain
+   service, envKey = the provider key name) and hand the link over — the secret lands in
    their keychain, never in chat.
 
 **If the profile has no handle in your manifest, do NOT jump to bootstrapping** — a
@@ -154,7 +153,15 @@ in it; it rides only as a runner argument, never into chat or logs.
 
 ## 2. Run the task with the embedded runner
 
-The runtime is already on your computer at `/opt/browser-engine/venv` — do not pip install.
+The runtime lives at `/opt/browser-engine/venv`. Some computer images don't ship it; a
+missing runtime is not a missing browser (the browser is remote). Run the skill's installer
+first. It does nothing when the runtime is present and takes about 30 seconds otherwise:
+
+```bash
+sh "<skill dir>/install-runtime.sh"
+```
+
+If it fails, report the browser as unavailable and quote the installer's error output.
 Write the runner once per session, then invoke it per task:
 
 ```bash

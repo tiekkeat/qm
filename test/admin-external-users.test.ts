@@ -12,13 +12,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { createInsecureTestServer, createServer } from "../src/api/server.ts";
-import { buildApp } from "../src/wiring.ts";
-import {
-  INVITE_EMAIL_NOT_CONFIGURED,
-  createInviteMailer,
-  renderInviteEmail,
-  type InviteMailer,
-} from "../src/admin/invite-email.ts";
+import { buildApp } from "./support/build-app.ts";
+import { INVITE_EMAIL_NOT_CONFIGURED, createInviteMailer, renderInviteEmail } from "../src/admin/invite-email.ts";
+import type { Mailer, Mailer as InviteMailer } from "../plugins/chassis/src/email.ts";
 import { adminStatusFromGrants } from "../src/admin/admin-service.ts";
 import { coreEmailAdmission, coreEmailAllowed } from "../plugins/chassis/src/external-members.ts";
 import { mintCapabilityToken, CAPABILITY_TTL_MS, CONTROL_PLANE_AUD } from "../src/auth/capability-token.ts";
@@ -34,11 +30,12 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 
 type Sent = { to: string; subject: string; text: string; html: string };
 
-function stubMailer(fail?: string): { sent: Sent[]; mailer: InviteMailer } {
+function stubMailer(fail?: string): { sent: Sent[]; mailer: Mailer } {
   const sent: Sent[] = [];
   return {
     sent,
     mailer: {
+      async verify() { return "configured"; },
       async send(message) {
         if (fail) throw new Error(fail);
         sent.push(message);
@@ -81,7 +78,10 @@ function start(
     ...(opts.emailAuthPrincipals ? { emailAuthPrincipals: opts.emailAuthPrincipals } : {}),
   };
   const server = opts.signed
-    ? createServer(built.app, { ...deps, signingSecret: SECRET })
+    ? createServer(built.app, {
+        ...deps,
+        signingSecret: SECRET,
+      })
     : createInsecureTestServer(built.app, deps);
   server.listen(0);
   const base = `http://localhost:${(server.address() as AddressInfo).port}`;
@@ -123,8 +123,6 @@ test("broker admission preserves configured email members without external invit
   }
   await s.built.identity.deactivate("ops@allowed.example");
   assert.deepEqual(await coreEmailAdmission(s.base, SECRET, "ops@allowed.example"), { allowed: false });
-  s.built.config.setInternalMemberOverrides(["ops@allowed.example"]);
-  assert.deepEqual(await coreEmailAdmission(s.base, SECRET, "ops@allowed.example"), { allowed: false });
   await s.built.identity.putExternalMember({
     email: "person@corp.example",
     role: "member",
@@ -133,8 +131,6 @@ test("broker admission preserves configured email members without external invit
     createdAt: Date.now() - DAY_MS,
     updatedAt: Date.now(),
   });
-  assert.deepEqual(await coreEmailAdmission(s.base, SECRET, "person@corp.example"), { allowed: false });
-  s.built.config.setInternalMemberOverrides(["person@corp.example"]);
   assert.deepEqual(await coreEmailAdmission(s.base, SECRET, "person@corp.example"), { allowed: false });
 });
 
@@ -552,7 +548,7 @@ test("expiry classifies an external as guest, and the signed broker check answer
   }
 });
 
-test("the directory resolves participants without loading their session windows", async (t) => {
+test("the directory resolves participants without loading every participant row", async (t) => {
   const s = start();
   t.after(s.close);
   for (const thread of ["first", "second"]) {
@@ -562,7 +558,7 @@ test("the directory resolves participants without loading their session windows"
   }
   await s.built.identity.deactivate("inactive");
   t.mock.method(s.built.sessions, "listParticipants", () => {
-    throw new Error("Directory lookup must not load participant windows");
+    throw new Error("Directory lookup must not load every participant row");
   });
   const alice = { principalId: "alice", displayName: "alice", type: "internal" };
   assert.deepEqual(await s.built.app.directoryMembers(), [alice]);

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { createPgPool } from "../persistence/pg-pool.ts";
+import { createPgPool, definePgMigration } from "../persistence/pg-pool.ts";
 import type {
   OpenTaskFilter,
   Task,
@@ -89,7 +89,7 @@ function filterSql(filter: TaskFilter | OpenTaskFilter, open: boolean): { where:
 
 export function createPostgresTaskStore(connectionString: string, opts: { now?: () => number } = {}): TaskStore {
   const now = opts.now ?? (() => Date.now());
-  const pg = createPgPool(connectionString, "tasks/store/0002-native-runtimes", SCHEMA);
+  const pg = createPgPool(connectionString, [definePgMigration({ id: "tasks/store/0002-native-runtimes", statements: SCHEMA })]);
   const q = pg.query;
 
   return {

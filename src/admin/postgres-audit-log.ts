@@ -99,7 +99,7 @@ export function createPostgresAuditLog(connectionString: string): AuditLog {
       }
       if (action !== undefined) {
         params.push(action);
-        conds.push(`action = $${params.length}`);
+        conds.push(typeof action === "string" ? `action = $${params.length}` : `action = ANY($${params.length})`);
       }
       if (since !== undefined) {
         params.push(since);
@@ -116,14 +116,6 @@ export function createPostgresAuditLog(connectionString: string): AuditLog {
         params,
       );
       return rows.map(rowToEvent);
-    },
-    async tallyByResource(action) {
-      await Promise.allSettled(pendingWrites);
-      const rows = await q(
-        `SELECT resource, count(*)::bigint AS n FROM audit_log WHERE action = $1 GROUP BY resource`,
-        [action],
-      );
-      return new Map(rows.map((r) => [String(r.resource), Number(r.n)]));
     },
   };
 }

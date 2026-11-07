@@ -7,9 +7,11 @@ import { createDirectory, type BotIdentity } from "../src/slack/directory.ts";
 import { createTurnHandler, type TurnHandler } from "../src/slack/turn-handler.ts";
 import { toEvent } from "../src/api/routes/surface-cache.ts";
 import { createSlackHistoryReader } from "../src/slack/history.ts";
-import { createMemorySurfaceCache } from "../src/surface-cache/surface-cache.ts";
 import { createDeduper, createThreadTracker } from "../src/slack/lib.ts";
 import { createDeferredEnvelopeAck } from "../src/slack/deferred-ack.ts";
+import { createPostgresSurfaceCache } from "../src/surface-cache/surface-cache.ts";
+import { testDatabaseUrl } from "./support/test-database.ts";
+import { settle } from "./support/settle.ts";
 
 const ids: BotIdentity = {
   botUserId: "UBOT",
@@ -48,6 +50,7 @@ function fixture(
     }),
   };
   const mirror = createMirror({
+    account: "default",
     core: {
       ingestSurfaceEvents:
         options.ingest ??
@@ -156,6 +159,24 @@ test("hidden messages never enter context or dispatch", async () => {
   assert.deepEqual(f.events, []);
   assert.deepEqual(f.dispatches, []);
   assert.deepEqual(f.inbox, []);
+});
+
+test("inbox events take DM-ness from Slack's channel_type, not the channel id", async () => {
+  const f = fixture();
+  for (const [channel, channel_type] of [
+    ["D1", "channel"],
+    ["G1", "mpim"],
+    ["C1", "im"],
+  ])
+    await f.fire({ type: "message", channel, channel_type, user: "U1", ts: "5.000001", text: "hi" });
+  assert.deepEqual(
+    f.inbox.map(([, msg]) => [msg.channel, msg.isDirectMessage]),
+    [
+      ["D1", false],
+      ["G1", true],
+      ["C1", true],
+    ],
+  );
 });
 
 test("a system-message edit arriving first is already handled", async () => {
@@ -359,7 +380,16 @@ test("self message deletions reach the mirror without dispatch", async () => {
     deleted_ts: "2",
     previous_message: { user: "UBOT", bot_id: "BBOT", thread_ts: "1" },
   });
-  assert.deepEqual(f.events, [{ container: "D1", ts: "2", deleted: true, sub: "1", self: true }]);
+  assert.deepEqual(f.events, [
+    {
+      container: "D1",
+      ts: "2",
+      deleted: true,
+      sub: "1",
+      self: true,
+      source: { account: "default", workspace: "T1", assistant: "UBOT" },
+    },
+  ]);
   assert.equal(f.dispatches.length, 0);
 });
 
@@ -438,38 +468,29 @@ test("thread broadcast snapshots retain broadcast membership through metadata up
   assert.equal(f.events[1].broadcast, undefined);
 });
 
-test("real message handler checks prior stake before ingesting the current reply without a shadow miss", async (t) => {
-  const cache = createMemorySurfaceCache();
+test("real message handler checks prior stake in the mirror before ingesting the current reply", async () => {
+  const cache = createPostgresSurfaceCache(testDatabaseUrl());
   await cache.ingest([
     { container: "C1", ts: "1.000001", text: "root", authorId: "U1" },
     { container: "C1", ts: "2.000001", sub: "1.000001", text: "prior reply", authorId: "UBOT", self: true },
   ]);
-  const calls: any[] = [];
-  const records: any[] = [];
-  t.mock.method(console, "info", (text: string) => {
-    records.push(JSON.parse(text));
-  });
   const currentTs = "3.000001";
+  const currentStoredAtRead: boolean[] = [];
   const client = {
     conversations: {
-      replies: async (args: any) => {
-        calls.push(args);
-        assert.deepEqual(args, { channel: "C1", ts: "1.000001", limit: 200, latest: currentTs, inclusive: false });
-        assert.equal((await cache.readMessages("C1", { at: currentTs })).length, 0);
-        return {
-          messages: [
-            { ts: "1.000001", user: "U1", text: "root" },
-            { ts: "2.000001", thread_ts: "1.000001", user: "UBOT", text: "prior reply" },
-          ],
-          has_more: false,
-        };
+      replies: async () => {
+        throw new Error("unexpected Slack read");
       },
     },
   };
   const reader = createSlackHistoryReader({
-    source: "shadow",
     ids,
-    core: { readSurfaceMessages: (channel: string, opts: any) => cache.readMessages(channel, opts) } as any,
+    core: {
+      readSurfaceMessages: async (channel: string, opts: any) => {
+        currentStoredAtRead.push((await cache.readMessages("C1", { at: currentTs })).length > 0);
+        return cache.readMessages(channel, opts);
+      },
+    } as any,
     historyClient: client as never,
   });
   const threads = createThreadTracker();
@@ -489,16 +510,10 @@ test("real message handler checks prior stake before ingesting the current reply
     thread_ts: "1.000001",
     text: "follow-up",
   });
-  await new Promise((resolve) => setImmediate(resolve));
+  await settle(async () => f.dispatches.length > 0);
   assert.equal(f.dispatches.length, 1);
-  assert.equal(calls.length, 1);
-  assert.equal(records.length, 1);
-  assert.equal(records[0].liveMessages, 2);
-  assert.equal(records[0].matchingMessages, 2);
-  assert.equal(records[0].liveMessagesMissingFromStorage, 0);
-  assert.equal(records[0].liveMessagesMissingFromMirror, 0);
+  assert.equal(currentStoredAtRead[0], false);
   assert.equal(await handler.botHasStakeInThread(client, "C1", "1.000001", "4.000001"), true);
-  assert.equal(calls.length, 1);
 });
 
 test("stake fallback bounds Slack replies while omitted cutoff and negative tracking remain unchanged", async () => {
@@ -527,7 +542,7 @@ test("stake fallback bounds Slack replies while omitted cutoff and negative trac
 });
 
 test("reaction turns preserve the reacted message in the mirror", async () => {
-  const cache = createMemorySurfaceCache();
+  const cache = createPostgresSurfaceCache(testDatabaseUrl());
   const f = fixture({
     ingest: async (events) => {
       await cache.ingest(events);
@@ -570,7 +585,7 @@ test("reaction turns preserve the reacted message in the mirror", async () => {
 });
 
 test("synthetic reaction turns preserve the canonical message snapshot", async () => {
-  const cache = createMemorySurfaceCache();
+  const cache = createPostgresSurfaceCache(testDatabaseUrl());
   const directory = {
     getChannelInfo: async () => ({ id: "D1" }),
     allInternalRosters: async () => new Map([["D1", []]]),
@@ -580,6 +595,7 @@ test("synthetic reaction turns preserve the canonical message snapshot", async (
     }),
   };
   const mirror = createMirror({
+    account: "default",
     core: { ingestSurfaceEvents: cache.ingest } as any,
     ids,
     directory: directory as any,
@@ -636,7 +652,7 @@ test("synthetic reaction turns preserve the canonical message snapshot", async (
 });
 
 test("broadcast metadata survives reduced remirroring and partial edits across HTTP ingestion", async () => {
-  const cache = createMemorySurfaceCache();
+  const cache = createPostgresSurfaceCache(testDatabaseUrl());
   const f = fixture({
     ingest: async (events) => {
       await cache.ingest(events.map((e) => toEvent(e)!));
@@ -684,7 +700,7 @@ test("dispatch retains known ordinary and file-share subtypes for direct message
 
 test("untyped attachment-only updates and deletions resolve room kind without dispatch", async () => {
   for (const info of [{ is_im: true }, { is_mpim: true }, { is_private: true }, {}]) {
-    const cache = createMemorySurfaceCache();
+    const cache = createPostgresSurfaceCache(testDatabaseUrl());
     const f = fixture({
       directory: {
         getChannelInfo: async () => info,
@@ -721,7 +737,10 @@ test("untyped attachment-only updates and deletions resolve room kind without di
     const rows = await cache.readMessages("C1");
     assert.match(rows[0]!.text, /forwarded body/);
     assert.equal(rows[0]!.editedAt, 1000);
-    assert.deepEqual(rows[0]!.files, [{ fileId: "F1", name: "image.png", mimetype: "image/png" }]);
+    assert.deepEqual(
+      rows[0]!.files?.map(({ fileId, name, mimetype }) => ({ fileId, name, mimetype })),
+      [{ fileId: "F1", name: "image.png", mimetype: "image/png" }],
+    );
     assert.equal(f.dispatches.length, 0);
     await f.fire({
       type: "message",

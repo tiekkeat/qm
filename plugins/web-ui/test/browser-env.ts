@@ -1,5 +1,6 @@
 import { JSDOM, type ConstructorOptions } from "jsdom";
-import { createServer, type PluginOption, type ViteDevServer } from "vite";
+import type { PluginOption, ViteDevServer } from "vite";
+import { testViteServer } from "./vite-server.ts";
 
 export interface BrowserEnv {
   dom: JSDOM;
@@ -38,6 +39,7 @@ export async function browserEnv(
     sessionStorage: dom.window.sessionStorage,
     navigator: dom.window.navigator,
     HTMLElement: dom.window.HTMLElement,
+    HTMLAnchorElement: dom.window.HTMLAnchorElement,
     Element: dom.window.Element,
     Node: dom.window.Node,
     Event: dom.window.Event,
@@ -76,9 +78,7 @@ export async function browserEnv(
   };
   let vite: ViteDevServer;
   try {
-    vite = await createServer({
-      server: { middlewareMode: true, hmr: false, ws: false },
-      appType: "custom",
+    vite = await testViteServer({
       plugins: options.plugins,
     });
   } catch (error) {

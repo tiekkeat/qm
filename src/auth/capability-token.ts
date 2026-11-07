@@ -2,6 +2,7 @@ import { promisify } from "node:util";
 import { deflateRaw, inflateRaw } from "node:zlib";
 import { orgId as configOrgId } from "../config.ts";
 import type { CandidateDestination, Destination, EgressPolicy, Principal, ScopeId } from "../types.ts";
+import type { SessionOrigin } from "../sessions/session-store.ts";
 import { mintSignedPayload, verifySignedPayload } from "./signed-token.ts";
 
 export const CAPABILITY_TTL_MS = 60 * 60_000;
@@ -23,6 +24,7 @@ export function parseSandboxCapabilityTtlMs(value: string | undefined): number {
 export const SANDBOX_CAPABILITY_TTL_MS = parseSandboxCapabilityTtlMs(undefined);
 
 export const BROWSER_MODEL_AUD = "browser-model";
+export const SANDBOX_MODEL_AUD = "sandbox-model";
 
 export const CONTROL_PLANE_AUD = "control-plane";
 export const OAUTH_CONSENT_AUD = "oauth-consent";
@@ -63,11 +65,13 @@ export interface CapabilityClaims {
   liveActor?: boolean;
   runId?: string;
   sessionId?: string;
+  origin?: SessionOrigin;
   runAttempt?: number;
   runLeaseToken?: string;
   deployment?: string;
   botActor?: boolean;
   liveAuthor?: boolean;
+  actAsActor?: boolean;
   triggered?: boolean;
   grants?: string[];
   threadRef?: string;
@@ -155,6 +159,7 @@ export async function verifyCapabilityToken(
   if (claims.liveActor !== undefined && typeof claims.liveActor !== "boolean") return null;
   if (claims.botActor !== undefined && typeof claims.botActor !== "boolean") return null;
   if (claims.liveAuthor !== undefined && typeof claims.liveAuthor !== "boolean") return null;
+  if (claims.actAsActor !== undefined && typeof claims.actAsActor !== "boolean") return null;
   if (claims.blob !== undefined && claims.blob?.dir !== "read" && claims.blob?.dir !== "write") return null;
   if (claims.drop !== undefined && typeof claims.drop !== "string") return null;
   if (claims.runId !== undefined && typeof claims.runId !== "string") return null;
@@ -165,7 +170,11 @@ export async function verifyCapabilityToken(
     return null;
   if (claims.deployment !== undefined && (typeof claims.deployment !== "string" || !claims.deployment)) return null;
   if (claims.exp === 0) {
-    if (![CONTROL_PLANE_AUD, OAUTH_CONSENT_AUD, CREDENTIAL_BROKER_AUD, EGRESS_PROXY_AUD].includes(claims.aud ?? ""))
+    if (
+      ![CONTROL_PLANE_AUD, OAUTH_CONSENT_AUD, CREDENTIAL_BROKER_AUD, EGRESS_PROXY_AUD, SANDBOX_MODEL_AUD].includes(
+        claims.aud ?? "",
+      )
+    )
       return null;
   } else if (!Number.isSafeInteger(claims.exp) || now >= claims.exp) return null;
   return claims;

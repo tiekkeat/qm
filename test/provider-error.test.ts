@@ -4,7 +4,7 @@ import test from "node:test";
 import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
 import { stream } from "@earendil-works/pi-ai/api/openai-completions";
 import { normalizeContext } from "@earendil-works/pi-ai";
-import { providerTurnError } from "../src/harness/provider-error.ts";
+import { providerTurnError } from "../src/model/provider-error.ts";
 
 test("patched Pi AI keeps a LiteLLM 429 budget_exceeded as structured providerError", async (t) => {
   const body = {

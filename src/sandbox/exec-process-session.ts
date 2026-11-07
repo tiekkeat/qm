@@ -24,6 +24,13 @@ export interface ExecProcessSessions {
   listProcesses(handle: SandboxHandle): Promise<ProcessSession[]>;
 }
 
+export class ProcessSessionGoneError extends Error {
+  constructor(processId: string) {
+    super(`no such process session: ${processId}`);
+    this.name = "ProcessSessionGoneError";
+  }
+}
+
 const PROC_BASE = "${HOME:-/root}/.agent-proc";
 export const processSessionDir = (processId: string): string => `${PROC_BASE}/${processId}`;
 const REBOOT_RC = 137;
@@ -68,7 +75,7 @@ export function redactCommand(command: string, env?: Record<string, string>): st
   );
   return redactPipedIntoWithToken(flagsRedacted)
     .replace(
-      /(export\s+\w*(?:PASS|PASSWORD|SECRET|TOKEN|KEY|IDENTIFIER|CREDENTIAL|PROXY_USER)\w*=')[^']*'/gi,
+      /(export\s+(?=\w*(?:PASS|PASSWORD|SECRET|TOKEN|KEY|IDENTIFIER|CREDENTIAL|PROXY_USER))\w+=')[^']*'/gi,
       "$1<redacted>'",
     )
     .slice(0, 500);
@@ -133,7 +140,7 @@ export function createExecProcessSessions(io: ExecProcessIo): ExecProcessSession
       ].join("\n");
       const r = await io.run(handle, script, { timeoutMs: waitMs + 20_000 });
       const out = r.stdout;
-      if (/MISSING=1/.test(out)) throw new Error(`no such process session: ${processId}`);
+      if (/MISSING=1/.test(out)) throw new ProcessSessionGoneError(processId);
       const cur = /CURSOR=(\d+)/.exec(out);
       const st = /STATUS=(running|exited:-?\d+)/.exec(out);
       const dataIdx = out.indexOf("DATA=");

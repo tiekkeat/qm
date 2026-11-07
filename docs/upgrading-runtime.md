@@ -43,16 +43,12 @@ retention also removes expired entries from the legacy table, preventing a later
 restart from importing them again. The legacy table remains available for older
 binaries.
 
-Upgrading from a release that still writes `session_tape` copies its step metadata
-into `legacy_tape_steps` during startup migrations, then drops the tape. Stop every
-older core and worker before starting the new release: a tape write after the copy
-starts makes the drop refuse, and that startup fails with the reset to run. The copy
-runs on the direct migration connection without a statement timeout and resumes
-after an interrupted startup. It walks every session at roughly 30 sessions per
-second, so a few thousand sessions take a couple of minutes; above that, run
-`node src/migrate-main.ts` with the release's configuration before starting the
-servers so readiness checks do not time out. Instances that start meanwhile wait for the copy on
-the migration lock.
+Session, run and directory tables start from one base schema (`sessions/store/0047-base-schema`,
+`runs/store/0011-base-schema`, `directory/store/0006-base-schema`). A database already at
+`sessions/store/0046-spend-days-cron-rebuild`, `runs/store/0010-drop-turn-metrics` and
+`directory/store/0005` treats the base schema as applied. A database with session, run or
+directory tables from an older release refuses to start: first run a release that applies
+those migrations but predates the base schema until its migrations finish, then upgrade.
 
 Rolling back the runtime restores code and configuration, not database contents.
 Older binaries do not display cron history written only to the new journal; those

@@ -8,14 +8,18 @@ import { traceStatus } from "../plugins/chassis/src/timing.ts";
 async function runReporting(body: string, enabled = true, env: Record<string, string> = {}) {
   const events: Record<string, any>[] = [];
   const transactions: Record<string, any>[] = [];
+  const headers: Record<string, any>[] = [];
+  const outbound: Record<string, unknown>[] = [];
   const collector = createServer(async (req, res) => {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const lines = Buffer.concat(chunks).toString().split("\n");
     if (req.url?.includes("outbound")) {
+      outbound.push(req.headers);
       res.end("{}");
       return;
     }
+    if (lines[0]) headers.push(JSON.parse(lines[0]));
     for (let i = 1; i + 1 < lines.length; i += 2) {
       const type = JSON.parse(lines[i]!).type;
       if (type === "event") events.push(JSON.parse(lines[i + 1]!));
@@ -34,7 +38,7 @@ async function runReporting(body: string, enabled = true, env: Record<string, st
       "-e",
       `
     import * as Sentry from '@sentry/node';
-    import { initializeErrorReporting, reportBackendError, startTiming, flushErrorReporting } from './plugins/chassis/src/error-reporting.ts';
+    import { initializeErrorReporting, reportBackendError, flushErrorReporting, nameRequest, traceCarrier, traceQueued, startDispatchTrace } from './plugins/chassis/src/error-reporting.ts';
     initializeErrorReporting(Sentry, 'test');
     ${body}
   `,
@@ -49,18 +53,22 @@ async function runReporting(body: string, enabled = true, env: Record<string, st
         SENTRY_DEPLOYMENT: "test-deployment",
         COLLECTOR_PORT: String(address.port),
         ...env,
+        ...(env.CORE_API_URL === "collector" ? { CORE_API_URL: `http://127.0.0.1:${address.port}` } : {}),
       },
     },
   );
   let output = "";
+  let errors = "";
   child.stdout.on("data", (chunk) => {
     output += chunk;
   });
-  child.stderr.on("data", () => {});
+  child.stderr.on("data", (chunk) => {
+    errors += chunk;
+  });
   const timeout = setTimeout(() => child.kill("SIGKILL"), 10_000);
   try {
     const [code, signal] = await once(child, "exit");
-    return { events, transactions, code, signal, output };
+    return { events, transactions, headers, outbound, code, signal, output, errors };
   } finally {
     clearTimeout(timeout);
     collector.closeAllConnections();
@@ -120,7 +128,7 @@ test("unhandled rejection flushes a fatal unhandled event and exits", async () =
 });
 
 test("fatal reporting preserves the core drain handler and avoids duplicate console events", async () => {
-  const { events, code, output } = await runReporting(`
+  const { events, code, output, errors } = await runReporting(`
     const { shutdownOnUncaught } = await import('./src/util/process-guard.ts');
     shutdownOnUncaught('qm', () => {
       setTimeout(async () => { console.log('drained'); await flushErrorReporting(); process.exit(1); }, 100);
@@ -129,18 +137,77 @@ test("fatal reporting preserves the core drain handler and avoids duplicate cons
   `);
   assert.equal(code, 1);
   assert.equal(output.trim(), "drained");
+  assert.match(errors, /^\[qm\] uncaught exception; draining and exiting: TypeError: private-fatal$/m);
   assert.equal(events.length, 1);
+  assert.equal(events[0]!.tags["request.surface"], undefined);
+});
+
+test("fatal log and report name the core route and request id in flight", async () => {
+  const { events, code, errors } = await runReporting(`
+    const { shutdownOnUncaught } = await import('./src/util/process-guard.ts');
+    const { createInsecureTestServer } = await import('./src/api/server.ts');
+    shutdownOnUncaught('qm', () => setTimeout(async () => { await flushErrorReporting(); process.exit(1); }, 50));
+    const blobTransfer = { open: () => new Promise(() => setTimeout(() => Promise.reject(new TypeError('terminated')), 0)) };
+    const server = createInsecureTestServer({}, { blobTransfer });
+    server.listen(0, '127.0.0.1', () => {
+      void fetch('http://127.0.0.1:' + server.address().port + '/v1/blobs/blob_7f3a9c?token=private-query', { headers: { 'x-request-id': 'req-42' } });
+    });
+  `);
+  assert.equal(code, 1);
+  assert.match(
+    errors,
+    /^\[qm\] unhandled rejection during core GET \/v1\/blobs\/:id \(request id req-42\); draining and exiting: TypeError: terminated$/m,
+  );
+  assert.doesNotMatch(errors, /blob_7f3a9c|private-query/);
+  assert.equal(events.length, 1);
+  assert.equal(events[0]!.tags["request.surface"], "core");
+  assert.equal(events[0]!.tags["request.method"], "GET");
+  assert.equal(events[0]!.tags["request.route"], "/v1/blobs/:id");
+  assert.equal(events[0]!.tags["request.id"], "req-42");
+  assert.equal(events[0]!.tags["request.finished"], false);
+});
+
+test("fatal log marks a request that finished before its work failed", async () => {
+  const { events, code, errors } = await runReporting(`
+    const { createServer } = await import('node:http');
+    const { withRequestContext } = await import('./plugins/chassis/src/error-reporting.ts');
+    const { findRoute } = await import('./plugins/chassis/src/router.ts');
+    const { shutdownOnUncaught } = await import('./src/util/process-guard.ts');
+    shutdownOnUncaught('qm', () => setTimeout(async () => { await flushErrorReporting(); process.exit(1); }, 50));
+    const routes = [{ method: 'GET', path: '/api/files/:id/content' }];
+    const server = createServer((req, res) => withRequestContext('web-ui', req, res, () => {
+      findRoute(routes, req.method, new URL(req.url, 'http://local').pathname);
+      res.once('close', () => setTimeout(() => { throw new TypeError('private-fatal'); }, 0));
+      res.end();
+    }));
+    server.listen(0, '127.0.0.1', () => {
+      void fetch('http://127.0.0.1:' + server.address().port + '/api/files/f8c1e2/content?sig=private-query', { headers: { 'fly-request-id': 'edge-7', 'x-request-id': 'client-9' } });
+    });
+  `);
+  assert.equal(code, 1);
+  assert.match(
+    errors,
+    /^\[qm\] uncaught exception after web-ui GET \/api\/files\/:id\/content \(request id edge-7\) finished; draining and exiting:/m,
+  );
+  assert.doesNotMatch(errors, /f8c1e2|private-query|client-9/);
+  assert.equal(events.length, 1);
+  assert.equal(events[0]!.tags["request.route"], "/api/files/:id/content");
+  assert.equal(events[0]!.tags["request.finished"], true);
 });
 
 test("operator error records send one classified event with the record details", async () => {
   const { events, code, output } = await runReporting(`
-    const { createErrorLog, withErrorReporting } = await import('./src/admin/error-log.ts');
-    const errors = withErrorReporting(createErrorLog());
+    const { withErrorReporting } = await import('./src/admin/error-log.ts');
+    const { createPostgresErrorLog } = await import('./src/admin/postgres-error-log.ts');
+    const { testDatabaseUrl } = await import('./test/support/test-database.ts');
+    const errors = withErrorReporting(createPostgresErrorLog(testDatabaseUrl()));
     const error = new Error('private-job-failure');
     console.error('[worker] private-job-failure');
     errors.record({category:'turn', code:'failed', message:error.message, scopeLabel:'private-scope'}, error);
+    await errors.flush();
     console.log((await errors.list())[0].message);
     await flushErrorReporting();
+    process.exit(0);
   `);
   assert.equal(code, 0);
   assert.equal(output.trim(), "private-job-failure");
@@ -163,55 +230,154 @@ test("trace statuses map HTTP outcomes", () => {
   ]);
 });
 
-test("real SDK preserves sampled transaction data only when a sample rate is configured", async () => {
-  const body = `
-    startTiming('queue.task', 'run', Date.now() - 500)?.({ status: 'ok', endMs: Date.now(),
-      data: { surface: 'web', origin: 'human', private: 'private-tag', page: 'private-page' },
-      measurements: { queue_wait: 20, private: 5 } });
-    const finish = startTiming('http.server', 'GET /*');
-    finish?.({ name: 'GET /v1/sessions/:id', status: 'not_found', data: { http_status: '404' } });
-    reportBackendError(new Error('private-error'));
-    await fetch('http://127.0.0.1:' + process.env.COLLECTOR_PORT + '/private-outbound').catch(() => {});
-    await flushErrorReporting();
-  `;
-  const off = await runReporting(body);
-  assert.equal(off.code, 0);
-  assert.equal(off.transactions.length, 0);
-  assert.equal(off.events.length, 1);
-  const invalid = await runReporting(body, true, { SENTRY_TRACES_SAMPLE_RATE: "5" });
-  assert.equal(invalid.transactions.length, 0);
-  const on = await runReporting(body, true, { SENTRY_TRACES_SAMPLE_RATE: "1" });
+const TRACED_REQUESTS = `
+  const { createServer } = await import('node:http');
+  const collectorUrl = 'http://127.0.0.1:' + process.env.COLLECTOR_PORT;
+  let carrier;
+  let declinedCarrier;
+  let reported = false;
+  const server = createServer(async (req, res) => {
+    nameRequest(req.method, '/v1/things/:id');
+    if (req.url.startsWith('/v1/declined')) declinedCarrier = traceCarrier();
+    if (req.url.startsWith('/v1/forged')) {
+      reportBackendError(new Error('forged-error'));
+      console.log('forged-carrier ' + JSON.stringify(traceCarrier() ?? null));
+    }
+    if (!reported) {
+      reported = true;
+      carrier = traceCarrier();
+      reportBackendError(new Error('handler-error'));
+    }
+    await fetch('http://127.0.0.1:' + process.env.COLLECTOR_PORT + '/private-outbound/private-path?token=private-query', {
+      headers: { 'x-private': 'private-header' },
+    }).catch(() => {});
+    res.end('ok');
+    setTimeout(() => fetch(collectorUrl + '/private-detached/private-path?token=private-late').catch(() => {}), 100);
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const base = 'http://127.0.0.1:' + server.address().port;
+  await fetch(collectorUrl + '/private-unparented/private-path?token=private-root').catch(() => {});
+  const forged = { 'sentry-trace': '0123456789abcdef0123456789abcdef-0123456789abcdef-1', baggage: 'sentry-sample_rand=0.00000001,sentry-transaction=private-dsc,sentry-user_id=private-user,sentry-private=private-key,sentry-release=private-release,sentry-environment=private-env,sentry-public_key=private-pk,sentry-trace_id=private-trace,third=private-third' };
+  await fetch(base + '/v1/things/private-id?token=private-token', { headers: { 'x-qm-signature': 'private-signature', cookie: 'private-cookie' } });
+  await fetch(base + '/v1/forged/private-id', { headers: forged });
+  await fetch(base + '/v1/declined/1', { headers: { 'sentry-trace': 'fedcba9876543210fedcba9876543210-fedcba9876543210-0' } });
+  console.log('declined-carrier ' + JSON.stringify(declinedCarrier ?? null));
+  await traceQueued(declinedCarrier, 'declined-run', {}, async () => {});
+  await fetch(base + '/healthz');
+  await fetch(base + '/v1/runs/private-id/events');
+  await traceQueued(carrier, 'run', { 'messaging.message.id': 'run-1', 'qm.surface': 'web', private: 'private-attribute' }, async () => {
+    const dispatch = startDispatchTrace();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    dispatch.firstToken();
+    dispatch.end();
+  });
+  await traceQueued(undefined, 'stopped-run', {}, async () => ({ stopped: true }), (result) => result.stopped);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  reportBackendError(new Error('private-error'));
+  server.close();
+  await flushErrorReporting();
+`;
+
+test("tracing is off unless a valid sample rate is configured; errors still report", async () => {
+  for (const env of [{}, { SENTRY_TRACES_SAMPLE_RATE: "5" }, { SENTRY_TRACES_SAMPLE_RATE: "0" }] as Record<
+    string,
+    string
+  >[]) {
+    const run = await runReporting(TRACED_REQUESTS, true, env);
+    assert.equal(run.code, 0);
+    assert.equal(run.transactions.length, 0);
+    assert.equal(run.events.length, 3);
+  }
+});
+
+test("sampled requests and queued runs become scrubbed, connected transactions", async () => {
+  const on = await runReporting(TRACED_REQUESTS, true, { SENTRY_TRACES_SAMPLE_RATE: "1" });
   assert.equal(on.code, 0);
-  assert.equal(on.events.length, 1);
-  assert.equal(on.transactions.length, 2);
-  assert.match(JSON.stringify(on.transactions), /private-tag/);
-  const [run, request] = on.transactions;
-  assert.equal(run!.transaction, "run");
-  assert.ok(Math.abs(run!.timestamp - run!.start_timestamp - 0.5) < 0.05);
-  assert.deepEqual(run!.tags, {
+  assert.equal(on.events.length, 3);
+  assert.match(
+    /declined-carrier (.*)/.exec(on.output)?.[1] ?? "",
+    /^\{"sentryTrace":"fedcba9876543210fedcba9876543210-[0-9a-f]{16}-0"\}$/,
+    "a run queued by an unsampled request carries the negative decision",
+  );
+  assert.ok(
+    on.transactions.every(
+      (event) =>
+        event.transaction !== "declined-run" && event.contexts.trace.trace_id !== "fedcba9876543210fedcba9876543210",
+    ),
+    "a run queued by an unsampled request is not resampled",
+  );
+  const forgedCarrier = /forged-carrier (.*)/.exec(on.output)?.[1];
+  assert.ok(forgedCarrier && forgedCarrier !== "null", "a continued request still hands its trace to runs");
+  assert.doesNotMatch(forgedCarrier, /private/);
+  assert.deepEqual(Object.keys(JSON.parse(forgedCarrier)), ["sentryTrace"]);
+  assert.match(forgedCarrier, /"sentryTrace":"0123456789abcdef0123456789abcdef-/);
+  assert.doesNotMatch(JSON.stringify(on.transactions), /private/);
+  assert.doesNotMatch(JSON.stringify(on.headers), /private/);
+  const items = new Map([...on.events, ...on.transactions].map((item) => [item.event_id, item]));
+  const traced = on.headers.filter((h) => h.trace);
+  assert.ok(traced.length >= on.events.length + on.transactions.length, "every envelope carries a trace header");
+  for (const header of traced) {
+    const item = items.get(header.event_id);
+    assert.equal(header.trace.trace_id, item?.contexts.trace.trace_id, "the envelope trace header matches its event");
+    assert.equal(header.trace.release, "test-release");
+  }
+  const handlerError = on.events.find((event) => event.exception.values[0].value === "handler-error");
+  assert.equal(handlerError?.transaction, "GET /v1/things/:id", "errors inside a request carry the route template");
+  assert.deepEqual(
+    on.transactions.filter((event) => ["db", "http.client"].includes(event.contexts.trace.op)),
+    [],
+    "detached and unparented work is not sent as its own transaction",
+  );
+  const names = on.transactions.map((event) => event.transaction);
+  assert.deepEqual(names.sort(), ["GET /v1/things/:id", "GET /v1/things/:id", "run", "stopped-run"].sort());
+  assert.equal(
+    on.transactions.find((event) => event.transaction === "stopped-run")?.contexts.trace.status,
+    "cancelled",
+  );
+  const [request] = on.transactions.filter(
+    (event) => event.transaction === "GET /v1/things/:id" && event.contexts.trace.op === "http.server",
+  );
+  assert.ok(request, "the routed request is named by its template");
+  assert.equal(request.contexts.trace.data["http.route"], "/v1/things/:id");
+  assert.equal(request.request, undefined);
+  const outbound = request.spans.find((span: { op: string }) => span.op === "http.client");
+  assert.match(outbound.description, /^GET http:\/\/127\.0\.0\.1:\d+$/);
+  const run = on.transactions.find((event) => event.transaction === "run")!;
+  assert.equal(run.contexts.trace.op, "queue.process");
+  assert.equal(run.contexts.trace.trace_id, request.contexts.trace.trace_id, "the run continues the request's trace");
+  assert.equal(run.contexts.trace.data["messaging.message.id"], "run-1");
+  assert.equal(run.contexts.trace.data["qm.surface"], "web");
+  assert.equal(run.measurements.time_to_first_token.unit, "millisecond");
+  assert.ok(run.measurements.time_to_first_token.value >= 15);
+  assert.deepEqual(run.tags, {
     service: "test",
     deployment: "test-deployment",
+    "messaging.message.id": "run-1",
+    "qm.surface": "web",
   });
-  assert.deepEqual(run!.measurements, {
-    queue_wait: { value: 20, unit: "millisecond" },
-    private: { value: 5, unit: "millisecond" },
+  assert.equal(run.release, "test-release");
+  assert.equal(run.environment, "verification");
+});
+
+test("trace context goes only to QM's own services", async () => {
+  const external = await runReporting(TRACED_REQUESTS, true, { SENTRY_TRACES_SAMPLE_RATE: "1" });
+  assert.ok(external.outbound.length > 0);
+  assert.ok(external.outbound.every((h) => h["sentry-trace"] === undefined && h.baggage === undefined));
+  const internal = await runReporting(TRACED_REQUESTS, true, {
+    SENTRY_TRACES_SAMPLE_RATE: "1",
+    CORE_API_URL: "collector",
   });
-  assert.equal(run!.contexts.trace.data.private, "private-tag");
-  assert.equal(run!.contexts.trace.data.page, "private-page");
-  assert.equal(run!.contexts.trace.op, "queue.task");
-  assert.equal(run!.release, "test-release");
-  assert.equal(run!.environment, "verification");
-  assert.equal(request!.transaction, "GET /v1/sessions/:id");
-  assert.equal(request!.contexts.trace.status, "not_found");
-  assert.equal(request!.contexts.trace.data.http_status, "404");
+  assert.ok(internal.outbound.some((h) => typeof h["sentry-trace"] === "string"));
 });
 
 test("reportFailure sends one classified event per distinct failure and skips cancellations and recorded errors", async () => {
   const { events, code, output } = await runReporting(`
     console.error = (line) => console.log(line);
     const { reportFailure } = await import('./src/util/errors.ts');
-    const { createErrorLog, withErrorReporting } = await import('./src/admin/error-log.ts');
-    const errors = withErrorReporting(createErrorLog());
+    const { withErrorReporting } = await import('./src/admin/error-log.ts');
+    const { createPostgresErrorLog } = await import('./src/admin/postgres-error-log.ts');
+    const { testDatabaseUrl } = await import('./test/support/test-database.ts');
+    const errors = withErrorReporting(createPostgresErrorLog(testDatabaseUrl()));
     const recorded = new Error('private-turn-failure');
     errors.record({category:'turn', code:'error', message:recorded.message, scopeLabel:'private-scope'}, recorded);
     reportFailure('scheduler: fire', recorded);
@@ -224,6 +390,7 @@ test("reportFailure sends one classified event per distinct failure and skips ca
     reportFailure('tools: persist artifact', reportedFirst);
     errors.record({category:'turn', code:'error', message:reportedFirst.message, scopeLabel:'private-scope'}, reportedFirst);
     await flushErrorReporting();
+    process.exit(0);
   `);
   assert.equal(code, 0);
   assert.deepEqual(
@@ -249,4 +416,41 @@ test("sandbox cleanup errors send both original failures and their stacks", asyn
     const value = values.find((entry: { value: string }) => entry.value === message);
     assert.ok(value?.stacktrace.frames.length, message);
   }
+});
+
+test("human turns are always traced while other runs follow the configured rate", async () => {
+  const sampled = await runReporting(
+    `
+    const { createServer } = await import('node:http');
+    let declined;
+    const server = createServer((req, res) => { declined = traceCarrier(); res.end('ok'); });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    await fetch('http://127.0.0.1:' + server.address().port + '/v1/things', { headers: { 'sentry-trace': 'fedcba9876543210fedcba9876543210-fedcba9876543210-0' } });
+    server.close();
+    for (let i = 0; i < 20; i++) {
+      await traceQueued(undefined, 'human-run', { 'messaging.message.id': 'run-' + i, 'qm.surface': 'slack', 'qm.origin': 'human' }, async () => {});
+      await traceQueued(undefined, 'cron-run', { 'qm.surface': 'cron', 'qm.origin': 'automation' }, async () => {});
+      await traceQueued(undefined, 'subagent-run', { 'qm.origin': 'direct' }, async () => {});
+    }
+    await traceQueued(declined, 'human-after-unsampled-request', { 'qm.origin': 'human' }, async () => {});
+    await traceQueued(declined, 'cron-after-unsampled-request', { 'qm.origin': 'automation' }, async () => {});
+    await flushErrorReporting();
+  `,
+    true,
+    { SENTRY_TRACES_SAMPLE_RATE: "0.000001" },
+  );
+  assert.equal(sampled.code, 0);
+  const names = sampled.transactions.map((event) => event.transaction);
+  assert.equal(names.filter((name) => name === "human-run").length, 20);
+  assert.ok(names.includes("human-after-unsampled-request"));
+  assert.deepEqual(
+    names.filter((name) => !name.startsWith("human-")),
+    [],
+    "automation, direct and request transactions keep the configured rate and inherited decisions",
+  );
+  const human = sampled.transactions.find((event) => event.transaction === "human-run")!;
+  assert.equal(human.contexts.trace.data["sentry.sample_rate"], 1);
+  assert.equal(human.tags["qm.origin"], "human");
+  assert.equal(human.tags["qm.surface"], "slack");
+  assert.match(human.tags["messaging.message.id"], /^run-\d+$/);
 });

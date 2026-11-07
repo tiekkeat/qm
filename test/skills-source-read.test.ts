@@ -1,7 +1,7 @@
 import "./support/auto-fake-sprites.ts";
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { testConfig } from "./support/test-config.ts";
 import type { TurnRequest } from "../src/types.ts";
 
@@ -56,7 +56,7 @@ async function fixture(t: TestContext) {
 test("published skill sources and assets read without a sandbox, respecting scope and archive", async (t) => {
   const b = await fixture(t);
   const skill = await b.publish("personal:U1", "PUBLISHED_BODY");
-  assert.match(await b.turn("!sysprompt source-helper"), /\*\*source-helper\*\*/);
+  assert.match(await b.turn("!sysprompt"), /^- source-helper — /m);
   assert.match(
     await b.turn("!skill source-helper"),
     /^\/.+\/\.agent-skills\/\w+\/[a-f0-9]{16}\/source-helper\nPUBLISHED_BODY$/,
@@ -149,7 +149,7 @@ test("a body read avoids sandbox work and a file request materializes that skill
         },
       },
       sandbox: {
-        provision: async (_layers: unknown, options?: { sandboxId?: string }) => {
+        provision: async (_owner: unknown, options?: { sandboxId?: string }) => {
           sandboxIds.push(options?.sandboxId);
           provisions++;
           return { ...handle, id: options?.sandboxId ?? handle.id };
@@ -165,14 +165,13 @@ test("a body read avoids sandbox work and a file request materializes that skill
     input: { origin: { kind: "human" } },
     actor: { id: "U1" },
     session: { id: "s" },
-    resolution: { layers: [{ scopeId: "personal:U1", mountPath: "", mode: "rw" }] },
+    resolution: { writableScopeId: "personal:U1", readOnlyScopeIds: [] },
     scopeId: "personal:U1",
     memoryScopeId: "personal:U1",
     turnSessionDir: "turn/s",
     turnFilesDir: "turn/s/t",
     connectorEnv: {},
     visibleSkillsForTurn: async () => visible,
-    emitGapWork: () => {},
     perf: { credsMs: 0 },
   } as unknown as TurnSandboxContext);
   const bodyOnly = structuredClone(unrelated);

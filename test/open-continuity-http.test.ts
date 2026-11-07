@@ -3,47 +3,47 @@ import { test, mock, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
 import { randomUUID } from "node:crypto";
-import { createMockHarness } from "../src/harness/mock-harness.ts";
-import type { HarnessTurnInput } from "../src/harness/harness.ts";
+import { createMockAgent } from "./support/mock-agent.ts";
+import type { AgentTurnInput } from "../src/agent/agent.ts";
 import { mintCapabilityToken, type CapabilityClaims } from "../src/auth/capability-token.ts";
 import { signedHeaders } from "../plugins/chassis/src/core-client.ts";
 import { credentialHandle } from "../src/credentials/keychain.ts";
 import { testConfig } from "./support/test-config.ts";
+import { createPostgresReplayDedupe } from "../src/auth/replay-dedupe.ts";
+import { testDatabaseUrl } from "./support/test-database.ts";
 
-mock.module("../src/harness/mock-harness.ts", {
+mock.module("./support/mock-agent.ts", {
   namedExports: {
-    createMockHarness: () => {
-      const h = createMockHarness();
-      const run = h.turns.runTurn;
-      h.turns.runTurn = async (turn: HarnessTurnInput) => {
+    createMockAgent: () => {
+      const h = createMockAgent();
+      const run = h.runTurn;
+      h.runTurn = async (turn: AgentTurnInput) => {
         const match = /!proof (\{[^\n]+\})/.exec(turn.input);
         if (!match) return run(turn);
         const command = JSON.parse(match[1]!) as {
           id?: string;
-          ownerAuth?: boolean;
           command: string;
           credentials?: string[];
         };
-        await turn.emit({ type: "user", payload: { text: turn.input }, scopeLabel: turn.scopeLabel });
+        await turn.emit({ kind: "UserMessage", text: turn.input });
         let reply: string;
         try {
           const out = await turn.tools.execute(command.command, {
             ...(command.id ? { sandboxId: command.id } : {}),
-            ...(command.ownerAuth ? { ownerAuth: true } : {}),
             ...(command.credentials ? { credentials: command.credentials } : {}),
           });
           reply = out.stdout.trim() || out.stderr.trim();
         } catch (e) {
           reply = `DENIED: ${String(e)}`;
         }
-        await turn.emit({ type: "assistant", payload: { text: reply }, scopeLabel: turn.scopeLabel });
+        await turn.emit({ kind: "AgentMessage", text: reply });
         return { reply };
       };
       return h;
     },
   },
 });
-const { buildApp } = await import("../src/wiring.ts");
+const { buildApp } = await import("./support/build-app.ts");
 const { createServer } = await import("../src/api/server.ts");
 const SECRET = "synthetic-continuity-http-signing-key";
 const members = ["alice", "bob"].map((id) => ({ id, type: "internal" as const }));
@@ -51,7 +51,7 @@ const members = ["alice", "bob"].map((id) => ({ id, type: "internal" as const })
 async function fixture(t: TestContext) {
   const b = buildApp(testConfig({ signingSecret: SECRET, memoryCapture: "off" }));
   await b.config.hydrate?.();
-  await b.identity.hydrate();
+  await b.identity.refresh();
   await b.deploymentLayerReady;
   await b.app.upsertDirectory(
     ["alice", "bob", "stranger"].map((principalId) => ({
@@ -75,6 +75,7 @@ async function fixture(t: TestContext) {
   );
   await b.sandboxResources.setDefault("admin-alice", "channel:public-room", sharedSandbox.id);
   const server = createServer(b.app, {
+    replayDedupe: createPostgresReplayDedupe(testDatabaseUrl()),
     signingSecret: SECRET,
     scheduler: b.scheduler,
     config: b.config,
@@ -238,7 +239,7 @@ test("HTTP Open shared cron isolates synthetic owner credential and revokes reso
   const created = await b.request("POST", "/v1/crons", owner, {
     title: "Owner keychain proof",
     schedule: { everyMs: 3600000 },
-    task: `!proof ${JSON.stringify({ ownerAuth: true, credentials: [credentialHandle(credential)], command: 'test "$CONTINUITY_PROOF_TOKEN" = "synthetic-owner-sentinel" && printf owner-credential-present' })}`,
+    task: `!proof ${JSON.stringify({ credentials: [credentialHandle(credential)], command: 'test "$CONTINUITY_PROOF_TOKEN" = "synthetic-owner-sentinel" && printf owner-credential-present' })}`,
   });
   assert.equal(created.status, 200, JSON.stringify(created.body));
   const id = created.body.cron.id;
@@ -281,7 +282,7 @@ for (const isPrivate of [false, true]) {
       const response = await b.request("POST", "/v1/crons", await b.cap("alice"), {
         title: "Opt-out proof",
         schedule: { everyMs: 3600000 },
-        task: `!proof ${JSON.stringify({ ownerAuth: true, credentials: [credentialHandle(credential)], command: 'test "$CONTINUITY_VETO_TOKEN" = "synthetic-veto-sentinel" && printf veto-credential-present' })}`,
+        task: `!proof ${JSON.stringify({ credentials: [credentialHandle(credential)], command: 'test "$CONTINUITY_VETO_TOKEN" = "synthetic-veto-sentinel" && printf veto-credential-present' })}`,
       });
       assert.equal(response.status, 200, JSON.stringify(response.body));
       const id = response.body.cron.id;
@@ -327,7 +328,7 @@ test("HTTP private channel cron runs without its owner's keychain once the conve
     createdBy: "alice",
     ownerScopeId: "channel:public-room",
     schedule: { everyMs: 3600000 },
-    action: `!proof ${JSON.stringify({ ownerAuth: true, credentials: [credentialHandle(credential)], command: 'test "$CONTINUITY_ISOLATED_TOKEN" = "synthetic-isolated-sentinel" && printf isolated-credential-present' })}`,
+    action: `!proof ${JSON.stringify({ credentials: [credentialHandle(credential)], command: 'test "$CONTINUITY_ISOLATED_TOKEN" = "synthetic-isolated-sentinel" && printf isolated-credential-present' })}`,
     destination: { type: "slack", target: "public-room", audienceScopeId: "channel:public-room" },
   });
   const fired = await b.scheduler.runNow(cron.id);

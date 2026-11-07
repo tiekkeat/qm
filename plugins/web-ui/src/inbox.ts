@@ -25,6 +25,8 @@ import {
   ChevronRight,
   Inbox as InboxGlyph,
   MoreHorizontal,
+  PanelRightClose,
+  PanelRightOpen,
   Plus,
   RefreshCw,
   Undo2,
@@ -48,7 +50,8 @@ import { listBackLink } from "./list-page";
 import { registerPaneKind } from "./pane-kinds";
 import { exitSplitIfActive, notifyPanesChanged } from "./split";
 import { tip } from "./tooltip";
-import { brandName, fieldSelect, menuSelect, avatarTpl, relTime, sheenLabel, slackMark, workingWave } from "./ui";
+import { brandName, fieldSelect, menuSelect, avatarTpl, relTime, sheenLabel, workingWave } from "./ui";
+import { slackMark } from "./slack-mark";
 import { icon } from "./icons";
 import { assistantSidebar, assistantMessage } from "./assistant-sidebar";
 import { inboxChat } from "./inbox-chat";
@@ -136,6 +139,7 @@ export interface InboxItem {
   dismissedAt?: number;
   repliedAt?: number;
   externalReplyText?: string;
+  noReplyNeeded?: { reason?: string };
   reactions?: string[];
   probablyResolved?: boolean;
   automated?: boolean;
@@ -156,8 +160,6 @@ export interface InboxSyncCron {
   id: string;
   enabled: boolean;
   lastFiredAt?: number;
-  taskVersion: number | null;
-  currentTaskVersion: number;
 }
 
 const DEFAULT_VIEWS: InboxView[] = [
@@ -228,7 +230,6 @@ export const inboxState = {
   picker: false,
   menuId: null as string | null,
   selectionBusy: false,
-  migrationPending: false,
   loopId: null as string | null,
   syncCron: null as InboxSyncCron | null,
   loaded: false,
@@ -400,7 +401,7 @@ function resolvedStatus(entry: LedgerItem): InboxItem["status"] {
 
 export function toInboxItem(entry: LedgerItem): InboxItem {
   const payload = entry.sourcePayload;
-  const sourceId = entry.source ?? payload.source;
+  const sourceId = entry.source;
   const source: InboxSource = sourceId === "gmail" || sourceId === "slack" ? sourceId : "generic";
   const draft = draftOf(entry);
   const resolved = resolvedStatus(entry);
@@ -459,6 +460,9 @@ export function toInboxItem(entry: LedgerItem): InboxItem {
     ...(resolved === "dismissed" && entry.actedAt !== undefined ? { dismissedAt: entry.actedAt } : {}),
     ...(resolved === "replied" && entry.actedAt !== undefined ? { repliedAt: entry.actedAt } : {}),
     ...(resolved === "replied" && entry.actionResult ? { externalReplyText: entry.actionResult } : {}),
+    ...(entry.actionKind === "no_reply_needed"
+      ? { noReplyNeeded: entry.actionResult ? { reason: entry.actionResult } : {} }
+      : {}),
   };
 }
 
@@ -498,7 +502,6 @@ export async function refreshInbox(
   if (!opts.silent || inboxState.loaded) drawAll();
   try {
     type Feed = {
-      migrationPending: boolean;
       filter: InboxFilter;
       selected: typeof inboxState.selected;
       available: typeof inboxState.available;
@@ -550,7 +553,6 @@ export async function refreshInbox(
     inboxState.available = metadata.available;
     inboxState.total = metadata.total;
     inboxState.filter = refreshFilter!;
-    inboxState.migrationPending = metadata.migrationPending;
     const next = [...combined.values()];
     const openId = fullSurface?.selectedId;
     const detail = openId ? inboxState.items.find((item) => item.id === openId && item.detailLoaded) : undefined;
@@ -910,7 +912,7 @@ function editDraft(item: InboxItem, patch: Partial<InboxDraft>): void {
 }
 
 function isDraftConflict(e: unknown): boolean {
-  return e instanceof ApiError && e.status === 409 && /draft changed/i.test(e.message);
+  return e instanceof ApiError && (e.body as { error?: unknown } | null)?.error === "draft_changed";
 }
 
 async function explainDraftConflict(item: InboxItem, edited: boolean): Promise<void> {
@@ -1453,7 +1455,7 @@ function reactionChipTpl(name: string): TemplateResult {
 function handledStateLabel(item: InboxItem): string {
   if (item.status === "sent") return "Sent";
   if (item.status === "replied") return "Replied";
-  return "Dismissed";
+  return item.noReplyNeeded ? "No reply needed" : "Dismissed";
 }
 
 function itemSideMark(item: InboxItem, handled: boolean): TemplateResult | typeof nothing {
@@ -1485,8 +1487,14 @@ export function handledNoteTpl(item: InboxItem): TemplateResult {
       ${item.externalReplyText ? html`<div class="inbox-replied-text">${slackTextTpl(item, item.externalReplyText)}</div>` : nothing}
     </div>`;
   }
+  const label = `${handledStateLabel(item)} ${item.dismissedAt ? relTime(item.dismissedAt) : ""}`;
+  if (item.noReplyNeeded?.reason)
+    return html`<div class="inbox-handled-note inbox-replied-note">
+      <div class="inbox-handled-line">${icon(X, 13)}<span>${label}</span> ${reopenButtonTpl(item)}</div>
+      <div class="inbox-replied-text">${item.noReplyNeeded.reason}</div>
+    </div>`;
   return html`<div class="inbox-handled-note">
-    ${icon(X, 13)}<span>Dismissed ${item.dismissedAt ? relTime(item.dismissedAt) : ""}</span>
+    ${icon(X, 13)}<span>${label}</span>
     ${reopenButtonTpl(item)}
   </div>`;
 }
@@ -1718,9 +1726,6 @@ function itemRowTpl(surface: InboxSurface, item: InboxItem, groupSize = 1): Temp
   `;
 }
 
-const MIGRATION_STATUS = "Moving your Inbox…";
-const MIGRATION_HINT = "Available once your existing Inbox finishes moving";
-
 function syncStatusLabel(cron: InboxSyncCron): string {
   if (!cron.enabled) return "Sync paused";
   return cron.lastFiredAt ? `Synced ${relTime(cron.lastFiredAt)}` : "First sync pending";
@@ -1730,7 +1735,6 @@ function syncActionTpl(opts: {
   label: string;
   busyLabel: string;
   busy: boolean;
-  disabled?: boolean;
   tooltip: string;
   action: () => void;
 }): TemplateResult {
@@ -1738,7 +1742,7 @@ function syncActionTpl(opts: {
     class="btn inbox-sync-action"
     type="button"
     ${tip(opts.tooltip)}
-    ?disabled=${opts.busy || opts.disabled}
+    ?disabled=${opts.busy}
     @click=${opts.action}
   >
     ${icon(RefreshCw, 13)}<span>${opts.busy ? opts.busyLabel : opts.label}</span>
@@ -1749,6 +1753,37 @@ function syncLoops(viewId: string) {
   return inboxState.selected.filter(
     (loop) => loop.source && (viewId === "all" || loop.id === viewId || loop.source === viewId),
   );
+}
+
+const ASSISTANT_HIDDEN_KEY = "web-ui:inbox-assistant-hidden";
+let assistantHidden = ((): boolean => {
+  try {
+    return localStorage.getItem(ASSISTANT_HIDDEN_KEY) === "1";
+  } catch {
+    return false;
+  }
+})();
+
+function assistantToggleTpl(): TemplateResult {
+  const label = assistantHidden ? "Show assistant" : "Hide assistant";
+  return html`<button
+    class="icon-btn compact subtle inbox-assistant-toggle"
+    type="button"
+    aria-label=${label}
+    aria-expanded=${String(!assistantHidden)}
+    ${tip(label)}
+    @click=${() => {
+      assistantHidden = !assistantHidden;
+      try {
+        localStorage.setItem(ASSISTANT_HIDDEN_KEY, assistantHidden ? "1" : "0");
+      } catch {
+        void 0;
+      }
+      drawAll();
+    }}
+  >
+    ${icon(assistantHidden ? PanelRightOpen : PanelRightClose, 17)}
+  </button>`;
 }
 
 function syncLineTpl(surface: InboxSurface): TemplateResult | typeof nothing {
@@ -1764,8 +1799,7 @@ function syncLineTpl(surface: InboxSurface): TemplateResult | typeof nothing {
   }
   const loops = syncLoops(surface.viewId);
   const crons = loops.flatMap((loop) => (loop.syncCron ? [loop.syncCron] : []));
-  const moving = inboxState.migrationPending;
-  if (!crons.length && !moving) return nothing;
+  if (!crons.length) return nothing;
   const status =
     crons.length === 1 ? syncStatusLabel(crons[0]!) : `${crons.filter((cron) => cron.enabled).length} syncs on`;
   return html`<span class="inbox-sync-line">
@@ -1773,11 +1807,10 @@ function syncLineTpl(surface: InboxSurface): TemplateResult | typeof nothing {
       label: "Sync",
       busyLabel: "Syncing…",
       busy: inboxState.syncBusy,
-      disabled: moving,
-      tooltip: moving ? MIGRATION_HINT : "Sync now",
+      tooltip: "Sync now",
       action: () => void syncNow(surface.viewId),
     })}
-    <span class="inbox-sync-status" role=${moving ? "status" : nothing}>${moving ? MIGRATION_STATUS : status}</span>
+    <span class="inbox-sync-status">${status}</span>
   </span>`;
 }
 
@@ -1966,15 +1999,12 @@ function surfaceTpl(surface: InboxSurface): TemplateResult {
                     <span class="inbox-setup-icon" aria-hidden="true">${loopIcon(loop, 17)}</span>
                     <div class="inbox-setup-copy">
                       <span class="inbox-setup-title">${loop.name}</span
-                      ><span class="inbox-setup-description"
-                        >${inboxState.migrationPending ? MIGRATION_STATUS : "Sync not set up"}</span
-                      >
+                      ><span class="inbox-setup-description">Sync not set up</span>
                     </div>
                     <button
                       class="inbox-setup-action"
                       aria-label=${`Set up ${loop.name}`}
-                      ${inboxState.migrationPending ? tip(MIGRATION_HINT) : nothing}
-                      ?disabled=${inboxState.syncBusy || inboxState.migrationPending}
+                      ?disabled=${inboxState.syncBusy}
                       @click=${() => void setUpSync(loop.id)}
                     >
                       <span>${inboxState.syncBusy ? "Setting up…" : "Set up"}</span>${icon(ChevronRight, 14)}
@@ -2083,7 +2113,7 @@ function itemPageTpl(item: InboxItem): TemplateResult {
         </h1>
         ${sub ? html`<div class="pane-subtitle">${sub}</div>` : nothing}
       </div>
-      ${triageControlsTpl(item)} ${dismissItemTpl(item)}
+      ${triageControlsTpl(item)} ${dismissItemTpl(item)} ${item.detailLoaded ? assistantToggleTpl() : nothing}
     </div>
     <div class="inbox-surface inbox-item-surface">
       <div class="inbox-scroll inbox-item-thread">
@@ -2091,7 +2121,11 @@ function itemPageTpl(item: InboxItem): TemplateResult {
         ${detail}
       </div>
     </div>
-    ${item.detailLoaded ? html`<aside class="inbox-item-aside" aria-label="Conversation assistant">${chatTpl(item)}</aside>` : nothing}
+    ${
+      item.detailLoaded && !assistantHidden
+        ? html`<aside class="inbox-item-aside" aria-label="Conversation assistant">${chatTpl(item)}</aside>`
+        : nothing
+    }
   `;
 }
 
@@ -2176,7 +2210,7 @@ function drawFull(): void {
   }
   syncInboxUrl(openSentEmail?.id ?? fullSurface.selectedId);
   const host = fullSurface.host;
-  host.classList.toggle("inbox-thread-page", Boolean(openItem?.detailLoaded));
+  host.classList.toggle("inbox-thread-page", Boolean(openItem?.detailLoaded) && !assistantHidden);
   const surface = fullSurface;
   let page: TemplateResult | typeof nothing;
   if (openItem) page = itemPageTpl(openItem);
@@ -2193,16 +2227,24 @@ function drawFull(): void {
         <div class="inbox-index-feed">
           <div class="pane-head">
             <h1 class="pane-title">Inbox</h1>
-            <div class="pane-head-actions">${syncLineTpl(surface)}</div>
+            <div class="pane-head-actions">${syncLineTpl(surface)} ${assistantToggleTpl()}</div>
           </div>
           ${surfaceTpl(surface)}
         </div>
-        ${inboxChat({
-          kind: "inbox",
-          hasEmail: inboxState.selected.some((loop) => loop.sources?.includes("gmail") || loop.source === "gmail"),
-          hasSlack: inboxState.selected.some((loop) => loop.sources?.includes("slack") || loop.source === "slack"),
-          hasDrafts: inboxState.items.some((item) => Boolean(item.draft) && item.status === "open"),
-        })}
+        ${
+          assistantHidden
+            ? nothing
+            : inboxChat({
+                kind: "inbox",
+                hasEmail: inboxState.selected.some(
+                  (loop) => loop.sources?.includes("gmail") || loop.source === "gmail",
+                ),
+                hasSlack: inboxState.selected.some(
+                  (loop) => loop.sources?.includes("slack") || loop.source === "slack",
+                ),
+                hasDrafts: inboxState.items.some((item) => Boolean(item.draft) && item.status === "open"),
+              })
+        }
       </div>
     `;
   keepingChatLogsPinned(host, () => render(page, host));

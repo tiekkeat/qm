@@ -11,7 +11,6 @@ interface Call {
 }
 
 const calls: Call[] = [];
-let composioReturnTo: string | null = null;
 const core = createServer((req: IncomingMessage, res) => {
   let raw = "";
   req.on("data", (chunk) => (raw += chunk));
@@ -26,10 +25,6 @@ const core = createServer((req: IncomingMessage, res) => {
       res.end(JSON.stringify({ deployments: [{ id: "d1", permission: "write" }] }));
       return;
     }
-    if ((req.url ?? "").split("?")[0] === "/v1/composio/complete-auth") {
-      res.end(JSON.stringify({ returnTo: composioReturnTo }));
-      return;
-    }
     res.end(JSON.stringify({ ok: true }));
   });
 });
@@ -38,7 +33,7 @@ await new Promise<void>((resolve) => core.listen(0, resolve));
 process.env.CORE_API_URL = `http://localhost:${(core.address() as AddressInfo).port}`;
 process.env.CORE_SIGNING_SECRET = "body-parsing-test";
 process.env.WEB_UI_PRINCIPALS = "alice";
-process.env.WEB_UI_PUBLIC_URL = "http://localhost:8790";
+process.env.PUBLIC_WEB_URL = "http://localhost:8790";
 
 const { handler } = await import("../server/index.ts");
 const surface = createServer((req, res) => void handler(req, res));
@@ -56,7 +51,7 @@ test.after(() => {
 
 test("a body that parses to a JSON primitive answers 400 — it never hangs the request", async () => {
   for (const raw of ["null", "false", "0", '""', "42"]) {
-    const r = await fetch(`${base}/api/ui-state`, { method: "PUT", headers, body: raw });
+    const r = await fetch(`${base}/api/connectors/x/start`, { method: "POST", headers, body: raw });
     assert.equal(r.status, 400, `body ${raw} must answer, not hang`);
     assert.equal(((await r.json()) as { error?: string }).error, "bad_request");
   }
@@ -67,70 +62,13 @@ test("an empty body on a strict route is refused, not read as a field-clearing o
   for (const [method, path] of [
     ["POST", "/api/deployments/d1/display-name"],
     ["POST", "/api/deployments/d1/name"],
-    ["PATCH", "/api/memory"],
-    ["DELETE", "/api/memory"],
-    ["POST", "/api/sessions/s1"],
-    ["POST", "/api/connectors/revoke"],
     ["POST", "/api/keychain/drops"],
-    ["POST", "/api/runs/r1/signal"],
   ] as const) {
     const r = await fetch(`${base}${path}`, { method, headers });
     assert.equal(r.status, 400, `${method} ${path} with no body must refuse`);
   }
   const reached = calls.slice(before).filter((c) => !c.url.startsWith("/v1/deployments?"));
   assert.equal(reached.length, 0, "no empty-body request may reach core (only the manage gate's list fetch may)");
-});
-
-test("a steer forwards a server-built TurnRequest; client-supplied identity fields are ignored", async () => {
-  const threadRef = "web:alice:steer-thread";
-  const r = await fetch(`${base}/api/runs/r1/signal`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      kind: "steer",
-      text: "louder",
-      threadRef,
-      ts: "client-forged",
-      actor: { externalId: "mallory" },
-      request: { surface: "web", actor: { externalId: "mallory" }, conversation: { kind: "dm", threadRef }, text: "x" },
-    }),
-  });
-  assert.equal(r.status, 200);
-  const forwarded = calls.at(-1);
-  assert.ok(forwarded?.url.startsWith("/v1/runs/r1/signal"));
-  const body = forwarded!.body as {
-    kind?: string;
-    text?: string;
-    ts?: string;
-    request?: { surface?: string; actor?: { externalId?: string }; conversation?: unknown; text?: string };
-  };
-  assert.equal(body.kind, "steer");
-  assert.equal(body.text, "louder");
-  assert.equal(body.ts, undefined, "a client-supplied ts is dropped; core mints its own");
-  assert.equal(body.request?.actor?.externalId, "alice", "the actor comes from the signed-in session");
-  assert.equal(body.request?.surface, "web");
-  assert.equal(body.request?.text, "louder");
-  assert.deepEqual(body.request?.conversation, { kind: "dm", threadRef });
-});
-
-test("ordinary steering without conversation context and abort preserve bare signal forwarding", async () => {
-  for (const body of [
-    { kind: "steer", text: "louder" },
-    { kind: "steer", text: "louder", threadRef: "" },
-    { kind: "steer", text: "louder", threadRef: "invalid" },
-    { kind: "abort" },
-  ]) {
-    const r = await fetch(`${base}/api/runs/r1/signal`, { method: "POST", headers, body: JSON.stringify(body) });
-    assert.equal(r.status, 200);
-    assert.deepEqual(calls.at(-1)?.body, { kind: body.kind, ...("text" in body ? { text: body.text } : {}) });
-  }
-});
-
-test("routes that historically tolerated an empty body still do", async () => {
-  const r = await fetch(`${base}/api/sessions/s1/fork`, { method: "POST", headers });
-  assert.equal(r.status, 200, "fork with no body still forks from the tail");
-  const forked = calls.at(-1);
-  assert.deepEqual(forked?.body, { principalId: "alice" });
 });
 
 test("app authorization accepts existing browser payloads and validates new return context", async () => {
@@ -163,22 +101,4 @@ test("app authorization accepts existing browser payloads and validates new retu
     assert.equal((await response.json()).error, "invalid_return_url");
   }
   assert.equal(calls.length, before);
-});
-
-test("Composio verifier forwards only the opaque session and redirects safely", async () => {
-  composioReturnTo = "http://localhost:8790//evil.example/path";
-  const response = await fetch(`${base}/api/composio/callback?session_uri=opaque&user_id=bob`, {
-    headers,
-    redirect: "manual",
-  });
-  assert.equal(response.status, 303);
-  assert.equal(response.headers.get("location"), composioReturnTo);
-  assert.equal(response.headers.get("cache-control"), "no-store");
-  assert.deepEqual(calls.at(-1)?.body, { sessionUri: "opaque" });
-  composioReturnTo = "https://evil.example/path";
-  assert.equal(
-    (await fetch(`${base}/api/composio/callback?session_uri=opaque`, { headers, redirect: "manual" })).status,
-    400,
-  );
-  composioReturnTo = null;
 });

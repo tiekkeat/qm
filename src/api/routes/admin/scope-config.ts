@@ -1,13 +1,12 @@
-import { parseScopeId } from "../../../types.ts";
+import { parseScopeId, type Principal } from "../../../types.ts";
 import { encodeRef, serviceCredRef } from "../../../acl/resource-ref.ts";
 import { computeRetention } from "../../../admin/retention.ts";
 import {
   FAST_MODE_MODEL_IDS,
   modelCatalogFor,
-  HARNESS_IDS,
-  selectableBaseModels,
   embeddingModelCatalog,
   defaultModelForHarness,
+  HARNESS_IDS,
   modelProviderAvailabilityFor,
   modelServiceable,
   modelSupportedByHarness,
@@ -17,18 +16,13 @@ import {
 import {
   builtInModelCatalog,
   cachedModelCatalog,
-  selectableCatalogForHarness,
+  selectableCatalog,
   selectableModelCatalog,
   type ModelCatalogEntry,
 } from "../../../model/model-catalog.ts";
 import { sendJson } from "../../http.ts";
 import { activePrincipal, adminActorFrom, audit, authorizeAdmin, orgScope } from "../shared.ts";
-import {
-  ADMIN_RESOURCES,
-  ADMIN_RESOURCE_BY_ID,
-  adminResourceManifest,
-  defaultAutoFlaggerConfig,
-} from "../admin-resources.ts";
+import { ADMIN_RESOURCES, ADMIN_RESOURCE_BY_ID, adminResourceManifest } from "../admin-resources.ts";
 import { type ApiCtx } from "../route.ts";
 import {
   composePolicy,
@@ -38,6 +32,7 @@ import {
 } from "../../../policy/command-policy.ts";
 import { isHostDenied } from "../../../resolution/egress-policy.ts";
 import { discoverScopes } from "./common.ts";
+import { scopeActivity } from "./scope-activity.ts";
 
 export async function putScopeConfig(ctx: ApiCtx): Promise<void> {
   const { res, deps, params, body } = ctx;
@@ -47,19 +42,6 @@ export async function putScopeConfig(ctx: ApiCtx): Promise<void> {
 
   const actor = await authorizeAdmin(ctx, targetScope);
   if (!actor) return;
-  if (
-    [
-      "base-model",
-      "runtime",
-      "cron-runtime",
-      "subagent-runtime",
-      "fallback-runtime",
-      "webui-models",
-      "browse-model",
-      "auto-flagger",
-    ].includes(resource)
-  )
-    await deps.refreshModels?.();
   const withScopeMutationLock = async <T>(fn: () => Promise<T>): Promise<T> =>
     deps.advisoryLock ? deps.advisoryLock.withLock(`admin-governance:${targetScope}`, fn) : fn();
 
@@ -104,13 +86,13 @@ export async function putScopeConfig(ctx: ApiCtx): Promise<void> {
 
   const desc = ADMIN_RESOURCE_BY_ID.get(resource);
   if (!desc) return sendJson(res, 404, { error: "not_found", message: `unknown admin resource: ${resource}` });
+  if (desc.refreshesModels) await deps.refreshModels?.();
   return withScopeMutationLock(async () => {
     try {
       const result = await desc.apply(ctx, actor, targetScope);
       if ("error" in result) {
         return sendJson(res, result.status ?? 400, { error: result.code ?? "bad_request", message: result.error });
       }
-      await deps.config!.flushScope(targetScope);
     } catch (err) {
       await deps.config!.refreshScope(targetScope);
       throw err;
@@ -130,21 +112,25 @@ export async function getAdminResources(ctx: ApiCtx): Promise<void> {
   return sendJson(res, 200, { resources: adminResourceManifest() });
 }
 
+export async function adminPermissions(deps: ApiCtx["deps"], actor: Principal) {
+  if (!deps.admin || !(await activePrincipal(deps, actor.id))) return null;
+  const status = await deps.admin.adminStatusOf(actor);
+  return { ...status, permissions: status.isAdmin ? ["admin"] : [] };
+}
+
 export async function whoami(ctx: ApiCtx): Promise<void> {
   const { res, deps } = ctx;
   if (!deps.admin) return sendJson(res, 404, { error: "not_found" });
   const actor = adminActorFrom(ctx);
-  if (!actor || !(await activePrincipal(deps, actor.id)))
-    return sendJson(res, 200, { isAdmin: false, permissions: [] });
-  const status = await deps.admin.adminStatusOf(actor);
-  const permissions = status.isAdmin ? ["admin"] : [];
+  const status = actor ? await adminPermissions(deps, actor) : null;
+  if (!actor || !status) return sendJson(res, 200, { isAdmin: false, permissions: [] });
   audit(deps, {
     principalId: actor.id,
     action: "admin.whoami",
     resource: "whoami",
     scopeLabel: status.scopeId ?? actor.id,
   });
-  return sendJson(res, 200, { ...status, permissions });
+  return sendJson(res, 200, status);
 }
 
 export async function listAdminScopes(ctx: ApiCtx): Promise<void> {
@@ -153,12 +139,11 @@ export async function listAdminScopes(ctx: ApiCtx): Promise<void> {
   const actor = await authorizeAdmin(ctx, scope);
   if (!actor) return;
   audit(deps, { principalId: actor.id, action: "scopes.read", resource: "scopes", scopeLabel: scope });
-  const [crons, deployments, skills, environmentRows, rollups] = await Promise.all([
+  const [crons, deployments, skills, environmentRows] = await Promise.all([
     app.listCrons(),
     app.listDeployments(),
     app.listSkills(),
     app.listEnvironments(),
-    deps.sessions?.scopeSessionRollups(scope, true) ?? [],
   ]);
   const environments = environmentRows.map(({ environment, attachments }) => ({
     id: environment.id,
@@ -179,22 +164,18 @@ export async function listAdminScopes(ctx: ApiCtx): Promise<void> {
     ...environments.map((environment) => environment.id),
     ...environments.flatMap((environment) => environment.attachedScopes),
   ];
-  const previewIds = rollups.flatMap((r) => (r.previewSessionId ? [r.previewSessionId] : []));
-  const [labels, previews] = await Promise.all([
-    discoverScopes(app, deps, owners),
-    deps.sessions?.lastUserMessages(previewIds) ?? new Map<string, string>(),
-  ]);
+  const labels = await discoverScopes(app, deps, owners);
+  const activity = scopeActivity(deps.sessions);
   const countBy = (ids: string[]): Map<string, number> => {
     const m = new Map<string, number>();
     for (const id of ids) m.set(id, (m.get(id) ?? 0) + 1);
     return m;
   };
-  const rollupBy = new Map(rollups.map((r) => [r.scopeId, r]));
   const cronN = countBy(crons.map((c) => c.ownerScopeId));
   const deployN = countBy(deployments.map((d) => d.ownerScopeId));
   const skillN = countBy(skills.map((s) => s.scopeId));
   const scopes = [...labels].map(([id, label]) => {
-    const rollup = rollupBy.get(id);
+    const counts = activity?.byScope.get(id);
     return {
       scopeId: id,
       ...(label ? { label } : {}),
@@ -207,24 +188,25 @@ export async function listAdminScopes(ctx: ApiCtx): Promise<void> {
             },
           }
         : {}),
-      sessions: rollup?.sessions ?? 0,
-      backgroundSessions: rollup?.backgroundSessions ?? 0,
-      lastActivity: rollup?.lastActivity ?? 0,
-      lastConversationActivity: rollup?.lastConversationActivity ?? 0,
-      lastMessage: (rollup?.previewSessionId && previews.get(rollup.previewSessionId)) || "",
+      ...(activity
+        ? {
+            sessions: counts?.conversations ?? 0,
+            backgroundSessions: (counts?.crons ?? 0) + (counts?.background ?? 0),
+            lastActivity: counts?.lastActivity ?? 0,
+          }
+        : {}),
       crons: cronN.get(id) ?? 0,
       deployments: deployN.get(id) ?? 0,
       skills: skillN.get(id) ?? 0,
     };
   });
-  scopes.sort(
-    (a, b) =>
-      b.lastActivity - a.lastActivity ||
-      b.sessions - a.sessions ||
-      b.backgroundSessions - a.backgroundSessions ||
-      a.scopeId.localeCompare(b.scopeId),
-  );
-  return sendJson(res, 200, { scopeId: scope, scopes, environments });
+  scopes.sort((a, b) => (b.lastActivity ?? 0) - (a.lastActivity ?? 0) || a.scopeId.localeCompare(b.scopeId));
+  return sendJson(res, 200, {
+    scopeId: scope,
+    scopes,
+    environments,
+    ...(activity ? { activityAsOf: activity.asOf } : {}),
+  });
 }
 
 interface ScopeEnvironmentMetadata {
@@ -261,7 +243,6 @@ const SETTINGS_RESOURCES = {
     "runtime",
     "securityPosture",
     "sharingPosture",
-    "autoFlagger",
     "approvalGrantModes",
     "commandPolicy",
     "ambientPolicy",
@@ -269,19 +250,17 @@ const SETTINGS_RESOURCES = {
     "orgAmbient",
   ],
   customize: ["soul", "branding", "featureFlags", "decisions"],
-  "slack-settings": ["externalSlackParticipants", "internalMemberOverrides", "channelHeaderPinDefault", "ackEmoji"],
+  "slack-settings": ["externalSlackParticipants", "channelHeaderPinDefault", "ackEmoji"],
   models: [
     "baseModel",
     "runtime",
     "cronRuntime",
     "subagentRuntime",
     "fallbackRuntime",
-    "approvedHarnesses",
     "webuiModels",
     "interactiveFastMode",
     "individualModelAuth",
     "memoryEmbeddingModel",
-    "browseModel",
     "browseMaxSteps",
   ],
   credentials: [],
@@ -294,11 +273,10 @@ type SettingsView = keyof typeof SETTINGS_RESOURCES;
 async function scopeServiceCredentials(deps: ApiCtx["deps"], targetScope: string) {
   const [credentials, grants] = await Promise.all([
     deps.serviceCreds?.listServiceCredentials(targetScope) ?? [],
-    deps.acl?.list() ?? [],
+    deps.acl?.find({ ownerScopeId: targetScope, kind: "service-cred" }) ?? [],
   ]);
   const grantees = new Map<string, string[]>();
   for (const grant of grants) {
-    if (grant.ownerScopeId !== targetScope) continue;
     const scopes = grantees.get(grant.ref) ?? [];
     scopes.push(grant.granteeScopeId);
     grantees.set(grant.ref, scopes);
@@ -376,42 +354,37 @@ async function scopeModelOptions(deps: ApiCtx["deps"], values: Record<string, un
   let currentId = defaultModelForHarness(deps.harnessId ?? "pi", deps.baseModelDefault);
   if (typeof values.baseModel === "string") currentId = values.baseModel;
   if (typeof runtime?.modelId === "string") currentId = runtime.modelId;
-  const currentHarness = typeof runtime?.harnessId === "string" ? runtime.harnessId : (deps.harnessId ?? "pi");
   const resolvedCurrent = resolveModel(currentId);
-  const preserveCurrent =
-    typeof runtime?.modelId === "string" || (nonblocking && !resolvedCurrent && currentId.includes("/"));
+  const preserveCurrent = typeof runtime?.modelId === "string" || (nonblocking && !resolvedCurrent);
   const currentModel: ModelCatalogEntry = {
     id: currentId,
     name: resolvedCurrent?.name ?? currentId + " (configured)",
-    provider: resolvedCurrent?.provider ?? (currentId.includes("/") ? "openrouter" : ""),
+    provider: resolvedCurrent?.provider ?? "",
   };
   const purposeRuntimes = [values.cronRuntime, values.subagentRuntime, values.fallbackRuntime].filter(
-    (value): value is { harnessId: string; modelId: string } =>
-      !!value &&
-      typeof (value as { harnessId?: unknown }).harnessId === "string" &&
-      typeof (value as { modelId?: unknown }).modelId === "string",
+    (value): value is { modelId: string; harnessId?: string } =>
+      !!value && typeof (value as { modelId?: unknown }).modelId === "string",
   );
-  const modelsFor = (harnessId: string) => {
-    const models = selectableCatalogForHarness(catalog, harnessId);
-    if (preserveCurrent && currentHarness === harnessId && !models.some((model) => model.id === currentModel.id))
-      models.push(currentModel);
-    const configured = purposeRuntimes.filter((runtime) => runtime.harnessId === harnessId);
-    for (const runtime of configured) {
-      if (!models.some((model) => model.id === runtime.modelId))
-        models.push({
-          id: runtime.modelId,
-          name: resolveModel(runtime.modelId)?.name ?? `${runtime.modelId} (configured)`,
-          provider: resolveModel(runtime.modelId)?.provider ?? "",
-        });
-    }
-    return models.filter(
+  const models = selectableCatalog(catalog);
+  if (preserveCurrent && !models.some((model) => model.id === currentModel.id)) models.push(currentModel);
+  for (const runtime of purposeRuntimes) {
+    if (!models.some((model) => model.id === runtime.modelId))
+      models.push({
+        id: runtime.modelId,
+        name: resolveModel(runtime.modelId)?.name ?? `${runtime.modelId} (configured)`,
+        provider: resolveModel(runtime.modelId)?.provider ?? "",
+      });
+  }
+  const modelsFor = (harness: string) =>
+    models.filter(
       (model) =>
-        modelServiceable(model.id, providersFor(harnessId)) ||
-        (preserveCurrent && currentHarness === harnessId && currentModel.id === model.id) ||
-        configured.some((runtime) => runtime.modelId === model.id),
+        (modelSupportedByHarness(model.id, harness) && modelServiceable(model.id, providersFor(harness))) ||
+        (preserveCurrent &&
+          currentModel.id === model.id &&
+          (runtime?.harnessId ?? deps.harnessId ?? "pi") === harness) ||
+        purposeRuntimes.some((runtime) => runtime.modelId === model.id && (runtime.harnessId ?? "pi") === harness),
     );
-  };
-  const modelsByHarness = Object.fromEntries(HARNESS_IDS.map((id) => [id, modelsFor(id)]));
+  const modelsByHarness = Object.fromEntries(HARNESS_IDS.map((harness) => [harness, modelsFor(harness)]));
   return {
     ...(cached?.refreshing ? { modelCatalogRefreshing: true } : {}),
     baseModelDefault: defaultModelForHarness(deps.harnessId ?? "pi", deps.baseModelDefault),
@@ -432,11 +405,7 @@ async function scopeModelOptions(deps: ApiCtx["deps"], values: Record<string, un
     ),
     manualCodexModels,
     fastModeModelIds: FAST_MODE_MODEL_IDS,
-    autoFlaggerDefault: defaultAutoFlaggerConfig(deps),
     memoryEmbeddingOptions: embeddingModelCatalog(),
-    browseModelOptions: selectableBaseModels().filter((m) =>
-      modelServiceable(m.id, providersFor(deps.harnessId ?? "pi")),
-    ),
   };
 }
 
@@ -539,8 +508,7 @@ export async function retention(ctx: ApiCtx): Promise<void> {
   if (!actor) return;
   audit(deps, { principalId: actor.id, action: "retention.read", resource: "retention", scopeLabel: scope });
   const sessionCount = (await deps.sessions?.countSessions()) ?? 0;
-  const participants = (await deps.sessions?.listParticipants()) ?? [];
-  const turns = (await deps.sessions?.attributedTurns()) ?? [];
-  const report = computeRetention({ sessionCount, participants, turns, nowMs: Date.now() });
+  const activity = (await deps.admin?.users.activity()) ?? [];
+  const report = computeRetention({ sessionCount, activity, nowMs: Date.now() });
   return sendJson(res, 200, { scopeId: scope, ...report });
 }

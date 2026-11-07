@@ -4,15 +4,14 @@ import {
   MODEL_PROVIDER_KEYS,
   effectiveModelProvider,
   localSandboxActive,
-  mockHarnessWarning,
   validatePortalTrust,
   type ModelProvider,
   type QmConfig,
 } from "../config.ts";
 import { CliError, errMessage, step, warn } from "../log.ts";
-import { capture, deploymentSecretValue, flyBin, isInvalidSecret, readEnvFile, which } from "../util.ts";
-import { computedSecrets, serviceSecretValue } from "../secrets.ts";
-import { emailTransportConfigured } from "../preflight.ts";
+import { capture, deploymentSecretValue, flyBin, readEnvFile, which } from "../util.ts";
+import { serviceSecretValue } from "../secrets.ts";
+import { emailTransportConfigured, smtpTlsMode, smtpTransport } from "../preflight.ts";
 
 export function slackManifestBotScopes(manifest: string): string[] {
   try {
@@ -144,29 +143,18 @@ export function requireFlyAuth(): void {
 export async function doctorCommon(
   config: QmConfig,
   secrets: Map<string, string>,
-  opts: { requiredSecretValues?: boolean; configDir?: string } = {},
+  opts: { allowMissingValues?: boolean; configDir?: string } = {},
 ): Promise<void> {
-  if (opts.requiredSecretValues) {
-    const missing = computedSecrets(config)
-      .filter((secret) => secret.required)
-      .filter((secret) => {
-        const value = deploymentSecretValue(secret.name, secrets.get(secret.name));
-        return isInvalidSecret(secret.name, value);
-      });
-    if (missing.length)
-      throw new CliError(
-        `required secrets are missing or placeholders: ${missing.map((secret) => secret.name).join(", ")}`,
-      );
-    step("required local secret values: ok");
-  }
   if (localSandboxActive(config)) {
     step("local Docker sandbox: configured");
+  } else if (config.target === "render") {
+    step("Render sandbox: configured");
   } else if (config.target === "aws") {
     step("AWS Lambda MicroVM sandbox: configured");
   } else if (config.sandbox) {
     step("sandbox: sprites boot the platform's stock image");
   } else {
-    step("sandbox: not configured — agents cannot execute commands (HARNESS=mock turns only)");
+    step("sandbox: not configured — agents cannot execute commands");
   }
 
   if (config.services.includes("slack")) {
@@ -181,43 +169,27 @@ export async function doctorCommon(
     if (httpEvents && app && !bot) {
       throw new CliError("Slack HTTP events setup needs SLACK_BOT_TOKEN, or no Slack tokens when setup is deferred");
     }
-    if (bot && (httpEvents || app)) {
+    if (bot) {
       const botApiUrl = deploymentSecretValue("SLACK_API_URL", secrets.get("SLACK_API_URL"));
       await slackCheck(bot, httpEvents ? undefined : app, opts.configDir, botApiUrl);
-      if (opts.requiredSecretValues) {
-        step("Slack tokens and manifest scopes: ok");
-      } else if (config.target === "aws") {
-        step("Slack tokens and manifest scopes: ok (verified the stored AWS secret values)");
-      } else {
-        step(
-          "Slack tokens and manifest scopes: ok (verified the local .env values — Fly's staged secrets are write-only and may differ)",
-        );
-      }
-    } else if (opts.requiredSecretValues) {
-      step("Slack setup: deferred to the admin connector page");
+      step("Slack tokens and manifest scopes: ok");
+    } else if (opts.allowMissingValues) {
+      warn("SLACK_BOT_TOKEN/SLACK_APP_TOKEN values are not available locally — skipping the live Slack check");
     } else {
-      warn(
-        config.target === "aws"
-          ? "SLACK_BOT_TOKEN/SLACK_APP_TOKEN are not in the AWS secret store yet — skipping the live Slack check"
-          : "SLACK_BOT_TOKEN/SLACK_APP_TOKEN values are not available locally — skipping the live Slack check (secret names were verified on the Fly apps)",
-      );
+      step("Slack setup: deferred to the admin connector page");
     }
   }
-  if (config.services.includes("portal")) {
-    validatePortalTrust(config, "config", opts.requiredSecretValues ? secrets : undefined);
-    step(
-      config.services.includes("auth")
-        ? "built-in sign-in broker and email trust boundary: ok"
-        : "portal OIDC client and tenant trust boundary: ok",
-    );
-  }
-  if (config.services.includes("auth")) await authBrokerCheck(config, secrets, opts.requiredSecretValues === true);
+  validatePortalTrust(config, "config", opts.allowMissingValues ? undefined : secrets);
+  step(
+    config.services.includes("auth")
+      ? "built-in sign-in broker and email trust boundary: ok"
+      : "portal OIDC client and tenant trust boundary: ok",
+  );
+  if (config.services.includes("auth")) await authBrokerCheck(config, secrets, !opts.allowMissingValues);
   await baseModelCheck(config, secrets);
 }
 
 async function baseModelCheck(config: QmConfig, secrets: Map<string, string>): Promise<void> {
-  const mockHarness = mockHarnessWarning(config);
-  if (mockHarness) warn(mockHarness);
   const provider = effectiveModelProvider(config);
   if (!provider) {
     step("base model: no modelProvider set — an administrator supplies the key from the Admin page");
@@ -279,21 +251,6 @@ async function resendCheck(apiKey: string): Promise<void> {
   if (!res.ok) throw new CliError(`the Resend API returned HTTP ${res.status}; retry when it recovers`);
 }
 
-async function smtpReachable(host: string, port: number): Promise<string> {
-  const { connect } = await import("node:net");
-  return new Promise<string>((resolve, reject) => {
-    const socket = connect({ host, port });
-    const done = (error?: Error, greeting?: string): void => {
-      socket.destroy();
-      if (error) reject(error);
-      else resolve(greeting ?? "");
-    };
-    socket.setTimeout(10_000, () => done(new Error("connection timed out")));
-    socket.once("error", (e: Error) => done(e));
-    socket.once("data", (chunk: Buffer) => done(undefined, chunk.toString("utf8").split("\r\n")[0] ?? ""));
-  });
-}
-
 async function authBrokerCheck(config: QmConfig, secrets: Map<string, string>, haveValues: boolean): Promise<void> {
   if (haveValues && !emailTransportConfigured(config, secrets)) {
     step("sign-in email: disabled; use qm admin-login for administrator access");
@@ -327,13 +284,13 @@ async function authBrokerCheck(config: QmConfig, secrets: Map<string, string>, h
     return;
   }
   const port = Number(config.env.auth?.SMTP_PORT ?? 587);
-  let greeting: string;
+  const implicit = smtpTlsMode(config.env.auth?.SMTP_TLS, port) === "implicit";
   try {
-    greeting = await smtpReachable(host, port);
+    await smtpTransport(host, port, implicit ? "implicit" : "none").verify();
   } catch (e) {
     throw new CliError(
       `SMTP relay ${host}:${port} is unreachable: ${errMessage(e)} — the broker cannot send sign-in links`,
     );
   }
-  step(`SMTP relay ${host}:${port}: reachable (${greeting || "no greeting"})`);
+  step(`SMTP relay ${host}:${port}: reachable`);
 }

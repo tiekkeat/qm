@@ -7,18 +7,20 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
-import { buildApp, type BuiltApp } from "../src/wiring.ts";
+import { type BuiltApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { createServer } from "../src/api/server.ts";
 import {
   createKeychain,
   credentialHandle,
+  askResolutionEvents,
   renderKeychainManifest,
   fileCredentialEnvironment,
   KeychainError,
   type Keychain,
   type KeychainGrant,
 } from "../src/credentials/keychain.ts";
-import { createMemoryMap, type DurableMap, type DurableMapSelect } from "../src/persistence/durable-map.ts";
+import { type DurableMap, type DurableMapSelect } from "../src/persistence/durable-map.ts";
 import { envKey } from "../src/credentials/connector-token.ts";
 import { deriveConnectorKey } from "../src/connectors/connector-client-store.ts";
 import { mintCapabilityToken, CAPABILITY_TTL_MS, type CapabilityClaims } from "../src/auth/capability-token.ts";
@@ -27,14 +29,17 @@ import { fakeSprites } from "./support/auto-fake-sprites.ts";
 import { testConfig } from "./support/test-config.ts";
 import { selectDefaultSandbox } from "./support/default-sandbox.ts";
 import { materializeGrant } from "./support/materialize-grant.ts";
+import { testAdvisoryLock, testMap, testDatabaseUrl } from "./support/test-database.ts";
+import { createPostgresReplayDedupe } from "../src/auth/replay-dedupe.ts";
 
 const KEY = deriveConnectorKey("keychain-test-key");
 
 function kc(now?: () => number): Keychain {
   return createKeychain({
-    creds: createMemoryMap(),
-    grants: createMemoryMap(),
-    asks: createMemoryMap(),
+    lock: testAdvisoryLock(),
+    creds: testMap(),
+    grants: testMap(),
+    asks: testMap(),
     key: KEY,
     ...(now ? { now } : {}),
   });
@@ -85,7 +90,7 @@ test("listAllMetadata returns person-facing metadata only", async () => {
 
 test("listing and per-owner reads use the store's projected select and never a full all() scan", async () => {
   type Rec = import("../src/credentials/keychain.ts").KeychainCredential;
-  const backing = createMemoryMap<Rec>();
+  const backing = testMap<Rec>();
   const calls: string[] = [];
   const creds: DurableMap<Rec> = {
     ...backing,
@@ -98,7 +103,13 @@ test("listing and per-owner reads use the store's projected select and never a f
       return backing.select(query);
     },
   };
-  const k = createKeychain({ creds, grants: createMemoryMap(), asks: createMemoryMap(), key: KEY });
+  const k = createKeychain({
+    lock: testAdvisoryLock(),
+    creds,
+    grants: testMap(),
+    asks: testMap(),
+    key: KEY,
+  });
   const org = scopeId("org", "default-org");
   await k.save({ ...GH, ownerId: "Alice@X.com" });
   await k.save(GH);
@@ -213,8 +224,14 @@ test("concurrent materialization consumes a once grant exactly once", async () =
 });
 
 test("legacy retry grants remain consumed and invalidate prepared uses", async () => {
-  const grants = createMemoryMap<KeychainGrant>();
-  const k = createKeychain({ creds: createMemoryMap(), grants, asks: createMemoryMap(), key: KEY });
+  const grants = testMap<KeychainGrant>();
+  const k = createKeychain({
+    lock: testAdvisoryLock(),
+    creds: testMap(),
+    grants,
+    asks: testMap(),
+    key: KEY,
+  });
   const credential = await k.save(GH);
   const grant = await k.createGrant({
     credentialId: credential.id,
@@ -274,9 +291,9 @@ test("materializeOwnById: the owner's own credential needs no grant — scope, o
 });
 
 test("a grant row pointing at a broker credential cannot materialize (defense in depth)", async () => {
-  const creds = createMemoryMap<import("../src/credentials/keychain.ts").KeychainCredential>();
-  const grants = createMemoryMap<import("../src/credentials/keychain.ts").KeychainGrant>();
-  const k = createKeychain({ creds, grants, asks: createMemoryMap(), key: KEY });
+  const creds = testMap<import("../src/credentials/keychain.ts").KeychainCredential>();
+  const grants = testMap<import("../src/credentials/keychain.ts").KeychainGrant>();
+  const k = createKeychain({ lock: testAdvisoryLock(), creds, grants, asks: testMap(), key: KEY });
   const ORG = scopeId("org", "default-org");
   await k.setServiceCredential(ORG, { slug: "serp", name: "SERP", secret: "s3", host: "api.serper.dev" });
   const broker = (await creds.all()).find((c) => c.kind === "broker")!;
@@ -307,9 +324,10 @@ describe("connectors are grantable like any keychain record", () => {
   type Rec = import("../src/credentials/keychain.ts").KeychainCredential;
   function kcWithRefresh(freshToken: string): Keychain {
     return createKeychain({
-      creds: createMemoryMap<Rec>(),
-      grants: createMemoryMap(),
-      asks: createMemoryMap(),
+      lock: testAdvisoryLock(),
+      creds: testMap<Rec>(),
+      grants: testMap(),
+      asks: testMap(),
       key: KEY,
       refreshConnector: async () => ({ accessToken: freshToken, expiresAt: Date.now() + 3_600_000 }),
     });
@@ -456,7 +474,7 @@ describe("connectors are grantable like any keychain record", () => {
     assert.equal((await k2.materializeStanding(G1)).length, 0);
   });
 
-  it("the manifest lists a participant's connected apps with credential id and grant status", async () => {
+  it("the manifest leaves a participant's ungranted connected apps out", async () => {
     const k = kc();
     await k.setConnectorToken(GMAIL, "alex@x", { accessToken: "ya29.alex", expiresAt: Date.now() + 3_600_000 });
     const connectorsByOwner = await k.listConnectorsByOwners(["alex@x"]);
@@ -469,9 +487,7 @@ describe("connectors are grantable like any keychain record", () => {
       connectorsByOwner,
       scopeGrants: [],
     });
-    assert.match(md, /connected app gmail\.googleapis\.com/);
-    assert.match(md, /credential id/);
-    assert.match(md, /no grant for this conversation/);
+    assert.doesNotMatch(md, /Alex|gmail|[a-f0-9]{16}/);
   });
 });
 
@@ -669,12 +685,24 @@ test("materializeOwn round-trips the owner's env creds; expired creds are skippe
 });
 
 test("materializeOwn skips a row that doesn't decrypt under the current key instead of throwing", async () => {
-  const creds = createMemoryMap<import("../src/credentials/keychain.ts").KeychainCredential>();
+  const creds = testMap<import("../src/credentials/keychain.ts").KeychainCredential>();
   const OTHER = deriveConnectorKey("a-different-master-key");
-  const writer = createKeychain({ creds, grants: createMemoryMap(), asks: createMemoryMap(), key: OTHER });
+  const writer = createKeychain({
+    lock: testAdvisoryLock(),
+    creds,
+    grants: testMap(),
+    asks: testMap(),
+    key: OTHER,
+  });
   await writer.save({ ownerId: "U1", service: "stripe", secret: "sk_bad", envKey: "STRIPE_KEY" });
 
-  const reader = createKeychain({ creds, grants: createMemoryMap(), asks: createMemoryMap(), key: KEY });
+  const reader = createKeychain({
+    lock: testAdvisoryLock(),
+    creds,
+    grants: testMap(),
+    asks: testMap(),
+    key: KEY,
+  });
   await reader.save(GH);
 
   const own = await reader.materializeOwn("U1");
@@ -686,13 +714,19 @@ test("materializeOwn skips a row that doesn't decrypt under the current key inst
 });
 
 test("single-grant materialize surfaces a 422 (not a raw crypto 500) when the row doesn't decrypt", async () => {
-  const creds = createMemoryMap<import("../src/credentials/keychain.ts").KeychainCredential>();
-  const grants = createMemoryMap<import("../src/credentials/keychain.ts").KeychainGrant>();
+  const creds = testMap<import("../src/credentials/keychain.ts").KeychainCredential>();
+  const grants = testMap<import("../src/credentials/keychain.ts").KeychainGrant>();
   const OTHER = deriveConnectorKey("a-different-master-key");
-  const writer = createKeychain({ creds, grants, asks: createMemoryMap(), key: OTHER });
+  const writer = createKeychain({
+    lock: testAdvisoryLock(),
+    creds,
+    grants,
+    asks: testMap(),
+    key: OTHER,
+  });
   const cred = await writer.save({ ownerId: "U1", service: "stripe", secret: "sk_bad", envKey: "STRIPE_KEY" });
 
-  const reader = createKeychain({ creds, grants, asks: createMemoryMap(), key: KEY });
+  const reader = createKeychain({ lock: testAdvisoryLock(), creds, grants, asks: testMap(), key: KEY });
   const grant = await reader.createGrant({
     credentialId: cred.id,
     ownerId: "U1",
@@ -788,11 +822,27 @@ test("multi-input login: re-save upserts the same slot, and unique/non-empty fie
     (e: KeychainError) => e.status === 400,
     "a bad single envKey is rejected too",
   );
+  await assert.rejects(
+    k.save({ ownerId: "U1", service: "x", secret: "s", envKey: "AGENT_API_URL" }),
+    (e: KeychainError) => e.status === 400 && /AGENT_\*/.test(e.message),
+    "a single envKey in the reserved AGENT_* namespace is rejected",
+  );
+  await assert.rejects(
+    k.save({ ownerId: "U1", service: "x", fields: [{ envKey: "AGENT_API_TOKEN", value: "t" }] }),
+    (e: KeychainError) => e.status === 400 && /AGENT_\*/.test(e.message),
+    "a field envKey in the reserved AGENT_* namespace is rejected",
+  );
 });
 
 test("back-compat: a legacy record carrying a plaintext username still materializes the paired env var", async () => {
-  const creds = createMemoryMap<import("../src/credentials/keychain.ts").KeychainCredential>();
-  const k = createKeychain({ creds, grants: createMemoryMap(), asks: createMemoryMap(), key: KEY });
+  const creds = testMap<import("../src/credentials/keychain.ts").KeychainCredential>();
+  const k = createKeychain({
+    lock: testAdvisoryLock(),
+    creds,
+    grants: testMap(),
+    asks: testMap(),
+    key: KEY,
+  });
   const meta = await k.save({
     ownerId: "U1",
     service: "acme-portal",
@@ -818,7 +868,6 @@ test("manifest: explains itself in a bare channel, lists credentials + protocol 
   });
   assert.match(empty, /## Credentials/);
   assert.match(empty, /No credentials available/);
-  assert.match(empty, /`request-access` skill/);
   assert.doesNotMatch(empty, /Teammate keychains/);
   assert.ok(!empty.includes("/v1/keychain/grants"), "no chat-driven approval route");
 
@@ -832,7 +881,7 @@ test("manifest: explains itself in a bare channel, lists credentials + protocol 
     detectedByOwner: new Map([["U1", ["GitHub", "AWS SSO"]]]),
   });
   assert.match(detected, /NOT registered or grantable/);
-  assert.match(detected, /### Alice \(U1\)/);
+  assert.match(detected, /^### Alice$/m);
   assert.match(detected, /AWS SSO — detected/);
 
   const k = kc();
@@ -857,16 +906,14 @@ test("manifest: explains itself in a bare channel, lists credentials + protocol 
         ownerId: "U1",
         handle: credentialHandle(cred),
         description: "github",
-        scope: "scoped",
       },
     ],
   });
   assert.match(block, /## Credentials/);
-  assert.match(block, /### Alice \(U1\)/);
+  assert.match(block, /^### Alice$/m);
   assert.match(block, new RegExp(`github:${cred.id}`));
-  assert.match(block, /STANDING grant .*gh for repo work here/);
-  assert.match(block, /github:[a-f0-9]+.*GITHUB_TOKEN/);
-  assert.match(block, /select them in execute.credentials/);
+  assert.doesNotMatch(block, /STANDING|gh for repo work here|grant `/);
+  assert.match(block, /`github:[a-f0-9]+` — github \(AliceBell\); env `GITHUB_TOKEN`/);
   assert.ok(!block.includes("/v1/keychain/grants"));
 
   const login = renderKeychainManifest({
@@ -882,7 +929,6 @@ test("manifest: explains itself in a bare channel, lists credentials + protocol 
         ownerId: "U1",
         handle: "doordash:c1",
         description: "provides `DOORDASH_EMAIL` + `DOORDASH_PASSWORD`",
-        scope: "scoped",
       },
     ],
   });
@@ -899,23 +945,44 @@ test("manifest: own credentials need no grant but require explicit execution req
     service: "file-login",
     files: [{ path: ".qa/token", contentBase64: Buffer.from("file-secret").toString("base64") }],
   });
+  const entries = await k.listByOwner("U1");
   const own = renderKeychainManifest({
     scopeId: "personal:U1",
     conversationKind: "dm",
     actorId: "U1",
     members: [{ id: "U1", displayName: "Alice" }],
-    entriesByOwner: new Map([["U1", await k.listByOwner("U1")]]),
+    entriesByOwner: new Map([["U1", entries]]),
     scopeGrants: [],
+    execution: entries.map((c) => ({
+      credentialId: c.id,
+      ownerId: "U1",
+      handle: credentialHandle(c),
+      description: "",
+    })),
   });
-  assert.match(own, /### Alice \(U1\) — own; no grant needed \(including background turns\)\n.*file-login/);
-  assert.doesNotMatch(own, /Teammate keychains/);
-  assert.ok(!own.includes("no grant for this conversation"));
-  assert.match(
-    own,
-    /EXPIRED — they must re-auth before it can be used/,
-    "an expired own credential points at re-auth, not the grant flow",
+  assert.match(own, /^### Alice\n/m);
+  assert.match(own, /`file-login:[a-f0-9]+` — file-login; files in \$HOME/);
+  assert.match(own, /`npm:[a-f0-9]+` — npm; expired$/m);
+  assert.doesNotMatch(own, /request-access|grant/);
+  assert.equal(
+    renderKeychainManifest({
+      scopeId: "personal:U1",
+      conversationKind: "dm",
+      actorId: "U1",
+      scopeGrants: [],
+      members: [{ id: "U1" }],
+      entriesByOwner: new Map([["U1", entries]]),
+    }),
+    renderKeychainManifest({
+      scopeId: "personal:U1",
+      conversationKind: "dm",
+      actorId: "U1",
+      scopeGrants: [],
+      members: [{ id: "U1" }],
+      entriesByOwner: new Map(),
+    }),
+    "own credentials without an execution handle are not listed",
   );
-  assert.ok(!own.includes("before requesting a grant"));
 
   const other = renderKeychainManifest({
     scopeId: "personal:U2",
@@ -925,9 +992,7 @@ test("manifest: own credentials need no grant but require explicit execution req
     entriesByOwner: new Map([["U1", await k.listByOwner("U1")]]),
     scopeGrants: [],
   });
-  assert.match(other, /no grant for this conversation/);
-  assert.match(other, /EXPIRED — ask the owner to re-auth before requesting a grant/);
-  assert.ok(!other.includes("their own — no grant needed"), "a teammate's credential never reads as implied");
+  assert.doesNotMatch(other, /Alice|npm|request-access/);
 
   const channel = renderKeychainManifest({
     scopeId: "channel:C1",
@@ -937,11 +1002,7 @@ test("manifest: own credentials need no grant but require explicit execution req
     entriesByOwner: new Map([["U1", await k.listByOwner("U1")]]),
     scopeGrants: [],
   });
-  assert.ok(
-    !channel.includes("access is implied"),
-    "the actor's own credentials in a shared scope keep the grant protocol",
-  );
-  assert.match(channel, /no grant for this conversation/);
+  assert.doesNotMatch(channel, /Alice|npm|request-access/);
 });
 
 const SECRET = "keychain-route-secret".repeat(3);
@@ -983,9 +1044,9 @@ describe("/v1/keychain routes (capability-authed)", () => {
       { groupId: "G_CONN", principalId: "carol@conn" },
     ]);
     server = createServer(built.app, {
+      replayDedupe: createPostgresReplayDedupe(testDatabaseUrl()),
       signingSecret: SECRET,
       keychain: built.keychain,
-      workspace: built.workspace,
       auditLog: built.auditLog,
       credentialUsage: built.credentialUsage,
       sessions: built.sessions,
@@ -1270,8 +1331,7 @@ test("turn e2e: prompt lists exact handles and keychain env credentials are neve
   const sys = await built.app.turn(channelTurn("!sysprompt", "U_ASKER", audience));
   assert.equal(sys.status, "ok");
   assert.match(sys.reply ?? "", /## Credentials/);
-  assert.match(sys.reply ?? "", /### Alice \(U_OWNER\)/);
-  assert.match(sys.reply ?? "", /no grant for this conversation/);
+  assert.doesNotMatch(sys.reply ?? "", /### Alice|github \(AliceBell\)|request-access` skill:/);
   assert.ok(!(sys.reply ?? "").includes("ghp_e2e"), "prompt never carries the secret");
   await selectDefaultSandbox(built, "U_ASKER", "channel:C1");
 
@@ -1287,15 +1347,16 @@ test("turn e2e: prompt lists exact handles and keychain env credentials are neve
     purpose: "use my gh here for repo work",
   });
   const sys2 = await built.app.turn(channelTurn("!sysprompt", "U_ASKER", audience));
-  assert.match(sys2.reply ?? "", /STANDING grant .*use my gh here for repo work/);
-  assert.match(sys2.reply ?? "", new RegExp(`github:${cred.id}`));
+  assert.match(sys2.reply ?? "", new RegExp(`\`github:${cred.id}\` — github \\(AliceBell\\); env \`GITHUB_TOKEN\``));
+  assert.doesNotMatch(sys2.reply ?? "", /use my gh here for repo work|Not granted here/);
 
   mark = fakeSprites.execScripts().length;
   assert.equal((await built.app.turn(channelTurn("!run true", "U_ASKER", audience))).status, "ok");
   assert.ok(!execScriptsMention("export GITHUB_TOKEN=", mark), "standing grants are not ambient");
   assert.ok(!execScriptsMention("ghp_e2e", mark), "an unrequested command never receives the secret");
   const unchanged = await built.app.turn(channelTurn("!sysprompt", "U_ASKER", audience));
-  assert.doesNotMatch(unchanged.reply ?? "", /STANDING grant|## Credentials/);
+  const system = (reply?: string) => (reply ?? "").split("<environment>")[0];
+  assert.equal(system(unchanged.reply), system(sys2.reply));
 
   await selectDefaultSandbox(built, "U_OWNER", "personal:U_OWNER");
   mark = fakeSprites.execScripts().length;
@@ -1342,9 +1403,10 @@ test("prepared grants reject credential rotation without consuming a single use"
 test("connector refresh during preparation binds the refreshed version and later rotation invalidates it", async () => {
   let refreshes = 0;
   const k = createKeychain({
-    creds: createMemoryMap(),
-    grants: createMemoryMap(),
-    asks: createMemoryMap(),
+    lock: testAdvisoryLock(),
+    creds: testMap(),
+    grants: testMap(),
+    asks: testMap(),
     key: KEY,
     refreshConnector: async () => {
       refreshes++;
@@ -1408,9 +1470,10 @@ test("Composio keys remain backend-only across all materialization paths includi
 test("manifest timestamps stay stable until credentials and pending asks actually expire", async () => {
   let now = Date.parse("2030-01-01T00:00:00Z");
   const k = createKeychain({
-    creds: createMemoryMap(),
-    grants: createMemoryMap(),
-    asks: createMemoryMap(),
+    lock: testAdvisoryLock(),
+    creds: testMap(),
+    grants: testMap(),
+    asks: testMap(),
     key: KEY,
     now: () => now,
   });
@@ -1431,32 +1494,35 @@ test("manifest timestamps stay stable until credentials and pending asks actuall
         members: [{ id: "U1" }],
         entriesByOwner: new Map([["U1", await k.listByOwner("U1")]]),
         scopeGrants: [],
-        scopeAsks: await k.listAsks({ requesterScopeId: "channel:C1" }),
+        execution: [
+          { credentialId: credential.id, ownerId: "U1", handle: credentialHandle(credential), description: "" },
+        ],
       },
       now,
     );
+  const events = async (since: number) =>
+    askResolutionEvents(await k.listAsks({ requesterScopeId: "channel:C1" }), since, () => "U1", k.getCredential);
   const first = await manifest();
   for (const advance of [61_000, 3 * 3_600_000]) {
     now += advance;
     assert.equal(await manifest(), first);
+    assert.equal(await events(ask.createdAt), "");
   }
-  assert.ok(first.includes(`expires at ${new Date(expiresAt).toISOString()}`));
-  assert.match(first, /waiting on U1's approval card/);
+  assert.doesNotMatch(first, /expires at|\d{4}-\d{2}-\d{2}T|approval card/);
   now = ask.expiresAt;
-  assert.equal(await manifest(), first);
+  assert.equal(await events(ask.createdAt), "");
   now++;
-  const expiredAsk = await manifest();
-  assert.match(expiredAsk, /request to U1: expired/);
-  assert.doesNotMatch(expiredAsk, /waiting on U1's approval card/);
+  assert.equal(await events(ask.createdAt), "Access request to U1 for `github` was expired.");
+  assert.equal(await events(now), "");
   await assert.rejects(
     k.approveAsk({ askId: ask.id, ownerId: "U1", mode: "once", purpose: "test access" }),
     (e: KeychainError) => e.status === 410,
   );
   now = expiresAt;
-  assert.doesNotMatch(await manifest(), /EXPIRED — they must re-auth/);
+  assert.doesNotMatch(await manifest(), /; expired/);
   await k.materializeOwnById("U1", credential.id, "personal:U1");
   now++;
-  assert.match(await manifest(), /EXPIRED — they must re-auth/);
+  assert.match(await manifest(), /; expired/);
   await assert.rejects(
     k.materializeOwnById("U1", credential.id, "personal:U1"),
     (e: KeychainError) => e.status === 410,
@@ -1513,7 +1579,6 @@ test("manifest inventories are canonical across discovery order without mutating
       ["U1", ["zsh", "aws"]],
       ["U2", ["gcloud", "aws"]],
     ]),
-    scopeAsks: await k.listAsks({ requesterScopeId: "channel:C1" }),
   };
   const before = structuredClone(input);
   const first = renderKeychainManifest(input, 1000);
@@ -1529,11 +1594,8 @@ test("manifest inventories are canonical across discovery order without mutating
   }
   for (const entries of reversed.connectorsByOwner!.values()) entries.reverse();
   for (const entries of reversed.detectedByOwner!.values()) entries.reverse();
-  reversed.scopeAsks!.reverse();
   assert.equal(renderKeychainManifest(reversed, 1000), first);
   assert.deepEqual(input, before);
-  assert.match(first, /waiting on U1's approval card/);
-  assert.ok(!first.includes("Asks waiting on you"));
   reversed.connectorsByOwner!.get("U1")![0]!.needsReconnect = true;
   assert.notEqual(renderKeychainManifest(reversed, 1000), first);
 });
@@ -1581,35 +1643,29 @@ test("manifest merges credential representations without conflating login identi
         handle: credentialHandle(credential),
         ownerId,
         credentialId: credential.id,
-        scope: "scoped",
         description: "mail grant",
       },
       {
         handle: "connector:gmail.googleapis.com:default",
         ownerId,
         credentialId: credential.id,
-        scope: "owner",
         description: "own mail",
       },
       ...[first, second].map((c) => ({
         handle: credentialHandle(c),
         ownerId,
         credentialId: c.id,
-        scope: "owner" as const,
         description: "aws",
       })),
     ],
   };
   const rendered = renderKeychainManifest(input, 1000);
   assert.equal(rendered.split("### ").length - 1, 1);
-  assert.equal(rendered.split("connected app gmail.googleapis.com").length - 1, 1);
-  assert.match(rendered, /run in execute scope `owner` unless marked/);
-  assert.ok(rendered.includes(`\`${credentialHandle(credential)}\` (execute scope \`scoped\`)`));
-  assert.match(rendered, /`connector:gmail\.googleapis\.com:default`(?! \(execute scope)/);
-  assert.match(rendered, /NEEDS RECONNECT/);
-  assert.match(rendered, /token expires at/);
-  assert.match(rendered, /account work, EXPIRED/);
-  assert.match(rendered, /account personal, expires at/);
+  assert.equal(rendered.split("— Google").length - 1, 1);
+  assert.match(rendered, /`connector:gmail\.googleapis\.com:default`, `[^`]+` — Google; expired/);
+  assert.match(rendered, /aws \(work\); expired/);
+  assert.match(rendered, /aws \(personal\); env `OTHER_AWS_TOKEN`/);
+  assert.doesNotMatch(rendered, /expires at|\d{4}-\d{2}-\d{2}T/);
   assert.notEqual(credentialHandle(first), credentialHandle(second));
   for (const secret of ["private-token", "first-secret", "second-secret"]) assert.ok(!rendered.includes(secret));
   input.execution!.reverse();
@@ -1641,10 +1697,45 @@ test("granted connector keeps account and refresh semantics when owner is absent
       members: [{ id: "U_ACTOR" }],
       entriesByOwner: new Map(),
       scopeGrants: [{ grant, credential }],
+      execution: [
+        { handle: credentialHandle(credential), ownerId: "U_OWNER", credentialId: credential.id, description: "" },
+      ],
     },
     1000,
   );
-  assert.match(rendered, /connected app gmail\.googleapis\.com, account company/);
-  assert.match(rendered, /STANDING grant/);
-  assert.doesNotMatch(rendered, /EXPIRED|NEEDS RECONNECT|refresh-token|old-token/);
+  assert.match(rendered, /### U_OWNER\n- `[^`]+` — Google \(company\); env `VAULT_TOKEN_GMAIL_GOOGLEAPIS_COM`$/);
+  assert.doesNotMatch(rendered, /expired|Not granted|refresh-token|old-token/);
+});
+
+test("a connector whose refresh was rejected shows the provider's error, not just expired", () => {
+  const rendered = renderKeychainManifest({
+    scopeId: "personal:U1",
+    conversationKind: "dm",
+    actorId: "U1",
+    members: [{ id: "U1" }],
+    entriesByOwner: new Map(),
+    connectorsByOwner: new Map([
+      [
+        "U1",
+        [
+          {
+            credentialId: "c1",
+            ownerId: "U1",
+            host: "gmail.googleapis.com",
+            connected: true,
+            needsReconnect: true,
+            refreshError: "invalid_grant",
+          },
+        ],
+      ],
+    ]),
+    scopeGrants: [],
+    execution: [
+      { handle: "connector:gmail.googleapis.com:default", ownerId: "U1", credentialId: "c1", description: "" },
+    ],
+  });
+  assert.match(
+    rendered,
+    /`connector:gmail\.googleapis\.com:default` — .*; expired \(refresh failed: invalid_grant\)$/m,
+  );
 });

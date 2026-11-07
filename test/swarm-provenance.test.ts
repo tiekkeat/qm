@@ -37,10 +37,8 @@ test("execution metadata does not change stable dispatch provenance", async () =
       ...f.input,
       attempt: f.run.attempts,
       runLeaseToken: f.run.leaseToken!,
-      background: true,
       finalAttempt: false,
       cancel: new AbortController().signal,
-      queueMs: 7,
       runStartedAt: Date.now(),
     }),
   );
@@ -89,9 +87,6 @@ const mutations: Record<string, (input: OrchestratorInput) => void> = {
   model: (i) => {
     i.model = "forged-model";
   },
-  harness: (i) => {
-    i.harness = "claude";
-  },
   effort: (i) => {
     i.thinkingLevel = "high";
   },
@@ -112,6 +107,9 @@ const mutations: Record<string, (input: OrchestratorInput) => void> = {
   },
   deadline: (i) => {
     i.turnWallClockMs = 1;
+  },
+  goal: (i) => {
+    i.swarmGoal = { objective: "forged", token_cap: 1, assignedAt: Date.now() };
   },
   participants: (i) => {
     i.sessionParticipantIds = ["outsider"];

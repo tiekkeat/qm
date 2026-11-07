@@ -4,14 +4,15 @@ import {
   apiRouteName,
   initializeBrowserErrors,
   reportRequestTiming,
+  reportSessionSwitch,
   stopBrowserErrors,
 } from "../src/browser-errors.ts";
-import { browserErrorConfig } from "../server/browser-error-config.ts";
+import { browserErrorConfig } from "../../chassis/src/browser-error-config.ts";
 
 const origin = "https://app.example.com";
 
 test("browser request names come from a static resource allowlist, never the path", () => {
-  assert.equal(apiRouteName("/api/sessions/0f3a9c1e-1d2b-4c5d-8e9f-abcdef012345/entries"), "/api/sessions/*");
+  assert.equal(apiRouteName("/api/sessions/0f3a9c1e-1d2b-4c5d-8e9f-abcdef012345/items"), "/api/sessions/*");
   assert.equal(apiRouteName("/web/api/ui-state"), "/api/ui-state");
   assert.equal(apiRouteName("/api/private-resource/id"), "/*");
   assert.equal(apiRouteName("/d/private-app/"), "/*");
@@ -100,7 +101,7 @@ test("real browser SDK preserves page URLs, request data and child spans when sa
     const sdk = await import("@sentry/browser");
     await new Promise((resolve) => setTimeout(resolve, 600));
     reportRequestTiming(
-      `${origin}/api/sessions/0f3a9c1e-1d2b-4c5d-8e9f-abcdef012345/entries?after=private`,
+      `${origin}/api/sessions/0f3a9c1e-1d2b-4c5d-8e9f-abcdef012345/items?after=private`,
       "GET",
       Date.now() - 40,
       200,
@@ -108,6 +109,25 @@ test("real browser SDK preserves page URLs, request data and child spans when sa
     reportRequestTiming("/api/ui-state?key=private", "PUT", Date.now() - 5, 409);
     reportRequestTiming("/api/runs", "POST", Date.now() - 5, null);
     reportRequestTiming("https://other.example.com/private", "GET", Date.now(), 200);
+    const switched = Date.now() - 90;
+    reportSessionSwitch(switched, {
+      fetchedMs: switched + 60,
+      endMs: switched + 90,
+      loaded: true,
+      prefetched: false,
+      cached: false,
+      tracked: true,
+      items: 12,
+    });
+    reportSessionSwitch(switched, {
+      fetchedMs: switched + 20,
+      endMs: switched + 25,
+      loaded: false,
+      prefetched: true,
+      cached: false,
+      tracked: false,
+      items: 0,
+    });
     sdk.captureEvent({
       type: "transaction",
       transaction: "GET /api/private/1234",
@@ -146,6 +166,8 @@ test("real browser SDK preserves page URLs, request data and child spans when sa
         ["transaction", "GET /api/sessions/*"],
         ["transaction", "PUT /api/ui-state"],
         ["transaction", "POST /api/runs"],
+        ["transaction", "session_switch"],
+        ["transaction", "session_switch"],
         ["transaction", "GET /api/private/1234"],
         ["transaction", "GET /api/direct"],
       ],
@@ -156,7 +178,7 @@ test("real browser SDK preserves page URLs, request data and child spans when sa
     assert.equal(pageload.contexts.trace.data.url, `${origin}/s/private-session?token=private`);
     assert.equal(
       items[1]![2]!.contexts.trace.data.url,
-      `${origin}/api/sessions/0f3a9c1e-1d2b-4c5d-8e9f-abcdef012345/entries?after=private`,
+      `${origin}/api/sessions/0f3a9c1e-1d2b-4c5d-8e9f-abcdef012345/items?after=private`,
     );
     assert.deepEqual(pageload.measurements, {
       ttfb: { value: 120, unit: "millisecond" },
@@ -172,12 +194,28 @@ test("real browser SDK preserves page URLs, request data and child spans when sa
     assert.equal(items[2]![2]!.contexts.trace.status, "invalid_argument");
     assert.equal(items[3]![2]!.contexts.trace.data.http_status, "network");
     assert.equal(items[3]![2]!.contexts.trace.status, "internal_error");
-    assert.equal(items[5]![2]!.spans[0].description, "private");
-    assert.equal(items[5]![2]!.request.url, "private");
-    assert.equal(items[5]![2]!.tags.private, "private");
-    assert.equal(items[5]![2]!.contexts.trace.data.private, 1);
-    const traceIds = new Set(items.slice(0, 4).map(([, , event]) => event!.contexts.trace.trace_id));
-    assert.equal(traceIds.size, 4);
+    const loaded = items[4]![2]!;
+    assert.equal(loaded.contexts.trace.op, "ui.action");
+    assert.equal(loaded.contexts.trace.status, "ok");
+    assert.equal(loaded.contexts.trace.data.prefetched, "false");
+    assert.equal(loaded.contexts.trace.data.cached, "false");
+    assert.equal(loaded.contexts.trace.data.tracked, "true");
+    assert.equal(loaded.contexts.trace.data.items, "12");
+    assert.deepEqual(loaded.measurements, {
+      fetch: { value: 60, unit: "millisecond" },
+      render: { value: 30, unit: "millisecond" },
+    });
+    assert.equal(Math.round((loaded.timestamp - loaded.start_timestamp) * 1000), 90);
+    const failed = items[5]![2]!;
+    assert.equal(failed.contexts.trace.status, "internal_error");
+    assert.equal(failed.contexts.trace.data.prefetched, "true");
+    assert.equal(failed.contexts.trace.data.tracked, "false");
+    assert.equal(items[7]![2]!.spans[0].description, "private");
+    assert.equal(items[7]![2]!.request.url, "private");
+    assert.equal(items[7]![2]!.tags.private, "private");
+    assert.equal(items[7]![2]!.contexts.trace.data.private, 1);
+    const traceIds = new Set(items.slice(0, 6).map(([, , event]) => event!.contexts.trace.trace_id));
+    assert.equal(traceIds.size, 6);
     assert.equal(pageload.user.username, "private-user");
   });
 });

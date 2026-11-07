@@ -84,7 +84,6 @@ test("draft stays outside AI chat and Send it submits the combined instruction",
           message: instruction ? `${instruction}\n\nSend it` : "Send it",
           expectedProposalAt: 101,
           model: "gpt-5.6-sol",
-          harness: "pi",
           thinkingLevel: "medium",
           fastMode: false,
         });
@@ -121,7 +120,8 @@ test("draft stays outside AI chat and Send it submits the combined instruction",
     globalThis.fetch = async (url) => {
       if (String(url).includes("runtime-config")) return Response.json(inboxRuntime);
       staleCalls.push(String(url));
-      if (String(url).endsWith("/action")) return Response.json({ message: "draft changed" }, { status: 409 });
+      if (String(url).endsWith("/action"))
+        return Response.json({ error: "draft_changed", message: "draft changed" }, { status: 409 });
       staleLedger.proposal = { data: { body: "New agent draft" }, by: "agent", at: 200 };
       return Response.json({ item: staleLedger });
     };
@@ -193,9 +193,9 @@ test("draft stays outside AI chat and Send it submits the combined instruction",
     invalidateRuntimeConfigs();
     unavailable = true;
     render(embedded("test-inbox-deleted-model"), host);
-    await until(() => Boolean(host.querySelector('select option[value="pi:gpt-5.6-sol"]')));
+    await until(() => Boolean(host.querySelector('select option[value="gpt-5.6-sol"]')));
     const replacement = host.querySelector<HTMLSelectElement>("select")!;
-    replacement.value = "pi:gpt-5.6-sol";
+    replacement.value = "gpt-5.6-sol";
     replacement.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
     await until(() => Boolean(host.querySelector(".composer-input:not(:disabled)")));
     unavailable = false;
@@ -258,9 +258,12 @@ test("draft stays outside AI chat and Send it submits the combined instruction",
         if (String(url).endsWith("/action"))
           return new Response(JSON.stringify({ message: "Save unavailable" }), { status: 502 });
         if (String(url).endsWith("/followup"))
-          return new Response(JSON.stringify({ message: "the draft changed; review it before continuing" }), {
-            status: 409,
-          });
+          return new Response(
+            JSON.stringify({ error: "draft_changed", message: "the draft changed; review it before continuing" }),
+            {
+              status: 409,
+            },
+          );
         return Response.json({
           item: { ...ledger, proposal: { ...ledger.proposal, data: { body: "New server draft" }, at: 101 } },
         });

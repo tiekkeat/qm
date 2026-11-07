@@ -5,13 +5,16 @@ import type { Server } from "node:http";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildApp, type BuiltApp } from "../src/wiring.ts";
+import { type BuiltApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { signedRequestHeaders } from "../plugins/chassis/src/source-auth-sign.ts";
 import { signRequest } from "../src/auth/source-auth.ts";
 import { createServer } from "../src/api/server.ts";
 import { mintCapabilityToken, CAPABILITY_TTL_MS } from "../src/auth/capability-token.ts";
 import { CoreClient } from "./live-slack/core.ts";
 import { testConfig } from "./support/test-config.ts";
+import { createPostgresReplayDedupe } from "../src/auth/replay-dedupe.ts";
+import { testDatabaseUrl } from "./support/test-database.ts";
 
 const SECRET = "directory-resolve-secret".repeat(3);
 
@@ -27,7 +30,11 @@ describe("GET /v1/directory/resolve (agent looks up a teammate's mention id)", a
 
   before(async () => {
     built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "dir-resolve-")), signingSecret: SECRET }));
-    server = createServer(built.app, { signingSecret: SECRET, scheduler: built.scheduler });
+    server = createServer(built.app, {
+      replayDedupe: createPostgresReplayDedupe(testDatabaseUrl()),
+      signingSecret: SECRET,
+      scheduler: built.scheduler,
+    });
     await new Promise<void>((resolve) => server.listen(0, resolve));
     base = `http://localhost:${(server.address() as AddressInfo).port}`;
     await built.app.upsertDirectory([
@@ -61,6 +68,32 @@ describe("GET /v1/directory/resolve (agent looks up a teammate's mention id)", a
       assert.equal(response.status, 200);
       assert.deepEqual(await response.json(), { member });
     }
+  });
+
+  it("channel lookup offers public channels and private ones the person is in, exact name first, then prefix matches", async () => {
+    await built.app.upsertChannels(
+      [
+        { channelId: "CPUBLIC", name: "public", isPrivate: false },
+        { channelId: "CPUB", name: "pub", isPrivate: false },
+        { channelId: "CLAUNCH", name: "launch-pub", isPrivate: false },
+        { channelId: "CSECRET", name: "pub-secret", isPrivate: true },
+        { channelId: "COTHER", name: "pub-other-team", isPrivate: true },
+      ],
+      [
+        { channelId: "CSECRET", principalId: "carol@acme.com" },
+        { channelId: "COTHER", principalId: "alice@acme.com" },
+      ],
+    );
+    const path = `/v1/directory/channels?principalId=${encodeURIComponent("carol@acme.com")}&q=%23pub`;
+    assert.equal((await fetch(`${base}${path}`)).status, 401);
+    const response = await fetch(`${base}${path}`, { headers: signedRequestHeaders(SECRET, "GET", path) });
+    assert.equal(response.status, 200);
+    const { channels } = (await response.json()) as { channels: Array<{ scopeId: string; isPrivate: boolean }> };
+    assert.deepEqual(
+      channels.map((channel) => channel.scopeId),
+      ["channel:CPUB", "channel:CSECRET", "channel:CPUBLIC", "channel:CLAUNCH"],
+    );
+    assert.equal(channels.find((channel) => channel.scopeId === "channel:CSECRET")?.isPrivate, true);
   });
 
   it("resolves a name to a single match carrying the slackId needed to @-mention", async () => {
@@ -176,7 +209,11 @@ describe("a deployment without the Slack surface (the directory store is never p
         emailAuthPrincipals: ["dana@acme.com"],
       }),
     );
-    server = createServer(built.app, { signingSecret: SECRET, scheduler: built.scheduler });
+    server = createServer(built.app, {
+      replayDedupe: createPostgresReplayDedupe(testDatabaseUrl()),
+      signingSecret: SECRET,
+      scheduler: built.scheduler,
+    });
     await new Promise<void>((resolve) => server.listen(0, resolve));
     base = `http://localhost:${(server.address() as AddressInfo).port}`;
     const session = await built.sessions.getOrCreateByThread("web:1", "dm", "personal:rex@acme.com");
@@ -250,6 +287,7 @@ describe("qualification membership readiness with signed portal identity enforce
       [{ channelId: "CQA", principalId: "qa@example.com" }],
     );
     const server = createServer(app.app, {
+      replayDedupe: createPostgresReplayDedupe(testDatabaseUrl()),
       signingSecret: SECRET,
       portalIdentitySecret: portalSecret,
       capabilitySecret: "readiness-capability-key-distinct-from-source",

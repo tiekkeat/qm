@@ -2,7 +2,7 @@ import { LOOP_ICON_ERROR, validLoopIcon } from "../../loops/loop-store.ts";
 import { boundLoopCron } from "../../loops/authority.ts";
 import { unattendedGrantRefusal } from "../../cron/authority.ts";
 import type { AdvisoryLock } from "../../persistence/advisory-lock.ts";
-import type { Loop, LoopState, LoopTriageConfig } from "../../types.ts";
+import type { Loop, LoopState, LoopTriageConfig } from "../../loops/types.ts";
 import { scopeId, type ScopeId } from "../../types.ts";
 import type { CapabilityClaims } from "../../auth/capability-token.ts";
 import type { LoopStore, CreateLoopInput, LoopPatch } from "../../loops/loop-store.ts";
@@ -17,11 +17,10 @@ import { settleGroup } from "../../loops/triage.ts";
 import type { CronStore } from "../../cron/cron-store.ts";
 import { DEFAULT_CRON_TIMEZONE, userScheduleFromBody, validateUserSchedule } from "../../cron/schedule.ts";
 import type { ScopedConfigStore } from "../../resolution/config-store.ts";
-import { consentRequiredRecipient } from "../../triggers/trigger-store.ts";
-import { errMessage, swallow } from "../../util/errors.ts";
+import { errMessage, reportFailure, swallow } from "../../util/errors.ts";
 import { sendJson } from "../http.ts";
 import { isObj, resolveCapabilityDestination } from "./shared.ts";
-import { type ApiCtx, type Route } from "./route.ts";
+import { withActor, type ApiCtx, type Route } from "./route.ts";
 
 export interface LoopServiceDeps {
   lock?: AdvisoryLock;
@@ -67,13 +66,14 @@ function requireLiveHuman(ctx: ApiCtx, acting: ActingPrincipal): boolean {
   return false;
 }
 
-export async function canAdministerLoop(ctx: ApiCtx, loop: Loop, acting: ActingPrincipal): Promise<boolean> {
-  const { app } = ctx;
-  if (await app.membershipControlsScope(loop.ownerScopeId)) {
-    return app.managesScope(acting.actorId, loop.ownerScopeId);
-  }
-  if (await app.samePerson(loop.owner, acting.actorId)) return true;
-  return app.managesScope(acting.actorId, loop.ownerScopeId);
+export async function canAdministerLoop(
+  app: Pick<ApiCtx["app"], "membershipControlsScope" | "managesScope" | "samePerson">,
+  loop: Loop,
+  actorId: string,
+): Promise<boolean> {
+  if (await app.membershipControlsScope(loop.ownerScopeId)) return app.managesScope(actorId, loop.ownerScopeId);
+  if (await app.samePerson(loop.owner, actorId)) return true;
+  return app.managesScope(actorId, loop.ownerScopeId);
 }
 
 export async function loadAdministrable(
@@ -91,7 +91,7 @@ export async function loadAdministrable(
     sendJson(ctx.res, 404, { error: "not_found", message: "no such loop" });
     return null;
   }
-  if (!(await canAdministerLoop(ctx, loop, acting))) {
+  if (!(await canAdministerLoop(ctx.app, loop, acting.actorId))) {
     sendJson(ctx.res, 403, { error: "forbidden", message: "you may not administer this loop" });
     return null;
   }
@@ -110,9 +110,9 @@ export async function requireLoopAuthority(ctx: ApiCtx, deps: LoopServiceDeps, l
   const principal = ctx.capability ?? (ctx.actor?.p ? { actorId: ctx.actor.p, liveActor: true } : undefined);
   const refusal = principal
     ? await unattendedGrantRefusal(ctx.app, ctx.deps.admin, cron, principal)
-    : "a privileged loop requires a live turn started by its owner";
+    : { message: "a privileged loop requires a live turn started by its owner" };
   if (!refusal) return true;
-  sendJson(ctx.res, 403, { error: "forbidden", message: refusal });
+  sendJson(ctx.res, 403, { error: "forbidden", message: refusal.message });
   return false;
 }
 
@@ -248,7 +248,6 @@ async function createLoop(ctx: ApiCtx): Promise<void> {
     }
   }
   let destination;
-  let recipientConsent;
   if (b.destinationKey !== undefined) {
     if (typeof b.destinationKey !== "string")
       return sendJson(ctx.res, 400, { error: "bad_request", message: "destinationKey must be a string" });
@@ -259,8 +258,6 @@ async function createLoop(ctx: ApiCtx): Promise<void> {
       return sendJson(ctx.res, 400, { error: "bad_request", message: "destinationKey is not available" });
     if (!requireLiveHuman(ctx, acting)) return;
     destination = resolved.destination;
-    const recipientId = consentRequiredRecipient({ owner: acting.actorId, standing: true, destination });
-    if (recipientId) recipientConsent = { recipientId, status: "pending" as const };
   }
   const ownerScopeId: ScopeId = scopeId("personal", acting.actorId);
   const input: CreateLoopInput = {
@@ -280,7 +277,6 @@ async function createLoop(ctx: ApiCtx): Promise<void> {
     ...(governor && Object.keys(governor).length > 0 ? { governor } : {}),
     ...(schedule ? { schedule } : {}),
     ...(destination ? { destination } : {}),
-    ...(recipientConsent ? { recipientConsent } : {}),
   };
   let loop: Loop;
   let created: boolean;
@@ -321,7 +317,7 @@ async function listLoops(ctx: ApiCtx): Promise<void> {
   const all = await deps.store.list();
   const visible: Loop[] = [];
   for (const loop of all) {
-    if (await canAdministerLoop(ctx, loop, acting)) visible.push(loop);
+    if (await canAdministerLoop(ctx.app, loop, acting.actorId)) visible.push(loop);
   }
   return sendJson(ctx.res, 200, { loops: visible });
 }
@@ -350,10 +346,7 @@ async function getLoop(ctx: ApiCtx): Promise<void> {
             ...(item.sourcePayload ? { sourcePayload: agentSourcePayload(item.sourcePayload, item.source) } : {}),
             ...(item.inboxPreview
               ? {
-                  inboxPreview: agentSourcePayload(
-                    item.inboxPreview,
-                    item.source ?? String(item.sourcePayload?.source ?? ""),
-                  ),
+                  inboxPreview: agentSourcePayload(item.inboxPreview, item.source),
                 }
               : {}),
           }
@@ -470,31 +463,35 @@ async function patchLoop(ctx: ApiCtx): Promise<void> {
     if (!requireLiveHuman(ctx, acting)) return;
     if (b.destinationKey === null) {
       patch.destination = null;
-      patch.recipientConsent = null;
     } else {
       const resolved = resolveCapabilityDestination(ctx.capability, b.destinationKey);
       if (!resolved.ok || !resolved.destination)
         return sendJson(ctx.res, 400, { error: "bad_request", message: "destinationKey is not available" });
       patch.destination = resolved.destination;
-      const recipientId = consentRequiredRecipient({
-        owner: loop.owner,
-        standing: true,
-        destination: resolved.destination,
-      });
-      patch.recipientConsent = recipientId ? { recipientId, status: "pending" } : null;
     }
   }
   const updated = Object.keys(patch).length > 0 ? await deps.store.update(loop.id, patch) : loop;
   if (!updated) return sendJson(ctx.res, 404, { error: "not_found", message: "no such loop" });
-  if (patch.state !== undefined && loop.cronId && deps.crons) {
+  if (patch.state !== undefined) {
     try {
-      await deps.crons.setEnabled(loop.cronId, patch.state === "enabled");
+      await syncLoopSchedule(deps, loop, patch.state);
     } catch (e) {
-      await deps.store.update(loop.id, { restore: loop });
       return sendJson(ctx.res, 502, { error: "loop_schedule_failed", message: errMessage(e) });
     }
   }
   return sendJson(ctx.res, 200, { loop: updated ?? (await deps.store.get(loop.id)) });
+}
+
+export async function syncLoopSchedule(deps: LoopServiceDeps, loop: Loop, state: LoopState): Promise<void> {
+  if (!loop.cronId || !deps.crons) return;
+  try {
+    await deps.crons.setEnabled(loop.cronId, state === "enabled");
+  } catch (e) {
+    await deps.store
+      .update(loop.id, { restore: loop })
+      .catch((restoreErr: unknown) => reportFailure("loops: restore state after schedule failure", restoreErr));
+    throw e;
+  }
 }
 
 async function deleteLoop(ctx: ApiCtx): Promise<void> {
@@ -688,15 +685,17 @@ async function revokeShipGrant(ctx: ApiCtx): Promise<void> {
 }
 
 export const loopRoutes: ReadonlyArray<Route<ApiCtx>> = [
-  { method: "POST", path: "/v1/loops", auth: "either", handle: createLoop },
-  { method: "GET", path: "/v1/loops", auth: "either", handle: listLoops },
-  { method: "GET", path: "/v1/loops/:id", auth: "either", handle: getLoop },
-  { method: "PATCH", path: "/v1/loops/:id", auth: "either", handle: patchLoop },
-  { method: "DELETE", path: "/v1/loops/:id", auth: "either", handle: deleteLoop },
-  { method: "POST", path: "/v1/loops/:id/fire", auth: "either", handle: fireLoopNow },
-  { method: "POST", path: "/v1/loops/:id/triage/preview", auth: "source", handle: previewLoopTriage },
-  { method: "POST", path: "/v1/loops/:id/outputs/:outputId/decide", auth: "either", handle: decideOutput },
-  { method: "POST", path: "/v1/loops/:id/grants", auth: "either", handle: graduateShipAction },
-  { method: "POST", path: "/v1/loops/:id/autopilot", auth: "either", handle: setAutopilot },
-  { method: "DELETE", path: "/v1/loops/:id/grants/:grantId", auth: "either", handle: revokeShipGrant },
+  ...withActor("query.principalId", [
+    { method: "POST", path: "/v1/loops/:id/triage/preview", auth: "source", handle: previewLoopTriage },
+    { method: "POST", path: "/v1/loops", auth: "either", handle: createLoop },
+    { method: "GET", path: "/v1/loops", auth: "either", handle: listLoops },
+    { method: "GET", path: "/v1/loops/:id", auth: "either", handle: getLoop },
+    { method: "PATCH", path: "/v1/loops/:id", auth: "either", handle: patchLoop },
+    { method: "DELETE", path: "/v1/loops/:id", auth: "either", handle: deleteLoop },
+    { method: "POST", path: "/v1/loops/:id/fire", auth: "either", handle: fireLoopNow },
+    { method: "POST", path: "/v1/loops/:id/outputs/:outputId/decide", auth: "either", handle: decideOutput },
+    { method: "POST", path: "/v1/loops/:id/grants", auth: "either", handle: graduateShipAction },
+    { method: "POST", path: "/v1/loops/:id/autopilot", auth: "either", handle: setAutopilot },
+    { method: "DELETE", path: "/v1/loops/:id/grants/:grantId", auth: "either", handle: revokeShipGrant },
+  ]),
 ];

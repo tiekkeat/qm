@@ -3,8 +3,8 @@ import { fileURLToPath } from "node:url";
 import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { extname, join, resolve } from "node:path";
 import { gzipSync } from "node:zlib";
-
-const SERVER = process.env.WEB_UI_SERVER_URL ?? "http://localhost:8096";
+import emojiSource from "emoji-datasource/emoji.json" with { type: "json" };
+import { emojiTableModule } from "./src/emoji-source.ts";
 
 const here = (rel: string): string => fileURLToPath(new URL(rel, import.meta.url));
 
@@ -50,9 +50,19 @@ export function precompressStaticAssets(): Plugin {
   };
 }
 
+function emojiTablePlugin(): Plugin {
+  return {
+    name: "qm-emoji-table",
+    enforce: "pre",
+    load(id) {
+      if (id === here("src/emoji-table.ts")) return emojiTableModule(emojiSource);
+    },
+  };
+}
+
 export default defineConfig({
   base: process.env.WEB_UI_BASE ?? "/",
-  plugins: [precompressStaticAssets()],
+  plugins: [emojiTablePlugin(), precompressStaticAssets()],
   resolve: {
     alias: [
       { find: /^katex$/, replacement: here("src/lazy-katex.ts") },
@@ -77,13 +87,6 @@ export default defineConfig({
     emptyOutDir: true,
   },
   server: {
-    port: Number(process.env.VITE_PORT ?? 5173),
     fs: { allow: [fileURLToPath(new URL("..", import.meta.url))] },
-    proxy: {
-      "/signin": SERVER,
-      "/share": SERVER,
-      "/me": SERVER,
-      "/api": SERVER,
-    },
   },
 });

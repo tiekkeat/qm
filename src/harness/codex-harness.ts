@@ -14,7 +14,7 @@ import type { ScopeId, SessionEntry } from "../types.ts";
 import { swallow } from "../util/errors.ts";
 import { countTokens } from "../util/tokens.ts";
 import { CodexAppServer, CodexRpcError } from "./codex-app-server.ts";
-import { redactSecrets } from "./redact-secrets.ts";
+import { redactSecrets } from "../util/redact-secrets.ts";
 import { codexAuthFileForEnv, readCodexOAuthAuthFile } from "./codex-auth.ts";
 import {
   childCodexAuthFromDerived,

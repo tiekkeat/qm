@@ -5,13 +5,13 @@ import {
   type CoreSession,
   type SessionBackgroundView,
 } from "./core-bridge.ts";
-import { subagentCounts } from "./subagent-activity.ts";
+import { descendantsOf } from "./subagent-activity.ts";
 import { goalFloorLabel, goalWorkedLabel } from "./goal-strip.ts";
 import { relTime } from "./ui.ts";
 
 type ProjectAwareContext = CoreContext & { project?: CoreProject };
 
-type RecentGroupKind = "personal" | "project" | "channel" | "group";
+type RecentGroupKind = "personal" | "project" | "channel" | "group" | "persona";
 
 export interface RecentProjectSeed {
   scopeId: string;
@@ -44,7 +44,10 @@ export function automationRunLabel(s: Pick<CoreSession, "surface">): string | nu
 }
 
 export function sidebarSessions(sessions: readonly CoreSession[]): CoreSession[] {
-  return sessions.filter((session) => !session.parentSessionId && !automationRunLabel(session));
+  return sessions.filter(
+    (session) =>
+      !session.parentSessionId && (!session.sideChat || session.sideChat.expanded) && !automationRunLabel(session),
+  );
 }
 
 export function splitPinned<T extends Pick<CoreSession, "pinned">>(sessions: readonly T[]): { pinned: T[]; rest: T[] } {
@@ -74,6 +77,13 @@ export function recentProjectSeeds(contexts: readonly ProjectAwareContext[]): Re
   });
 }
 
+export function sidebarProjectSeeds(
+  contexts: readonly ProjectAwareContext[],
+  groupByActivity: boolean,
+): RecentProjectSeed[] {
+  return groupByActivity ? [] : recentProjectSeeds(contexts);
+}
+
 export function groupProjectSessions(
   sessions: readonly CoreSession[],
   projectSeeds: readonly RecentProjectSeed[],
@@ -82,21 +92,23 @@ export function groupProjectSessions(
   const projects = new Map<string, Extract<RecentItem, { kind: "project" }>>();
   const items: RecentItem[] = [];
   for (const session of [...sessions].sort((a, b) => activityOf(b) - activityOf(a))) {
-    const seed = seeds.get(session.scopeId);
+    const personaKey = session.personaId ? `persona:${session.personaId}` : null;
+    const key = personaKey && seeds.has(personaKey) ? personaKey : session.scopeId;
+    const seed = seeds.get(key);
     if (!seed) {
       items.push({ kind: "session", session });
       continue;
     }
-    let project = projects.get(session.scopeId);
+    let project = projects.get(key);
     if (!project) {
       project = {
         kind: "project",
-        scopeId: session.scopeId,
+        scopeId: key,
         name: seed.name,
         groupKind: seed.kind ?? "project",
         sessions: [],
       };
-      projects.set(session.scopeId, project);
+      projects.set(key, project);
       items.push(project);
     }
     project.sessions.push(session);
@@ -146,21 +158,63 @@ export function withoutUnsentPending(list: CoreSession[], threadRef: string): Co
   return list.filter((s) => s.id !== "" || s.threadRef !== threadRef);
 }
 
-export function bumpActivity(list: CoreSession[], threadRef: string, at: number): CoreSession[] {
-  return list.map((s) => (s.threadRef === threadRef ? { ...s, lastActivityAt: at } : s));
+export function bumpActivity(list: CoreSession[], threadRef: string, at: number, sent?: string): CoreSession[] {
+  return list.map((s) => {
+    if (s.threadRef !== threadRef) return s;
+    return sent?.trim() && s.lastUserPreview !== undefined
+      ? { ...s, lastActivityAt: at, lastUserPreview: sent }
+      : { ...s, lastActivityAt: at };
+  });
 }
 
-export function reconcileSessions(
-  server: CoreSession[],
+export function lastMessageTitle(s: CoreSession): string | null {
+  return s.lastUserPreview?.trim() || null;
+}
+
+export function upsertSessions(prev: CoreSession[], rows: readonly CoreSession[]): CoreSession[] {
+  if (!rows.length) return prev;
+  const incoming = new Map(rows.map((row) => [row.id, row]));
+  const threads = new Set(rows.map((row) => row.threadRef));
+  const kept = prev.filter((row) => !incoming.has(row.id) && !threads.has(row.threadRef));
+  return [...kept, ...rows];
+}
+
+export interface PageWindow {
+  archived: boolean;
+  surface?: string;
+  floor: number | null;
+}
+
+function inPageClass(row: CoreSession, window: PageWindow): boolean {
+  if (!row.id || row.parentSessionId || automationRunLabel(row)) return false;
+  if (Boolean(row.archived) !== window.archived) return false;
+  if (window.surface && row.surface !== window.surface) return false;
+  return true;
+}
+
+export function mergeFirstPage(
   prev: CoreSession[],
+  page: { sessions: readonly CoreSession[]; pinned?: readonly CoreSession[] },
+  window: PageWindow,
   openIds: readonly string[] = [],
 ): CoreSession[] {
-  const known = new Set(server.map((s) => s.threadRef));
-  const pending = prev.filter((s) => !s.id && !known.has(s.threadRef));
-  const served = new Set(server.map((s) => s.id));
-  const dropped = new Set(openIds.filter((id) => !served.has(id)));
-  const stillOpen = dropped.size ? prev.filter((s) => dropped.has(s.id) && !known.has(s.threadRef)) : [];
-  return [...pending, ...stillOpen, ...server];
+  const served = new Set([...page.sessions, ...(page.pinned ?? [])].map((row) => row.id));
+  const open = new Set(openIds);
+  const kept = prev.filter((row) => {
+    if (served.has(row.id) || open.has(row.id) || !inPageClass(row, window)) return true;
+    if (row.pinned && !window.archived) return false;
+    return window.floor !== null && activityOf(row) < window.floor;
+  });
+  return upsertSessions(kept, [...(page.pinned ?? []), ...page.sessions]);
+}
+
+export function mergeChildren(prev: CoreSession[], rootId: string, children: readonly CoreSession[]): CoreSession[] {
+  const below = new Set(descendantsOf(prev, rootId).map(({ session }) => session.id));
+  const served = new Set(children.map((row) => row.id));
+  return upsertSessions(
+    prev.filter((row) => !below.has(row.id) || served.has(row.id)),
+    children,
+  );
 }
 
 export function markWorking(list: CoreSession[], threadRef: string): CoreSession[] {
@@ -208,7 +262,6 @@ export interface BackgroundCounts {
   jobs: number;
   watches: number;
   crons: number;
-  subagents: number;
   goal: boolean;
   label: string;
 }
@@ -217,8 +270,6 @@ export function backgroundLabel(
   jobs: number,
   watches: number,
   crons: number,
-  subagents = 0,
-  subagentsWaiting = 0,
   goal?: { activeMs: number; runningSince?: number; floor?: Record<string, number> },
   now = Date.now(),
 ): BackgroundCounts | null {
@@ -227,39 +278,22 @@ export function backgroundLabel(
     parts.push(
       `goal · ${goalWorkedLabel(goal.activeMs + (goal.runningSince ? Math.max(0, now - goal.runningSince) : 0), goalFloorLabel(goal.floor ?? null))}`,
     );
-  if (subagents > 0) parts.push(`${subagents} subagent${subagents === 1 ? "" : "s"} running`);
-  if (subagentsWaiting > 0)
-    parts.push(`${subagentsWaiting} subagent${subagentsWaiting === 1 ? " needs" : "s need"} you`);
   if (jobs > 0) parts.push(`${jobs} background job${jobs === 1 ? "" : "s"} running`);
   if (watches > 0) parts.push(`${watches} watch${watches === 1 ? "" : "es"} armed`);
   if (crons > 0) parts.push(`${crons} cron${crons === 1 ? "" : "s"} scheduled here`);
-  return parts.length
-    ? { jobs, watches, crons, subagents: subagents + subagentsWaiting, goal: Boolean(goal), label: parts.join(" · ") }
-    : null;
+  return parts.length ? { jobs, watches, crons, goal: Boolean(goal), label: parts.join(" · ") } : null;
 }
 
 export function watchActivityLabel(w: { lastFiredAt?: number }): string {
   return w.lastFiredAt ? `still watching · last check ${relTime(w.lastFiredAt)}` : "still watching";
 }
 
-export function rowIndicators(
-  s: CoreSession,
-  liveThreads: ReadonlySet<string> | string | null,
-  list: readonly CoreSession[] = [],
-): RowIndicators {
+export function rowIndicators(s: CoreSession, liveThreads: ReadonlySet<string> | string | null): RowIndicators {
   const live = typeof liveThreads === "string" ? new Set([liveThreads]) : (liveThreads ?? new Set<string>());
-  const children = subagentCounts(list, s.id);
   return {
     working: Boolean(s.working) || (Boolean(s.threadRef) && live.has(s.threadRef)),
-    awaiting: Boolean(s.awaitingInput) || children.waiting > 0,
-    background: backgroundLabel(
-      s.backgroundJobs ?? 0,
-      s.watches ?? 0,
-      s.crons ?? 0,
-      children.running,
-      children.waiting,
-      s.goal,
-    ),
+    awaiting: Boolean(s.awaitingInput) || (s.subagents?.waiting ?? 0) > 0,
+    background: backgroundLabel(s.backgroundJobs ?? 0, s.watches ?? 0, s.crons ?? 0, s.goal),
   };
 }
 
@@ -269,7 +303,7 @@ export function conversationBackground(
   threadRef: string | null,
 ): RowIndicators["background"] {
   const row = list.find((s) => (sessionId ? s.id === sessionId : Boolean(threadRef) && s.threadRef === threadRef));
-  return row ? rowIndicators(row, null, list).background : null;
+  return row ? rowIndicators(row, null).background : null;
 }
 
 export function shouldStartProactiveOpener(state: {
@@ -301,6 +335,6 @@ function nextFireIn(at: number): string {
   const mins = Math.round((at - Date.now()) / 60_000);
   if (mins <= 0) return "due now";
   if (mins < 60) return `in ${mins}m`;
-  if (mins < 1440) return `in ${Math.floor(mins / 60)}h ${String(mins % 60).padStart(2, "0")}m`;
+  if (mins < 1440) return `in ${Math.floor(mins / 60)}h ${mins % 60}m`;
   return `in ${Math.floor(mins / 1440)}d`;
 }

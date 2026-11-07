@@ -5,7 +5,9 @@ import { tmpdir } from "node:os";
 import { join, relative, sep } from "node:path";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { isIP } from "node:net";
-import { errMessage } from "../util/errors.ts";
+import { credentialRequestHeaders, type CredentialInjection } from "../credentials/keychain.ts";
+import { errMessage, swallowAs } from "../util/errors.ts";
+import { commitShaPrefixSchema } from "../util/ids.ts";
 import { isPrivateNetworkIp } from "../util/network.ts";
 import { isProbablyBinary } from "./seed.ts";
 import type { FetchedRepo, RepoFile } from "./ingest.ts";
@@ -32,7 +34,7 @@ export interface PackTokenSources {
         secret: string;
         host: string;
         enabled: boolean;
-        injection?: { header?: string; scheme?: string };
+        injection?: CredentialInjection;
         allowedMethods?: string[];
         allowedPathPrefixes?: string[];
       }
@@ -42,8 +44,7 @@ export interface PackTokenSources {
 }
 
 export interface GitAuth {
-  header: string;
-  value: string;
+  headers: Record<string, string>;
   secret: string;
 }
 
@@ -129,25 +130,24 @@ export async function resolvePackAuth(
     ) {
       throw new Error(`skill pack credential is not authorized for ${repo.pathname}`);
     }
-    const header = credential.injection?.header?.trim() || "Authorization";
-    const scheme = credential.injection?.scheme ?? "Bearer ";
-    return { header, value: `${scheme}${credential.secret}`, secret: credential.secret };
+    return { headers: credentialRequestHeaders(credential), secret: credential.secret };
   }
   const host = connectorHostFor(pack.url);
   if (host) {
     const token = await sources.connectorToken(host, pack.createdBy);
-    if (token) return { header: "Authorization", value: `Bearer ${token}`, secret: token };
+    if (token) return { headers: { Authorization: `Bearer ${token}` }, secret: token };
   }
   return undefined;
 }
 
-const SHA_RE = /^[0-9a-f]{7,40}$/;
 const BRANCH_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/;
 
 const execFileP = promisify(execFile);
 
 function scrub(s: string, auth: GitAuth | undefined): string {
-  return auth ? s.split(auth.secret).join("***").split(auth.value).join("***") : s;
+  if (!auth) return s;
+  const secrets = [auth.secret, ...Object.values(auth.headers).filter((value) => value.includes(auth.secret))];
+  return secrets.reduce((out, value) => out.split(value).join("***"), s);
 }
 
 export function createGitFetcher(opts: GitFetcherOptions = {}): SkillPackFetcher {
@@ -171,7 +171,9 @@ export function createGitFetcher(opts: GitFetcherOptions = {}): SkillPackFetcher
     env.GIT_ALLOW_PROTOCOL = allowLocalRepos ? "https:file" : "https";
     const entries = [
       ...config,
-      ...(auth ? [["http.extraHeader", `${auth.header}: ${auth.value}`] as [string, string]] : []),
+      ...Object.entries(auth?.headers ?? {}).map(
+        ([name, value]) => ["http.extraHeader", `${name}: ${value}`] as [string, string],
+      ),
     ];
     if (entries.length) {
       env.GIT_CONFIG_COUNT = String(entries.length);
@@ -248,7 +250,8 @@ export function createGitFetcher(opts: GitFetcherOptions = {}): SkillPackFetcher
   return {
     async fetch(pack) {
       const ref = (pack.ref ?? "").trim();
-      if (ref && !SHA_RE.test(ref) && !BRANCH_RE.test(ref)) throw new Error(`invalid skill pack ref: ${ref}`);
+      if (ref && !commitShaPrefixSchema.safeParse(ref).success && !BRANCH_RE.test(ref))
+        throw new Error(`invalid skill pack ref: ${ref}`);
       const repo = await validateRepoUrl(pack.url, allowLocalRepos, lookup);
       const auth = opts.resolveAuth ? await opts.resolveAuth(pack) : undefined;
 
@@ -261,16 +264,17 @@ export function createGitFetcher(opts: GitFetcherOptions = {}): SkillPackFetcher
         const files = await readTree(repoDir);
         return { commit, files };
       } finally {
-        await rm(work, { recursive: true, force: true }).catch(() => {});
+        await rm(work, { recursive: true, force: true }).catch(swallowAs("skill pack: remove temp clone", undefined));
       }
     },
 
     async resolveRef(pack) {
       const ref = (pack.ref ?? "").trim();
-      if (ref && !SHA_RE.test(ref) && !BRANCH_RE.test(ref)) throw new Error(`invalid skill pack ref: ${ref}`);
+      if (ref && !commitShaPrefixSchema.safeParse(ref).success && !BRANCH_RE.test(ref))
+        throw new Error(`invalid skill pack ref: ${ref}`);
       const repo = await validateRepoUrl(pack.url, allowLocalRepos, lookup);
       const auth = opts.resolveAuth ? await opts.resolveAuth(pack) : undefined;
-      const target = ref && BRANCH_RE.test(ref) && !SHA_RE.test(ref) ? ref : "HEAD";
+      const target = ref && BRANCH_RE.test(ref) && !commitShaPrefixSchema.safeParse(ref).success ? ref : "HEAD";
       const work = await mkdtemp(join(tmpdir(), "qm-skill-ref-"));
       try {
         const out = await git(["ls-remote", repo.url, target], work, auth, repo.gitConfig);
@@ -280,10 +284,11 @@ export function createGitFetcher(opts: GitFetcherOptions = {}): SkillPackFetcher
             .map((l) => l.trim())
             .filter(Boolean)[0]
             ?.split(/\s+/)[0] ?? "";
-        if (!SHA_RE.test(sha)) throw new Error(`could not resolve ref "${target}" for skill pack`);
+        if (!commitShaPrefixSchema.safeParse(sha).success)
+          throw new Error(`could not resolve ref "${target}" for skill pack`);
         return sha;
       } finally {
-        await rm(work, { recursive: true, force: true }).catch(() => {});
+        await rm(work, { recursive: true, force: true }).catch(swallowAs("skill pack: remove temp clone", undefined));
       }
     },
   };

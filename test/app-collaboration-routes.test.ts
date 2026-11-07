@@ -1,3 +1,6 @@
+import { createPostgresReplayDedupe } from "../src/auth/replay-dedupe.ts";
+import { testDatabaseUrl } from "./support/test-database.ts";
+import { testDeployBackings } from "./support/test-database.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
@@ -9,7 +12,7 @@ import { scopeId } from "../src/types.ts";
 
 const secret = "collaboration-route-test-secret".repeat(2);
 test("release and rollback routes bind verified identity and enforce independent view/manage access", async (t) => {
-  const store = createDeployStore();
+  const store = createDeployStore(testDeployBackings());
   const deployment = await store.create({
     ownerScopeId: scopeId("personal", "owner"),
     createdBy: "owner",
@@ -33,7 +36,11 @@ test("release and rollback routes bind verified identity and enforce independent
       rollbackActor = actor;
     },
   } as unknown as App;
-  const server = createServer(app, { signingSecret: secret, deployStore: store });
+  const server = createServer(app, {
+    signingSecret: secret,
+    replayDedupe: createPostgresReplayDedupe(testDatabaseUrl()),
+    deployStore: store,
+  });
   await new Promise<void>((resolve) => server.listen(0, resolve));
   t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
   const base = `http://localhost:${(server.address() as AddressInfo).port}`;

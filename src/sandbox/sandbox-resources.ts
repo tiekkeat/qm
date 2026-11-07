@@ -1,4 +1,4 @@
-import { redactSecrets } from "../harness/redact-secrets.ts";
+import { redactSecrets } from "../util/redact-secrets.ts";
 import { errMessage } from "../util/errors.ts";
 import { withLiveTurnMembership } from "../resolution/scope-membership.ts";
 import { randomUUID } from "node:crypto";
@@ -6,7 +6,8 @@ import type { DurableMap } from "../persistence/durable-map.ts";
 import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
 import { parseScopeId, type CommandPolicy, type EgressPolicy, type ScopeId } from "../types.ts";
 import type { SandboxBackendName } from "./sandbox-routing.ts";
-import type { Sandbox, AgentComputerSpec, ProvisionOptions, ComputerStatus } from "./sandbox.ts";
+import type { Sandbox, AgentComputerSpec, ProvisionOptions, ComputerStatus, EgressEnforcement } from "./sandbox.ts";
+import { JOB_COMPUTER_SCOPE_PREFIX } from "./home-snapshot.ts";
 
 export interface SandboxResource {
   id: string;
@@ -25,6 +26,8 @@ export interface SandboxResource {
   holders?: string[];
   spec?: AgentComputerSpec;
   error?: string;
+  jobOnly?: boolean;
+  memoryGb?: number;
 }
 
 export interface SandboxAccessPlan {
@@ -33,7 +36,6 @@ export interface SandboxAccessPlan {
   readonly egress: EgressPolicy;
   readonly commandPolicy: CommandPolicy | null;
   readonly credentialScopeId?: ScopeId;
-  readonly env?: Readonly<Record<string, string>>;
 }
 
 export interface SandboxDefault {
@@ -43,6 +45,8 @@ export interface SandboxDefault {
 interface SandboxProviderProfile {
   name: SandboxBackendName;
   spec?: AgentComputerSpec;
+  egressEnforcement?: EgressEnforcement;
+  sizesMemory?: boolean;
   actions: string[];
 }
 
@@ -66,10 +70,14 @@ export interface SandboxResources {
     backend: string,
     name?: string,
     reservationId?: string,
+    jobOnly?: boolean,
+    memoryGb?: number,
   ): Promise<SandboxResource>;
+  jobComputers(): Promise<SandboxResource[]>;
+  retireJobComputer(id: string, seenState: SandboxResource["state"]): Promise<void>;
   access(actorId: string, id: string): Promise<SandboxResource>;
   status(actorId: string, id: string): Promise<ComputerStatus>;
-  restart(actorId: string, id: string): Promise<void>;
+  restart(actorId: string, id: string, memoryGb?: number): Promise<void>;
   blockExecution(actorId: string, id: string): Promise<void>;
   retire(actorId: string, id: string): Promise<void>;
   use<T>(id: string, action: () => Promise<T>, exclusive?: boolean, cleanup?: boolean): Promise<T>;
@@ -82,6 +90,13 @@ export interface SandboxResources {
 }
 
 export class SandboxAccessError extends Error {}
+
+const JOB_ONLY_REFUSAL =
+  "this computer belongs to a background job that uses private credentials; only that job's own controls can reach it";
+
+export async function preferredBackend(resources: SandboxResources, scopeId: ScopeId): Promise<SandboxBackendName> {
+  return (await resources.resolve(scopeId))?.backend ?? resources.defaultBackend();
+}
 
 export async function accessConversationSandbox(
   resources: SandboxResources | undefined,
@@ -148,8 +163,27 @@ export function createSandboxResources(opts: {
     if (!record) throw new SandboxAccessError(`sandbox not found: ${id}`);
     return record;
   };
+  const agentRecord = async (actorId: string, id: string): Promise<SandboxResource> => {
+    const record = await get(id);
+    if (record.jobOnly) throw new SandboxAccessError(JOB_ONLY_REFUSAL);
+    await authorize(actorId, record.ownerScopeId);
+    return record;
+  };
+  const destroy = async (current: SandboxResource): Promise<void> => {
+    const backend = opts.backends[current.backend];
+    if (!backend?.destroyScope) throw new Error(`sandbox retirement unavailable: ${current.backend}`);
+    const retiring = { ...current, state: "retired" as const, cleanupPending: true };
+    await opts.records.put(current.id, retiring);
+    try {
+      await backend.destroyScope(current.backingScopeId);
+      await opts.records.put(current.id, { ...retiring, cleanupPending: false, error: undefined });
+    } catch (error) {
+      opts.onLifecycleError?.(current, error);
+      await opts.records.put(current.id, { ...retiring, error: redactSecrets(errMessage(error)) });
+      throw error;
+    }
+  };
   const use = async <T>(id: string, action: () => Promise<T>, exclusive = false, cleanup = false): Promise<T> => {
-    await get(id);
     const lock = exclusive || !opts.lock.withSharedLock ? opts.lock.withLock : opts.lock.withSharedLock;
     return lock(`sandbox-resource:${id}`, async () => {
       const current = await get(id);
@@ -167,8 +201,14 @@ export function createSandboxResources(opts: {
       .map(([name, backend]) => ({
         name,
         ...(backend.profile.spec ? { spec: backend.profile.spec } : {}),
+        ...(backend.profile.egressEnforcement ? { egressEnforcement: backend.profile.egressEnforcement } : {}),
+        ...(backend.profile.sizesMemory ? { sizesMemory: true } : {}),
         actions: actionsFor(backend),
       }));
+  const checkMemory = (backend: Sandbox, memoryGb: number | undefined): void => {
+    if (memoryGb === undefined) return;
+    if (!backend.profile.sizesMemory) throw new Error(`${backend.profile.backend} computers take no memory size`);
+  };
   return {
     async forProjectDeletion(actorId, scopeId) {
       if (!(await opts.canCleanupScope?.(actorId, scopeId)))
@@ -195,6 +235,7 @@ export function createSandboxResources(opts: {
     use,
     async blockExecution(actorId, id) {
       const record = await get(id);
+      if (record.jobOnly) throw new SandboxAccessError(JOB_ONLY_REFUSAL);
       await authorizeManage(actorId, record.ownerScopeId);
       await opts.lock.withLock(`sandbox-resource:${id}`, async () => {
         const current = await get(id);
@@ -202,13 +243,13 @@ export function createSandboxResources(opts: {
       });
     },
     async hold(id, runId) {
-      await opts.records.update!(id, (current) =>
+      await opts.records.update(id, (current) =>
         current.holders?.includes(runId) ? current : { ...current, holders: [...(current.holders ?? []), runId] },
       );
     },
     async release(id, runId, isLive) {
       const record = runId
-        ? await opts.records.update!(id, (current) => ({
+        ? await opts.records.update(id, (current) => ({
             ...current,
             holders: (current.holders ?? []).filter((holder) => holder !== runId),
           }))
@@ -217,7 +258,7 @@ export function createSandboxResources(opts: {
       const live = await Promise.all(others.map(isLive));
       const ended = others.filter((_, index) => !live[index]);
       if (ended.length)
-        await opts.records.update!(id, (current) => ({
+        await opts.records.update(id, (current) => ({
           ...current,
           holders: (current.holders ?? []).filter((holder) => !ended.includes(holder)),
         }));
@@ -226,6 +267,7 @@ export function createSandboxResources(opts: {
     async retire(actorId, id) {
       await initialize();
       const record = await get(id);
+      if (record.jobOnly) throw new SandboxAccessError(JOB_ONLY_REFUSAL);
       await authorizeManage(actorId, record.ownerScopeId);
       await opts.lock.withLock(`sandbox-resource:${id}`, () =>
         opts.lock.withLock(`sandbox-default:${record.ownerScopeId}`, async () => {
@@ -235,41 +277,45 @@ export function createSandboxResources(opts: {
           if (selected?.sandboxId === id)
             throw new Error("unset or change this scope's default before retiring its computer");
           await opts.beforeRetire?.(current);
-          const backend = opts.backends[current.backend];
-          if (!backend?.destroyScope) throw new Error(`sandbox retirement unavailable: ${current.backend}`);
-          const retiring = { ...current, state: "retired" as const, cleanupPending: true };
-          await opts.records.put(id, retiring);
-          try {
-            await backend.destroyScope(current.backingScopeId);
-            await opts.records.put(id, { ...retiring, cleanupPending: false, error: undefined });
-          } catch (error) {
-            opts.onLifecycleError?.(current, error);
-            await opts.records.put(id, { ...retiring, error: redactSecrets(errMessage(error)) });
-            throw error;
-          }
+          await destroy(current);
         }),
       );
     },
-    async access(actorId, id) {
-      const record = await get(id);
-      await authorize(actorId, record.ownerScopeId);
-      return record;
+    async jobComputers() {
+      await initialize();
+      return (await opts.records.all()).filter((record) => record.jobOnly);
     },
+    async retireJobComputer(id, seenState) {
+      await opts.lock.withLock(`sandbox-resource:${id}`, async () => {
+        const current = await get(id);
+        if (!current.jobOnly || current.state !== seenState) return;
+        await destroy(current);
+        await opts.records.delete(id);
+      });
+    },
+    access: agentRecord,
     async status(actorId, id) {
-      const record = await get(id);
-      await authorize(actorId, record.ownerScopeId);
+      const record = await agentRecord(actorId, id);
       const backend = opts.backends[record.backend];
       if (!backend?.computerStatus) throw new Error(`sandbox status unavailable: ${record.backend}`);
       return use(id, () => backend.computerStatus!(record.backingScopeId));
     },
-    async restart(actorId, id) {
+    async restart(actorId, id, memoryGb) {
       await initialize();
-      const record = await get(id);
+      const record = await agentRecord(actorId, id);
       if (record.state === "retired") throw new Error("sandbox has been retired");
       await authorizeManage(actorId, record.ownerScopeId);
       const backend = opts.backends[record.backend];
       if (!backend?.restartComputer) throw new Error(`sandbox restart unavailable: ${record.backend}`);
-      await use(id, () => backend.restartComputer!(record.backingScopeId), true);
+      checkMemory(backend, memoryGb);
+      await use(
+        id,
+        async () => {
+          await backend.restartComputer!(record.backingScopeId, memoryGb ?? record.memoryGb);
+          if (memoryGb !== undefined) await opts.records.update(id, (current) => ({ ...current, memoryGb }));
+        },
+        true,
+      );
     },
     async resolve(scopeId) {
       await initialize();
@@ -283,7 +329,7 @@ export function createSandboxResources(opts: {
       const route = await opts.defaults.get(scopeId);
       const sandboxes: SandboxResource[] = [];
       for (const record of await opts.records.all()) {
-        if (!(await (opts.canReadScope ?? opts.canUseScope)(actorId, record.ownerScopeId))) continue;
+        if (record.jobOnly || !(await (opts.canReadScope ?? opts.canUseScope)(actorId, record.ownerScopeId))) continue;
         const backend = opts.backends[record.backend];
         let availableActions = actionsFor(backend).filter((action) => action !== "create");
         if (record.state === "retired")
@@ -299,24 +345,31 @@ export function createSandboxResources(opts: {
         providers: profiles(),
       };
     },
-    async create(actorId, scopeId, backend, name, reservationId) {
+    async create(actorId, scopeId, backend, name, reservationId, jobOnly, memoryGb) {
       await initialize();
       await authorizeManage(actorId, scopeId);
       await requireActive(scopeId);
       if (!Object.hasOwn(opts.backends, backend) || !opts.backends[backend as SandboxBackendName])
         throw new Error(`sandbox backend unavailable: ${backend}`);
+      checkMemory(opts.backends[backend as SandboxBackendName]!, memoryGb);
+      if (jobOnly && !opts.backends[backend as SandboxBackendName]?.destroyScope)
+        throw new Error(
+          `background jobs with private credentials need a computer that ${backend} can retire; run the command in the foreground`,
+        );
       const id = reservationId ?? randomUUID();
       if (!/^[a-zA-Z0-9-]{1,80}$/.test(id)) throw new Error("invalid sandbox reservation");
       const record: SandboxResource = {
         id,
         backend: backend as SandboxBackendName,
         ownerScopeId: scopeId,
-        backingScopeId: `sandbox-${id}`,
+        backingScopeId: jobOnly ? `${JOB_COMPUTER_SCOPE_PREFIX}${id}` : `sandbox-${id}`,
         name: name?.trim().slice(0, 120) || backend,
         createdBy: actorId,
         createdAt: new Date().toISOString(),
         legacy: false,
         state: "provisioning",
+        ...(jobOnly ? { jobOnly } : {}),
+        ...(memoryGb ? { memoryGb } : {}),
       };
       return (opts.lock.withSharedLock ?? opts.lock.withLock)(`project-work:${scopeId}`, () =>
         opts.lock.withLock(`sandbox-resource:${id}`, async () => {
@@ -332,10 +385,10 @@ export function createSandboxResources(opts: {
           await opts.records.put(id, record);
           const sandbox = opts.backends[record.backend]!;
           try {
-            const handle = await sandbox.provision(
-              [{ scopeId: record.backingScopeId, mountPath: "/", mode: "rw" }],
-              await opts.provisionOptions?.(scopeId),
-            );
+            const handle = await sandbox.provision(record.backingScopeId, {
+              ...(await opts.provisionOptions?.(scopeId)),
+              ...(memoryGb ? { memoryGb } : {}),
+            });
             const ready: SandboxResource = {
               ...record,
               state: "ready",
@@ -362,8 +415,7 @@ export function createSandboxResources(opts: {
       if (id !== null) await requireActive(scopeId);
       await opts.lock.withLock(`sandbox-default:${scopeId}`, async () => {
         if (id !== null) {
-          const record = await get(id);
-          await authorize(actorId, record.ownerScopeId);
+          const record = await agentRecord(actorId, id);
           if (record.state === "retired" || record.executionBlocked)
             throw new Error("sandbox has been retired or retirement is pending");
           if (record.ownerScopeId !== scopeId)

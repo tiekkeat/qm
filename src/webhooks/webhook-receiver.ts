@@ -1,8 +1,9 @@
-import type { Destination, Webhook } from "../types.ts";
+import type { Destination } from "../types.ts";
+import type { Webhook } from "../triggers/types.ts";
 import type { WebhookStore } from "./webhook-store.ts";
 import { getVerifier, type VerifierInput } from "./verifiers.ts";
 import { runTrigger, type TriggerDeps } from "../triggers/run-trigger.ts";
-import { buildWebhookWakeEnvelope, capForEscaping } from "../core/wake-envelope.ts";
+import { buildWebhookWakeEnvelope, capForEscaping } from "../wake/wake-envelope.ts";
 import { errMessage, reportFailure, reportFailureAs } from "../util/errors.ts";
 
 export type DeliverResult = { status: 202 } | { status: 200; body: string } | { status: 401 } | { status: 404 };
@@ -76,6 +77,7 @@ export function createWebhookReceiver(deps: WebhookReceiverDeps): WebhookReceive
     run: deps.run,
     ...(deps.directory ? { directory: deps.directory } : {}),
     ...(deps.currentScopeMembers ? { currentScopeMembers: deps.currentScopeMembers } : {}),
+    ...(deps.resolveRecipient ? { resolveRecipient: deps.resolveRecipient } : {}),
   };
 
   return {
@@ -120,8 +122,6 @@ export function createWebhookReceiver(deps: WebhookReceiverDeps): WebhookReceive
         fireKey,
         surface: "webhook",
         ...(destination ? { destination } : {}),
-        recipientConsentRequired: true,
-        ...(wh.recipientConsent ? { recipientConsent: wh.recipientConsent } : {}),
         errorNotice: (s) => `⚠️ Webhook did not complete: ${s}`,
       })
         .then(async (outcome) => {

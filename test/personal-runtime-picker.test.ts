@@ -1,25 +1,30 @@
+import { createPostgresReplayDedupe } from "../src/auth/replay-dedupe.ts";
+import { testDatabaseUrl } from "./support/test-database.ts";
 import "./support/auto-fake-sprites.ts";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { AddressInfo } from "node:net";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp as buildProductionApp } from "../src/wiring.ts";
+import { stopAtEnd } from "./support/build-app.ts";
 import { createServer } from "../src/api/server.ts";
 import { testConfig } from "./support/test-config.ts";
 import type { userRuntimeConfigBody } from "../src/api/runtime-config.ts";
 import { resolveModel } from "../src/model/pi-models.ts";
 import { signedHeaders, withSourceAuthNonce } from "../plugins/chassis/src/core-client.ts";
 import { mintPortalIdentity, PORTAL_IDENTITY_HEADER } from "../plugins/chassis/src/portal-identity.ts";
-import { createRuntimeService } from "../src/harness/runtime-control.ts";
+import { createRuntimeService } from "../src/agent/runtime-control.ts";
+
+const buildApp = (...args: Parameters<typeof buildProductionApp>) => stopAtEnd(buildProductionApp(...args));
 
 type Snapshot = Awaited<ReturnType<typeof userRuntimeConfigBody>>;
 
 async function setup() {
   const built = buildApp(testConfig());
-  built.config.setApprovedHarnesses(["pi", "claude"]);
-  await built.config.flushScope("org:default-org");
+  await built.config.setApprovedHarnesses(["pi", "claude"]);
   const signingSecret = "personal-runtime-source-auth-secret-0001";
   const identitySecret = "personal-runtime-portal-identity-secret-0001";
   const server = createServer(built.app, {
+    replayDedupe: createPostgresReplayDedupe(testDatabaseUrl()),
     signingSecret,
     capabilitySecret: "personal-runtime-capability-secret-0001",
     portalIdentitySecret: identitySecret,
@@ -27,7 +32,6 @@ async function setup() {
     identity: built.identity,
     config: built.config,
     userModelCredentials: built.userModelCredentials,
-    harnessId: "pi",
     providerKeys: { anthropic: false, openai: false, openrouter: false },
   });
   server.listen(0);
@@ -72,10 +76,9 @@ test("personal API-key picker works without company keys and saves model, effort
     await s.built.userModelCredentials.setApiKey("U1", "openai", "synthetic-openai");
     await s.built.config.setPersonalModelAuth("U1", true, "openai");
     const before = await s.get();
-    assert.ok(before.modelsByHarness.pi!.includes("gpt-5.6-terra"));
-    assert.ok(before.modelsByHarness.pi!.every((id: string) => resolveModel(id)?.provider === "openai"));
-    assert.deepEqual(before.modelsByHarness.claude, []);
-    assert.ok(before.modelsByHarness.pi!.includes(before.effective.modelId));
+    assert.ok(before.models.includes("gpt-5.6-terra"));
+    assert.ok(before.models.every((id: string) => resolveModel(id)?.provider === "openai"));
+    assert.ok(before.models.includes(before.effective.modelId));
     assert.equal(before.unavailableReason, undefined);
     assert.doesNotMatch(JSON.stringify(before), /synthetic-openai/);
     const choice = { harnessId: "pi", modelId: "gpt-5.6-terra", effortLevel: "high", fastMode: true };
@@ -85,7 +88,7 @@ test("personal API-key picker works without company keys and saves model, effort
     assert.deepEqual((await s.get()).effective, choice);
     assert.equal((await s.put({ ...choice, modelId: "claude-sonnet-5" })).status, 400);
     await s.built.userModelCredentials.delete("U1", "openai");
-    assert.deepEqual((await s.get()).modelsByHarness.pi, []);
+    assert.deepEqual((await s.get()).models, []);
     assert.equal((await s.put(choice)).status, 400);
   } finally {
     await s.close();
@@ -104,14 +107,14 @@ for (const provider of ["anthropic", "openai"] as const) {
       await s.built.config.setPersonalModelAuth("U1", true, provider);
       const config = await s.get();
       if (provider === "anthropic") {
-        assert.deepEqual(config.modelsByHarness.pi, []);
-        assert.ok(config.modelsByHarness.claude!.includes("claude-sonnet-5"));
+        assert.ok(config.models.includes("claude-sonnet-5"));
+        assert.ok(config.models.every((id: string) => resolveModel(id)?.provider === "anthropic"));
       } else {
-        assert.ok(config.modelsByHarness.pi!.includes("codex/gpt-5.6-sol"));
-        assert.ok(!config.modelsByHarness.pi!.includes("gpt-5.6-sol"));
-        assert.deepEqual(config.modelsByHarness.claude, []);
+        assert.ok(config.models.includes("codex/gpt-5.6-sol"));
+        assert.ok(!config.modelsByHarness.pi?.includes("gpt-5.6-sol"));
+        assert.ok(config.modelsByHarness.codex?.includes("gpt-5.6-sol"));
       }
-      assert.ok(config.modelsByHarness[config.effective.harnessId]!.includes(config.effective.modelId));
+      assert.ok(config.models.includes(config.effective.modelId));
     } finally {
       await s.close();
     }
@@ -129,27 +132,24 @@ test("personal picker keeps org restrictions and shared-scope caller isolation",
       { groupId: "room", principalId: "U1" },
       { groupId: "room", principalId: "U2" },
     ]);
-    assert.ok((await s.get("U1", "group:room")).modelsByHarness.pi!.includes("gpt-5.6-terra"));
-    assert.ok(!(await s.get("U2", "group:room")).modelsByHarness.pi!.includes("gpt-5.6-terra"));
-    await s.built.config.setRuntimeSelectionLatest("personal:U1", { harnessId: "pi", modelId: "gpt-5.6-terra" });
-    s.built.config.setWebuiModels("org:default-org", ["gpt-5.6-sol"]);
-    await s.built.config.flushScope("org:default-org");
-    assert.ok(!(await s.get()).modelsByHarness.pi!.includes("gpt-5.6-terra"));
-    assert.equal((await s.put({ harnessId: "pi", modelId: "gpt-5.6-terra" })).status, 400);
+    assert.ok((await s.get("U1", "group:room")).models.includes("gpt-5.6-terra"));
+    assert.ok(!(await s.get("U2", "group:room")).models.includes("gpt-5.6-terra"));
+    await s.built.config.setRuntimeSelection("personal:U1", { modelId: "gpt-5.6-terra" });
+    await s.built.config.setWebuiModels("org:default-org", ["gpt-5.6-sol"]);
+    assert.ok(!(await s.get()).models.includes("gpt-5.6-terra"));
+    assert.equal((await s.put({ modelId: "gpt-5.6-terra" })).status, 400);
     const refused = await s.built.app.turn({
       surface: "web",
       actor: { externalId: "U1" },
       conversation: { kind: "dm", threadRef: "web:U1:excluded-saved-model" },
       text: "hello",
-      liveActor: true,
+      origin: { kind: "human" },
       async: true,
-      harness: "pi",
       model: "gpt-5.6-terra",
     });
     assert.equal(refused.status, "refused");
-    s.built.config.setWebuiModels("org:default-org", []);
-    await s.built.config.flushScope("org:default-org");
-    assert.ok((await s.get()).modelsByHarness.pi!.includes("gpt-5.6-terra"));
+    await s.built.config.setWebuiModels("org:default-org", []);
+    assert.ok((await s.get()).models.includes("gpt-5.6-terra"));
   } finally {
     await s.close();
   }
@@ -161,7 +161,6 @@ for (const provider of ["anthropic", "openai"] as const) {
     try {
       s.built.config.setApprovedHarnesses([]);
       s.built.config.setWebuiModels("org:default-org", [provider === "anthropic" ? "gpt-6-sol" : "claude-opus-5"]);
-      await s.built.config.flushScope("org:default-org");
       await s.built.userModelCredentials.setOAuth("U1", provider, {
         accessToken: "synthetic-subscription-token",
         expiresAt: Date.now() + 3_600_000,
@@ -172,7 +171,7 @@ for (const provider of ["anthropic", "openai"] as const) {
       const snapshot = await s.get();
       assert.ok(snapshot.modelsByHarness[harnessId]?.includes(modelId));
       assert.equal(snapshot.unavailableReason, undefined);
-      assert.ok(snapshot.modelsByHarness[snapshot.effective.harnessId]?.includes(snapshot.effective.modelId));
+      assert.ok(snapshot.modelsByHarness[snapshot.effective.harnessId ?? "pi"]?.includes(snapshot.effective.modelId));
       const saved = await s.put({ harnessId, modelId, effortLevel: "high", fastMode: false });
       assert.equal(saved.status, 200);
       assert.equal((await s.get()).effective.modelId, modelId);
@@ -182,7 +181,7 @@ for (const provider of ["anthropic", "openai"] as const) {
         actor: { externalId: "U1" },
         conversation: { kind: "dm", threadRef: `web:U1:subscription-${provider}` },
         text: "hello",
-        liveActor: true,
+        origin: { kind: "human" },
         async: true,
         harness: harnessId,
         model: modelId,
@@ -193,7 +192,7 @@ for (const provider of ["anthropic", "openai"] as const) {
         actor: { externalId: "U1" },
         conversation: { kind: "dm", threadRef: `cron-subscription-${provider}` },
         text: "hello",
-        triggered: true,
+        origin: { kind: "automation" },
         async: true,
         harness: harnessId,
         model: modelId,
@@ -226,7 +225,6 @@ test("a legacy mixed personal account keeps API-key restrictions while exposing 
   try {
     s.built.config.setApprovedHarnesses(["pi"]);
     s.built.config.setWebuiModels("org:default-org", ["gpt-6-sol"]);
-    await s.built.config.flushScope("org:default-org");
     await s.built.userModelCredentials.setApiKey("U1", "anthropic", "synthetic-anthropic-key");
     await s.built.userModelCredentials.setOAuth("U1", "openai", { accessToken: "synthetic-subscription-token" });
     await s.built.config.setPersonalModelAuth("U1", true);

@@ -1,30 +1,29 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createOrchestrator, type OrchestratorInput, type OrchestratorDeps } from "../src/core/orchestrator.ts";
 import { createIdentityService } from "../src/identity/identity-service.ts";
-import { createMemoryConfigStore, type OrgBranding } from "../src/resolution/config-store.ts";
+import { type OrgBranding } from "../src/resolution/config-store.ts";
 import { createAclStore } from "../src/acl/acl-store.ts";
 import { createResolutionService } from "../src/resolution/resolution-service.ts";
-import { createMemorySessionStore } from "../src/sessions/memory-session-store.ts";
-import { createLocalWorkspaceStore } from "../src/workspace/workspace-store.ts";
-import { createMemoryService } from "../src/memory/memory-service.ts";
-import { createModelGateway } from "../src/model/model-gateway.ts";
-import { createAuditLog } from "../src/audit/audit-log.ts";
-import { createRateLimiter } from "../src/ratelimit/rate-limiter.ts";
-import { createMockHarness } from "../src/harness/mock-harness.ts";
+import { createMockAgent } from "./support/mock-agent.ts";
 import { createDeployStore } from "../src/deploy/deploy-store.ts";
 import { createDockerDeployProvider } from "../src/deploy/docker-deploy-provider.ts";
 import { createDeployService } from "../src/deploy/deploy-service.ts";
-import { createMemoryFileArtifactStore } from "../src/files/file-artifact-store.ts";
 import { createMemoryDurableByteStore } from "../src/files/durable-byte-store.ts";
 import type { Sandbox } from "../src/sandbox/sandbox.ts";
-import type { ConnectorStatusCache } from "../src/credentials/connector-status.ts";
 import type { ConnectorTokenStore } from "../src/credentials/keychain.ts";
 import type { SkillStore } from "../src/skills/skill-store.ts";
 import { scopeId, type Conversation, type Principal } from "../src/types.ts";
+import { singleProcessDeps } from "./support/single-process.ts";
+import { FEATURE_NAMES } from "../src/feature-flags.ts";
+import { createPostgresAuditLog } from "../src/admin/postgres-audit-log.ts";
+import { createPostgresFileArtifactStore } from "../src/files/postgres-file-artifact-store.ts";
+import { createPostgresMemoryService } from "../src/memory/postgres-memory-service.ts";
+import { createPostgresSessionStore } from "../src/sessions/postgres-session-store.ts";
+import { testConfigStore, testDatabaseUrl, testDeployBackings, testMap } from "./support/test-database.ts";
+import { createPostgresGrantStore } from "../src/acl/postgres-grant-store.ts";
 
 const ORG = "default-org";
 
@@ -53,11 +52,6 @@ function fakeSandbox(): Sandbox {
   };
 }
 
-const connectorStatusCache: ConnectorStatusCache = {
-  get: async () => ({ principalId: actor.id, checkedAt: Date.now(), providers: {} }),
-  put: async () => {},
-};
-
 const connectorTokens = {
   listConnectorsByOwners: async () => new Map(),
   connectorAccessToken: async () => null,
@@ -70,7 +64,7 @@ const skills = {
   visibleFor: async () => [],
 } as unknown as SkillStore;
 
-function buildOrchestrator(
+async function buildOrchestrator(
   opts: {
     orgSoul?: string;
     sessionSyscalls?: OrchestratorDeps["sessionSyscalls"];
@@ -78,18 +72,20 @@ function buildOrchestrator(
     scopeSoulFor?: { conversation: Conversation; soul: string };
     branding?: OrgBranding;
     brandingDefault?: OrgBranding;
+    config?: ReturnType<typeof testConfigStore>;
+    sessions?: OrchestratorDeps["sessions"];
   } = {},
 ) {
-  const config = createMemoryConfigStore(ORG);
-  if (opts.orgSoul !== undefined) config.setSoul(scopeId("org", ORG), opts.orgSoul);
-  if (opts.branding) config.setBranding(scopeId("org", ORG), opts.branding);
+  const config = opts.config ?? testConfigStore(ORG);
+  if (opts.orgSoul !== undefined) await config.setSoul(scopeId("org", ORG), opts.orgSoul);
+  if (opts.branding) await config.setBranding(scopeId("org", ORG), opts.branding);
 
-  const acl = createAclStore();
-  const auditLog = createAuditLog();
-  const workspace = createLocalWorkspaceStore(mkdtempSync(join(tmpdir(), "pm-")));
-  const memory = createMemoryService(workspace);
+  const acl = createAclStore(createPostgresGrantStore(testDatabaseUrl()));
+  const auditLog = createPostgresAuditLog(testDatabaseUrl());
+  const memory = createPostgresMemoryService(testDatabaseUrl());
   const deploy = createDeployService({
-    deployStore: createDeployStore(),
+    ...singleProcessDeps(),
+    deployStore: createDeployStore(testDeployBackings()),
     provider: createDockerDeployProvider(),
     deployDir: join(tmpdir(), "pm-deploy"),
     auditLog,
@@ -99,22 +95,20 @@ function buildOrchestrator(
 
   if (opts.scopeSoulFor) {
     const scope = resolution.scopeFor(opts.scopeSoulFor.conversation, actor);
-    config.setSoul(scope, opts.scopeSoulFor.soul);
+    await config.setSoul(scope, opts.scopeSoulFor.soul);
   }
 
   return createOrchestrator({
-    identity: createIdentityService(),
+    ...singleProcessDeps(),
+    identity: createIdentityService(testMap(), { externalMembers: testMap() }),
     sessionSyscalls: opts.sessionSyscalls,
     featureFlags: opts.featureFlags,
     resolution,
-    sessions: createMemorySessionStore(),
-    workspace,
-    files: createMemoryFileArtifactStore(createMemoryDurableByteStore()),
+    sessions: opts.sessions ?? createPostgresSessionStore(testDatabaseUrl()),
+    files: createPostgresFileArtifactStore(testDatabaseUrl(), createMemoryDurableByteStore()),
     sandbox: fakeSandbox(),
-    modelGateway: createModelGateway(),
     auditLog,
-    rateLimiter: createRateLimiter({ maxPerWindow: 1000, windowMs: 60_000 }),
-    harness: createMockHarness(),
+    agent: createMockAgent(),
     memory,
     deploy,
     acl,
@@ -122,7 +116,6 @@ function buildOrchestrator(
     ...(opts.brandingDefault ? { brandingDefault: opts.brandingDefault } : {}),
     skills,
     connectorTokens,
-    connectorStatusCache,
     signingSecret: "test-signing-secret",
     apiBaseUrl: "https://api.test",
   });
@@ -184,7 +177,7 @@ function countOccurrences(haystack: string, needle: string): number {
 
 test("Mode 1 (DM): live-conversation frame, org policy once, no template leaks, no Mode-2 language", async () => {
   const ORG_SOUL = "ORG-POLICY-MARKER: be terse and never promise a refund.";
-  const orch = buildOrchestrator({ orgSoul: ORG_SOUL });
+  const orch = await buildOrchestrator({ orgSoul: ORG_SOUL });
   const prompt = await sysprompt(orch, slackDm(""));
 
   assertNoTemplateTokens(prompt, "Mode 1 (DM)");
@@ -210,7 +203,7 @@ test("Mode 1 (DM): live-conversation frame, org policy once, no template leaks, 
 
 test("Mode 1 (DM): org policy still renders exactly once when the scope soul duplicates it verbatim", async () => {
   const ORG_SOUL = "ORG-POLICY-MARKER-2: escalate security incidents immediately.";
-  const orch = buildOrchestrator({
+  const orch = await buildOrchestrator({
     orgSoul: ORG_SOUL,
     scopeSoulFor: { conversation: dmConversation, soul: ORG_SOUL },
   });
@@ -227,7 +220,7 @@ test("Mode 1 (DM): org policy still renders exactly once when the scope soul dup
 
 test("Mode 2 (spine channel): autonomous-worklog frame, org policy once, no template leaks, no Mode-1 language", async () => {
   const ORG_SOUL = "ORG-POLICY-MARKER-3: never share customer PII outside the org.";
-  const orch = buildOrchestrator({ orgSoul: ORG_SOUL });
+  const orch = await buildOrchestrator({ orgSoul: ORG_SOUL });
   const prompt = await sysprompt(orch, spineChannelTurn(""));
 
   assertNoTemplateTokens(prompt, "Mode 2 (spine channel)");
@@ -248,7 +241,7 @@ test("Mode 2 (spine channel): autonomous-worklog frame, org policy once, no temp
 
 test("Mode 2 (spine channel): org policy still renders exactly once when the scope soul duplicates it verbatim", async () => {
   const ORG_SOUL = "ORG-POLICY-MARKER-4: all deploys require a second approver.";
-  const orch = buildOrchestrator({
+  const orch = await buildOrchestrator({
     orgSoul: ORG_SOUL,
     scopeSoulFor: { conversation: channelConversation, soul: ORG_SOUL },
   });
@@ -263,8 +256,8 @@ test("Mode 2 (spine channel): org policy still renders exactly once when the sco
 });
 
 test("Mode 1 and Mode 2 frames are mutually exclusive within one prompt", async () => {
-  const dmPrompt = await sysprompt(buildOrchestrator(), slackDm(""));
-  const spinePrompt = await sysprompt(buildOrchestrator(), spineChannelTurn(""));
+  const dmPrompt = await sysprompt(await buildOrchestrator(), slackDm(""));
+  const spinePrompt = await sysprompt(await buildOrchestrator(), spineChannelTurn(""));
 
   assert.match(dmPrompt, /live private 1:1/);
   assert.doesNotMatch(dmPrompt, /no one ever reads this transcript/);
@@ -275,8 +268,8 @@ test("Mode 1 and Mode 2 frames are mutually exclusive within one prompt", async 
 
 test("shared-core platform guidance reaches both the DM and the spine prompt", async () => {
   for (const prompt of [
-    await sysprompt(buildOrchestrator(), slackDm("")),
-    await sysprompt(buildOrchestrator(), spineChannelTurn("")),
+    await sysprompt(await buildOrchestrator(), slackDm("")),
+    await sysprompt(await buildOrchestrator(), spineChannelTurn("")),
   ]) {
     assert.match(prompt, /## System orientation/);
     assert.match(prompt, /## Files/);
@@ -295,9 +288,11 @@ test("session search guidance follows the callable surface and feature gate", as
         undefined,
         { type: "principal" as const, target: "U1", audienceScopeId: scopeId("personal", "U1"), onBehalfOf: "U1" },
       ]) {
-        const orchestrator = buildOrchestrator({
+        const orchestrator = await buildOrchestrator({
           sessionSyscalls: { forTurn: () => ({}) } as unknown as OrchestratorDeps["sessionSyscalls"],
-          featureFlags: { enabled: async () => enabled } as unknown as OrchestratorDeps["featureFlags"],
+          featureFlags: {
+            enabledFor: async () => new Set(enabled ? FEATURE_NAMES : []),
+          } as unknown as OrchestratorDeps["featureFlags"],
         });
         const prompt = await sysprompt(
           orchestrator,
@@ -318,27 +313,27 @@ test("session search guidance follows the callable surface and feature gate", as
 });
 
 test("identity defaults to QM and 'this organization' when no branding is configured", async () => {
-  const prompt = await sysprompt(buildOrchestrator(), slackDm(""));
+  const prompt = await sysprompt(await buildOrchestrator(), slackDm(""));
   assert.match(prompt, /# QM\n/);
   assert.match(prompt, /You are QM, a helpful org-wide assistant for this organization\./);
 });
 
 test("org branding renames the assistant and the organization across both modes", async () => {
   const branding: OrgBranding = { selfLabel: "straylight", orgName: "Straylight Industries" };
-  const dmPrompt = await sysprompt(buildOrchestrator({ branding }), slackDm(""));
+  const dmPrompt = await sysprompt(await buildOrchestrator({ branding }), slackDm(""));
   assert.match(dmPrompt, /# straylight\n/);
   assert.match(dmPrompt, /You are straylight, a helpful org-wide assistant for Straylight Industries\./);
   assert.match(dmPrompt, /You are straylight, in a live private 1:1 with Alice/);
   assert.doesNotMatch(dmPrompt, /You are QM/);
 
-  const spinePrompt = await sysprompt(buildOrchestrator({ branding }), spineChannelTurn(""));
+  const spinePrompt = await sysprompt(await buildOrchestrator({ branding }), spineChannelTurn(""));
   assert.match(spinePrompt, /You are straylight, in a channel conversation via Slack\./);
   assert.doesNotMatch(spinePrompt, /You are QM/);
 });
 
 test("web conversation surface label carries the configured name", async () => {
   const branding: OrgBranding = { selfLabel: "straylight" };
-  const webPrompt = await sysprompt(buildOrchestrator({ branding }), {
+  const webPrompt = await sysprompt(await buildOrchestrator({ branding }), {
     surface: "web",
     actor,
     conversation: dmConversation,
@@ -351,39 +346,39 @@ test("web conversation surface label carries the configured name", async () => {
 test("a Slack handle differing from the identity name appears as a mention adjunct in every mode", async () => {
   const branding: OrgBranding = { selfLabel: "straylight" };
   const withHandle = await sysprompt(
-    buildOrchestrator({ branding }),
+    await buildOrchestrator({ branding }),
     spineChannelTurn("", { gatewayContext: { botHandle: "qm-bot" } }),
   );
   assert.match(withHandle, /You are straylight \(@qm-bot in Slack\), a helpful org-wide assistant/);
 
   const dmWithHandle = await sysprompt(
-    buildOrchestrator({ branding }),
+    await buildOrchestrator({ branding }),
     slackDm("", { gatewayContext: { botHandle: "qm-bot" } }),
   );
   assert.match(dmWithHandle, /You are straylight \(@qm-bot in Slack\), a helpful org-wide assistant/);
 
   const matchingHandle = await sysprompt(
-    buildOrchestrator({ branding }),
+    await buildOrchestrator({ branding }),
     spineChannelTurn("", { gatewayContext: { botHandle: "Straylight" } }),
   );
   assert.match(matchingHandle, /You are straylight, a helpful org-wide assistant/);
   assert.doesNotMatch(matchingHandle, /in Slack\)/);
 
   const atHandle = await sysprompt(
-    buildOrchestrator({ branding }),
+    await buildOrchestrator({ branding }),
     spineChannelTurn("", { gatewayContext: { botHandle: "@qm-bot" } }),
   );
   assert.match(atHandle, /\(@qm-bot in Slack\)/);
   assert.doesNotMatch(atHandle, /@@/);
 
   const atMatchingHandle = await sysprompt(
-    buildOrchestrator({ branding }),
+    await buildOrchestrator({ branding }),
     spineChannelTurn("", { gatewayContext: { botHandle: "@straylight" } }),
   );
   assert.doesNotMatch(atMatchingHandle, /in Slack\)/);
 
   const hostileHandle = await sysprompt(
-    buildOrchestrator({ branding }),
+    await buildOrchestrator({ branding }),
     spineChannelTurn("", { gatewayContext: { botHandle: "{{qm-bot}}" } }),
   );
   assert.match(hostileHandle, /\(@qm-bot in Slack\)/);
@@ -392,7 +387,7 @@ test("a Slack handle differing from the identity name appears as a mention adjun
 
 test("a display name containing template tokens cannot break prompt rendering", async () => {
   const hostileActor: Principal = { id: "U9", type: "internal", displayName: "Al{{ice}}" };
-  const prompt = await sysprompt(buildOrchestrator(), {
+  const prompt = await sysprompt(await buildOrchestrator(), {
     surface: "slack",
     actor: hostileActor,
     conversation: { kind: "dm", threadRef: "dm:U9:pm9", audience: [hostileActor] },
@@ -406,7 +401,7 @@ test("a display name containing template tokens cannot break prompt rendering", 
 
 test("template tokens in a stored branding value are stripped, never rendered or thrown", async () => {
   const prompt = await sysprompt(
-    buildOrchestrator({ branding: { selfLabel: "{{straylight}}", orgName: "Acme {{Corp}}" } }),
+    await buildOrchestrator({ branding: { selfLabel: "{{straylight}}", orgName: "Acme {{Corp}}" } }),
     slackDm(""),
   );
   assert.match(prompt, /You are straylight, a helpful org-wide assistant for Acme Corp\./);
@@ -415,11 +410,11 @@ test("template tokens in a stored branding value are stripped, never rendered or
 
 test("env brandingDefault names the assistant when the store has no branding, and the store wins over it", async () => {
   const brandingDefault: OrgBranding = { selfLabel: "envbot", orgName: "Env Org" };
-  const fromEnv = await sysprompt(buildOrchestrator({ brandingDefault }), slackDm(""));
+  const fromEnv = await sysprompt(await buildOrchestrator({ brandingDefault }), slackDm(""));
   assert.match(fromEnv, /You are envbot, a helpful org-wide assistant for Env Org\./);
 
   const fromStore = await sysprompt(
-    buildOrchestrator({ brandingDefault, branding: { selfLabel: "storebot" } }),
+    await buildOrchestrator({ brandingDefault, branding: { selfLabel: "storebot" } }),
     slackDm(""),
   );
   assert.match(fromStore, /You are storebot, a helpful org-wide assistant for Env Org\./);
@@ -427,13 +422,13 @@ test("env brandingDefault names the assistant when the store has no branding, an
 
 test("Mode 2 (spine channel): static prose stays within the word-count ceiling (excl. live tail + soul)", async () => {
   const ORG_SOUL = "ORG-POLICY-MARKER-5: keep it short.";
-  const orch = buildOrchestrator({ orgSoul: ORG_SOUL });
+  const orch = await buildOrchestrator({ orgSoul: ORG_SOUL });
   const prompt = await sysprompt(orch, spineChannelTurn("", { timezone: "America/New_York" }));
 
   const systemPrompt = prompt.split("\n\n<environment>")[0]!;
   assert.match(
     prompt,
-    /## The user's local time/,
+    /<environment>[^]*Local time: /,
     "the volatile tail rides the environment note, not the system prompt",
   );
 
@@ -451,7 +446,7 @@ test("Mode 2 (spine channel): static prose stays within the word-count ceiling (
 for (const surface of ["web", "slack"]) {
   for (const mode of ["conversation", "autonomous", "fallback"]) {
     test(`${surface} ${mode} turns receive their surface formatting contract`, async () => {
-      const prompt = await sysprompt(buildOrchestrator(), {
+      const prompt = await sysprompt(await buildOrchestrator(), {
         surface,
         actor,
         conversation: mode === "conversation" ? dmConversation : channelConversation,
@@ -470,14 +465,13 @@ for (const surface of ["web", "slack"]) {
       assert.equal(countOccurrences(prompt, "Use Markdown"), 1);
       const stablePrompt = prompt.split("\n\n<environment>")[0]!.trim();
       assert.equal(countOccurrences(stablePrompt, "## Rules for talking to users"), 1);
-      assert.ok(stablePrompt.endsWith("4. Describe work in human terms and not system machinery."));
       assertNoTemplateTokens(prompt, `${surface} ${mode}`);
     });
   }
 }
 
 test("web group conversations are not described as private 1:1s", async () => {
-  const prompt = await sysprompt(buildOrchestrator(), {
+  const prompt = await sysprompt(await buildOrchestrator(), {
     surface: "web",
     actor,
     conversation: { kind: "group", channelRef: "G1", threadRef: "G1:t", audience: [actor] },
@@ -486,4 +480,69 @@ test("web group conversations are not described as private 1:1s", async () => {
   });
   assert.match(prompt, /live group conversation with Alice/);
   assert.doesNotMatch(prompt, /private 1:1/);
+});
+
+test("a guidance change from another session is announced on this session's next turn, once", async () => {
+  const config = testConfigStore(ORG);
+  const orch = await buildOrchestrator({ config, scopeSoulFor: { conversation: dmConversation, soul: "Be brief." } });
+  assert.doesNotMatch(await sysprompt(orch, slackDm("")), /standing guidance/);
+  await config.setSoul(
+    scopeId("personal", "U1"),
+    "Be brief.\nNever cite a PR by bare number.",
+    "U1",
+    "1aedf13a-0000-4000-8000-000000000000",
+  );
+  const next = await sysprompt(orch, slackDm(""));
+  assert.match(next, /Never cite a PR by bare number\./, "the system prompt carries the new guidance");
+  assert.match(
+    next,
+    /<environment>[\s\S]*In a different session \(1aedf13\) the user updated their standing guidance: "Never cite a PR by bare number\."\. Follow it moving forward but no need to directly mention you're doing so\.[\s\S]*<\/environment>/,
+  );
+  assert.doesNotMatch(await sysprompt(orch, slackDm("")), /updated their standing guidance/);
+});
+
+test("the live-subagents note rides wake turns and the first turn after a compaction, never an ordinary turn", async () => {
+  const conversation: Conversation = { kind: "dm", threadRef: "dm:U1:roster", audience: [actor] };
+  let roster = "Subagents opened from this conversation that are still working or blocked:\n- builder (s1) — running";
+  const sessions = createPostgresSessionStore(testDatabaseUrl());
+  const orchestrator = await buildOrchestrator({
+    sessions,
+    sessionSyscalls: {
+      forTurn: () => ({
+        open: async () => ({ ok: false, message: "unused" }),
+        write: async () => ({ ok: false, message: "unused" }),
+        read: async () => ({ ok: true, mode: "children", children: [] }),
+        liveSubagents: async () => roster,
+      }),
+    },
+    featureFlags: {
+      list: async () => [],
+      get: async () => null,
+      enabled: async () => true,
+      enabledFor: async () => new Set(FEATURE_NAMES),
+      setEnabled: async () => {
+        throw new Error("unused");
+      },
+    },
+  });
+  const destination = {
+    type: "principal" as const,
+    target: "U1",
+    audienceScopeId: scopeId("personal", "U1"),
+    onBehalfOf: "U1",
+  };
+  const wake = slackDm("", { conversation, origin: { kind: "automation", destination } });
+  const ordinary = slackDm("", { conversation });
+  const noted = (prompt: string) => /<environment>[\s\S]*- builder \(s1\) — running[\s\S]*<\/environment>/.test(prompt);
+
+  assert.equal(noted(await sysprompt(orchestrator, ordinary)), false, "an ordinary turn carries no roster");
+  assert.equal(noted(await sysprompt(orchestrator, wake)), true, "a wake turn carries the roster");
+  const session = await sessions.getByThread(conversation.threadRef);
+  assert.ok(session);
+  const throughSeq = (await sessions.latestItemSeq(session.id)) - 1;
+  await sessions.append({ sessionId: session.id }, { kind: "ContextCompaction", throughSeq, text: "summary" });
+  assert.equal(noted(await sysprompt(orchestrator, ordinary)), true, "the first turn after a compaction carries it");
+  assert.equal(noted(await sysprompt(orchestrator, ordinary)), false, "later ordinary turns do not");
+  roster = "";
+  assert.doesNotMatch(await sysprompt(orchestrator, wake), /still working or blocked/, "no note when no child is live");
 });

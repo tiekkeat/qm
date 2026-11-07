@@ -1,23 +1,38 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createInboxSourceRefresh } from "../src/loops/inbox-source-refresh.ts";
+import { createInboxSourceRefresh as createRefresh } from "../src/loops/inbox-source-refresh.ts";
 import { createLoopItemLedger } from "../src/loops/item-ledger.ts";
+import type { IngressEntry } from "../src/loops/ingress.ts";
+import { createPostgresErrorLog } from "../src/admin/postgres-error-log.ts";
+import { testDatabaseUrl, testMap } from "./support/test-database.ts";
 
 async function fixture(source = "gmail", meta: Record<string, unknown> = { threadId: "t1" }) {
-  const items = createLoopItemLedger();
+  const items = createLoopItemLedger(testMap());
   await items.ingest([
     {
       loopId: "inbox",
       dedupeKey: "ask",
       source,
       sourceAt: 1000,
-      sourcePayload: { source, [source]: meta, context: [{ author: "Elsewhere", text: "UNRELATED CHANNEL TAIL" }] },
+      sourcePayload: { [source]: meta, context: [{ author: "Elsewhere", text: "UNRELATED CHANNEL TAIL" }] },
       proposal: { by: "human", data: { body: "Keep my edit" } },
     },
   ]);
   return { items, item: (await items.byLoop("inbox"))[0]! };
 }
 const featureFlags = { enabled: async () => true };
+const createInboxSourceRefresh = (
+  deps: Omit<Parameters<typeof createRefresh>[0], "enqueue"> & {
+    enqueue?: Parameters<typeof createRefresh>[0]["enqueue"];
+  },
+) => createRefresh({ enqueue: async () => undefined, ...deps });
+function recorder() {
+  const events: unknown[] = [];
+  const enqueue = async (_loop: unknown, entries: IngressEntry[]) => {
+    events.push(...entries.map((entry) => entry.sourcePayload?.latestEvent));
+  };
+  return { events, enqueue };
+}
 const tokens = { connectorAccessToken: async () => "synthetic-token" };
 const json = (body: unknown) => Response.json(body);
 const ALEX = "https://avatars.slack-edge.com/alex.png";
@@ -35,12 +50,14 @@ function directoryOf(
 }
 const directory = directoryOf({ U1: { displayName: "Alex", avatarUrl: ALEX }, U2: { displayName: "Taylor" } });
 
-test("Gmail reply sent outside QM closes the card, ignores drafts and recognizes send-as aliases", async () => {
+test("Gmail reply sent outside QM becomes an owner event, ignoring drafts and recognizing send-as aliases", async () => {
   const { items, item } = await fixture();
   let reads = 0;
+  const queue = recorder();
   const refresh = createInboxSourceRefresh({
     featureFlags,
     items,
+    enqueue: queue.enqueue,
     tokens,
     directory,
     fetchImpl: async (url) => {
@@ -57,12 +74,8 @@ test("Gmail reply sent outside QM closes the card, ignores drafts and recognizes
   });
   await Promise.all([refresh("owner@example.com", [item]), refresh("owner@example.com", [item])]);
   await refresh("owner@example.com", [item]);
-  const after = (await items.get(item.id))!;
-  assert.equal(after.status, "skipped");
-  assert.equal(after.actionKind, "replied");
-  assert.equal(after.sourceAt, 2000);
-  assert.equal(after.actionResult, "Handled elsewhere");
-  assert.equal(after.proposal?.data.body, "Keep my edit");
+  assert.deepEqual(queue.events, [{ author: "owner", at: 2000, text: "Handled elsewhere" }]);
+  assert.equal((await items.get(item.id))!.proposal?.data.body, "Keep my edit");
   assert.equal(reads, 1);
 });
 
@@ -76,14 +89,16 @@ test("an old sent message or a newer inbound message does not close a Gmail item
     [{ internalDate: "2000", labelIds: ["DRAFT"] }],
   ]) {
     const { items, item } = await fixture();
+    const queue = recorder();
     await createInboxSourceRefresh({
       featureFlags,
       items,
+      enqueue: queue.enqueue,
       tokens,
       directory,
       fetchImpl: async () => json({ messages }),
     })("owner", [item]);
-    assert.equal((await items.get(item.id))!.status, "ready");
+    assert.deepEqual(queue.events, []);
   }
 });
 
@@ -184,28 +199,32 @@ test("top-level/private-channel mentions fetch just their root and replies, neve
 test("Slack detects group DMs by conversation metadata, including C-prefixed IDs", async () => {
   const { items, item } = await fixture("slack", { channelId: "C_GROUP_DM", ts: "1.0" });
   const calls: string[] = [];
+  const queue = recorder();
   await createInboxSourceRefresh({
     featureFlags,
     items,
+    enqueue: queue.enqueue,
     tokens,
     directory,
     fetchImpl: slackFetch(calls, { direct: true, own: true }),
   })("owner", [item]);
   assert.ok(calls.some((p) => p.includes("conversations.history")));
-  assert.equal((await items.get(item.id))!.actionKind, "replied");
+  assert.deepEqual(queue.events, [{ author: "owner", at: 2000, text: "Thread reply" }]);
 });
 
 test("a partial Slack thread is displayed as partial but cannot resolve an item", async () => {
   const { items, item } = await fixture("slack", { channelId: "C1", ts: "1.0" });
+  const queue = recorder();
   await createInboxSourceRefresh({
     featureFlags,
     items,
+    enqueue: queue.enqueue,
     tokens,
     directory,
     fetchImpl: slackFetch([], { partial: true, own: true }),
   })("owner", [item]);
   const after = (await items.get(item.id))!;
-  assert.equal(after.status, "ready");
+  assert.deepEqual(queue.events, []);
   assert.equal(after.sourcePayload!.sourceContextPartial, true);
 });
 
@@ -227,6 +246,25 @@ test("rate limiting is respected across different Slack items and never triggers
   await refresh("owner", [{ ...item, id: "second" }]);
   assert.equal(reads, 1);
   assert.equal((await items.get(item.id))!.status, "ready");
+});
+
+test("a Gmail rate limit pauses reads across the owner's Gmail items", async () => {
+  const { items, item } = await fixture();
+  let reads = 0;
+  const refresh = createInboxSourceRefresh({
+    featureFlags,
+    items,
+    tokens,
+    directory,
+    fetchImpl: async () => {
+      reads++;
+      return new Response("limited", { status: 429, headers: { "retry-after": "120" } });
+    },
+  });
+  await refresh("owner", [item]);
+  await refresh("owner", [{ ...item, id: "second" }]);
+  assert.equal(reads, 1);
+  assert.match(String((await items.get(item.id))!.sourcePayload?.sourceRefreshError), /not been dismissed/);
 });
 
 test("slow Gmail reads have a total batch budget and later cards are visited on the next refresh", async () => {
@@ -616,10 +654,9 @@ test("saved participants do not supply a missing sender identity", async () => {
 });
 
 test("profile failures retain diagnostics without exposing credentials", async () => {
-  const { createErrorLog } = await import("../src/admin/error-log.ts");
   for (const mode of [undefined, "avatars"] as const) {
     const { items, item } = await fixture("slack", { channelId: "D1", ts: "1.0", userId: "U1" });
-    const errors = createErrorLog();
+    const errors = createPostgresErrorLog(testDatabaseUrl());
     await createInboxSourceRefresh({
       featureFlags,
       items,
@@ -640,9 +677,8 @@ test("profile failures retain diagnostics without exposing credentials", async (
 });
 
 test("cosmetic refresh records ledger failures without rejecting the inbox request", async () => {
-  const { createErrorLog } = await import("../src/admin/error-log.ts");
   const { items, item } = await fixture("slack", { channelId: "D1", ts: "1.0", userId: "U1" });
-  const errors = createErrorLog();
+  const errors = createPostgresErrorLog(testDatabaseUrl());
   await createInboxSourceRefresh({
     featureFlags,
     items: {
@@ -665,8 +701,7 @@ test("cosmetic refresh records ledger failures without rejecting the inbox reque
 
 test("Inbox source refresh checks the owner rollout before credentials, reads, or writes in either mode", async () => {
   const { createFeatureFlagStore } = await import("../src/feature-flags.ts");
-  const { createMemoryMap } = await import("../src/persistence/durable-map.ts");
-  const flags = createFeatureFlagStore(createMemoryMap());
+  const flags = createFeatureFlagStore(testMap());
   await flags.setEnabled("inbox_loops", "personal:someone-else", true, "admin");
   for (const mode of [undefined, "avatars"] as const) {
     const { items, item } = await fixture("slack", { channelId: "D1", ts: "1.0", userId: "U1" });
@@ -719,13 +754,13 @@ test("Slack-id principals and items without a known sender use only the director
   assert.deepEqual((await items.get(item.id))!.sourcePayload!.participants, [
     { id: "U1", name: "Alex", avatarUrl: ALEX },
   ]);
-  const legacy = await fixture("slack", { channelId: "D2", ts: "1.0" });
-  await createInboxSourceRefresh({ featureFlags, items: legacy.items, tokens, directory, fetchImpl })(
+  const noSender = await fixture("slack", { channelId: "D2", ts: "1.0" });
+  await createInboxSourceRefresh({ featureFlags, items: noSender.items, tokens, directory, fetchImpl })(
     "owner",
-    [legacy.item],
+    [noSender.item],
     "avatars",
   );
-  assert.deepEqual(await legacy.items.get(legacy.item.id), legacy.item);
+  assert.deepEqual(await noSender.items.get(noSender.item.id), noSender.item);
 });
 
 test("people outside the directory keep the profile Slack returned with their message", async () => {

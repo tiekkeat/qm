@@ -1,32 +1,44 @@
+import { createDeliveryStore } from "../src/delivery/delivery-store.ts";
 import type { CapabilityClaims } from "../src/auth/capability-token.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { ServerResponse } from "node:http";
 import { composioRoutes, composioUserId } from "../src/api/routes/composio.ts";
+import { composioCallbackRoutes } from "../src/api/routes/composio-callback.ts";
 import type { ApiCtx } from "../src/api/routes/route.ts";
 import type { ServerDeps } from "../src/api/deps.ts";
 import { createKeychain } from "../src/credentials/keychain.ts";
-import { createMemoryMap } from "../src/persistence/durable-map.ts";
 import { deriveConnectorKey } from "../src/connectors/connector-client-store.ts";
 import { createAclStore } from "../src/acl/acl-store.ts";
 import { scopeId } from "../src/types.ts";
 import { orgId } from "../src/config.ts";
+import { createPostgresDirectoryStore } from "../src/directory/postgres-directory-store.ts";
+import { testAdvisoryLock, testDatabaseUrl, testMap, testUserStore } from "./support/test-database.ts";
+import { createPostgresGrantStore } from "../src/acl/postgres-grant-store.ts";
 
 function fixture() {
   const keychain = createKeychain({
-    creds: createMemoryMap(),
-    grants: createMemoryMap(),
-    asks: createMemoryMap(),
+    lock: testAdvisoryLock(),
+    creds: testMap(),
+    grants: testMap(),
+    asks: testMap(),
     key: deriveConnectorKey("composio-test"),
   });
-  const acl = createAclStore();
+  const acl = createAclStore(createPostgresGrantStore(testDatabaseUrl()));
+  const app = { getSessionForViewer: async (_id: string, _viewer: string): Promise<unknown> => null };
   const calls: Array<{ url: string; init?: RequestInit }> = [];
   const replies: unknown[] = [];
+  const audits: Array<{ action: string; resource?: string }> = [];
   const deps: Partial<ServerDeps> = {
     keychain,
+    deliveries: createDeliveryStore(),
     serviceCreds: keychain,
     acl,
-    composioReturns: createMemoryMap(),
+    composioReturns: testMap(),
+    portalUrl: "https://qm.example",
+    auditLog: {
+      record: (e: { action: string; resource?: string }) => audits.push(e),
+    } as unknown as ServerDeps["auditLog"],
     runs: {
       get: async () => ({
         status: "running",
@@ -45,15 +57,26 @@ function fixture() {
       return Response.json(result);
     }) as typeof fetch,
   };
-  async function invoke(path: string, body?: unknown, actor: string | null = "alice", capability?: CapabilityClaims) {
+  async function invoke(
+    path: string,
+    body?: unknown,
+    actor: string | null = "alice",
+    capability?: CapabilityClaims,
+    impersonating = false,
+  ) {
     let status = 0;
     let text = "";
+    let location: string | undefined;
+    const headers: Record<string, string> = {};
     const url = new URL(path, "http://localhost");
     const res = {
-      setHeader() {},
+      setHeader(name: string, value: string) {
+        headers[name] = value;
+      },
       getHeader() {},
-      writeHead(code: number) {
+      writeHead(code: number, headers?: { location?: string }) {
         status = code;
+        location = headers?.location;
       },
       end(value: string) {
         text = value;
@@ -61,15 +84,16 @@ function fixture() {
     } as unknown as ServerResponse;
     const ctx = {
       deps,
+      app,
       res,
       url,
       body,
       capability,
-      actor: actor ? { p: actor, exp: Date.now() + 60_000 } : null,
+      actor: actor ? { p: actor, exp: Date.now() + 60_000, ...(impersonating ? { imp: "admin" } : {}) } : null,
     } as ApiCtx;
-    const route = composioRoutes.find((r) => "path" in r && r.path === url.pathname)!;
+    const route = [...composioRoutes, ...composioCallbackRoutes].find((r) => "path" in r && r.path === url.pathname)!;
     await route.handle(ctx);
-    return { status, data: JSON.parse(text), text };
+    return { status, data: text ? JSON.parse(text) : null, text, location, headers };
   }
   async function own(ownerId = "alice", service = "composio") {
     await keychain.save({ ownerId, service, envKey: "COMPOSIO_API_KEY", secret: "private-key" });
@@ -94,8 +118,10 @@ function fixture() {
         grantedBy: "admin",
       });
   }
-  return { invoke, own, shared, calls, replies, deps };
+  return { invoke, own, shared, calls, replies, deps, app, audits };
 }
+
+const SETTINGS = "https://qm.example/?view=settings";
 
 test("Composio requires a verified actor and never uses another person's key", async () => {
   const f = fixture();
@@ -244,7 +270,7 @@ test("connections return only this actor's active accounts and strip credentials
   const r = await f.invoke("/v1/composio/connections?user_ids=bob&cursor=page-1");
   assert.equal(r.status, 200);
   assert.deepEqual(r.data, {
-    items: [{ id: "ca_gmail", toolkit: "gmail", userId: composioUserId(orgId(), "alice") }],
+    items: [{ id: "ca_gmail", toolkit: "gmail", userId: composioUserId(orgId(), "alice"), missingScopes: [] }],
     nextCursor: "next-page",
   });
   const q = new URL(f.calls[0]!.url).searchParams;
@@ -252,6 +278,139 @@ test("connections return only this actor's active accounts and strip credentials
   assert.equal(q.get("statuses"), "ACTIVE");
   assert.equal(q.get("cursor"), "page-1");
   assert.doesNotMatch(r.text, /secret-token|private-key|user_id/);
+});
+
+test("connections report scopes the app's configuration grants that an older connection lacks", async () => {
+  const f = fixture();
+  await f.own();
+  const account = (id: string, scope: string | undefined, config = "ac_x") => ({
+    id,
+    user_id: composioUserId(orgId(), "alice"),
+    status: "ACTIVE",
+    toolkit: { slug: "twitter" },
+    auth_config: { id: config },
+    state: { authScheme: "OAUTH2", val: { scope, access_token: "secret-token" } },
+  });
+  f.replies.push(
+    {
+      items: [
+        account("ca_old", "tweet.read users.read offline.access"),
+        account("ca_new", "tweet.read users.read offline.access dm.read dm.write"),
+        account("ca_unknown", undefined),
+        account("ca_unreadable", "tweet.read", "ac_gone"),
+      ],
+    },
+    {
+      credentials: {
+        scopes: ["tweet.read", "users.read", "offline.access", "dm.read", "dm.write"],
+        client_secret: "s3",
+      },
+    },
+    new Response("missing", { status: 404 }),
+  );
+  const r = await f.invoke("/v1/composio/connections");
+  assert.equal(r.status, 200);
+  assert.deepEqual(
+    r.data.items.map((item: { id: string; missingScopes: string[] }) => [item.id, item.missingScopes]),
+    [
+      ["ca_old", ["dm.read", "dm.write"]],
+      ["ca_new", []],
+      ["ca_unknown", []],
+      ["ca_unreadable", []],
+    ],
+  );
+  assert.deepEqual(
+    f.calls.slice(1).map((call) => new URL(call.url).pathname),
+    ["/api/v3.1/auth_configs/ac_x", "/api/v3.1/auth_configs/ac_gone"],
+  );
+  assert.doesNotMatch(r.text, /secret-token|s3|private-key/);
+  f.replies.push({ items: [account("ca_old", "tweet.read"), account("ca_unreadable", "tweet.read", "ac_gone")] }, {});
+  await f.invoke("/v1/composio/connections");
+  assert.deepEqual(
+    f.calls.slice(3).map((call) => new URL(call.url).pathname),
+    ["/api/v3.1/connected_accounts", "/api/v3.1/auth_configs/ac_gone"],
+  );
+});
+
+test("scopes granted in URL form match their short configured names", async () => {
+  const f = fixture();
+  await f.own();
+  f.replies.push(
+    {
+      items: [
+        {
+          id: "ca_outlook",
+          user_id: composioUserId(orgId(), "alice"),
+          status: "ACTIVE",
+          toolkit: { slug: "outlook" },
+          auth_config: { id: "ac_outlook" },
+          state: { val: { scope: "https://graph.microsoft.com/Mail.Read offline_access https://mail.google.com/" } },
+        },
+      ],
+    },
+    { credentials: { scopes: ["Mail.Read", "offline_access", "https://mail.google.com/", "Mail.Send"] } },
+  );
+  const r = await f.invoke("/v1/composio/connections");
+  assert.deepEqual(r.data.items[0].missingScopes, ["Mail.Send"]);
+});
+
+test("people can disconnect only their own connections, on a turn they started", async () => {
+  const f = fixture();
+  await f.own();
+  const mine = {
+    id: "ca_mine",
+    user_id: composioUserId(orgId(), "alice"),
+    status: "EXPIRED",
+    toolkit: { slug: "twitter" },
+  };
+  f.replies.push(mine, {});
+  const r = await f.invoke("/v1/composio/disconnect", { accountId: "ca_mine" });
+  assert.deepEqual([r.status, r.data], [200, { disconnected: "ca_mine", toolkit: "twitter" }]);
+  assert.deepEqual(
+    f.calls.map((call) => [call.init?.method, new URL(call.url).pathname]),
+    [
+      ["GET", "/api/v3.1/connected_accounts/ca_mine"],
+      ["DELETE", "/api/v3.1/connected_accounts/ca_mine"],
+    ],
+  );
+  assert.deepEqual(
+    f.audits.filter((e) => e.action === "composio.disconnected").map((e) => e.resource),
+    ["twitter/ca_mine"],
+  );
+
+  f.replies.push(mine, {});
+  assert.equal((await f.invoke("/v1/composio/disconnect", { accountId: "ca_mine" }, null, privateCap)).status, 200);
+
+  for (const account of [
+    { ...mine, user_id: composioUserId(orgId(), "bob") },
+    { ...mine, id: "ca_other" },
+    { ...mine, toolkit: { slug: "composio" } },
+  ]) {
+    const g = fixture();
+    await g.own();
+    g.replies.push(account);
+    assert.equal((await g.invoke("/v1/composio/disconnect", { accountId: "ca_mine" })).status, 403);
+    assert.ok(g.calls.every((call) => call.init?.method === "GET"));
+  }
+
+  const g = fixture();
+  await g.own();
+  g.replies.push(new Response("gone", { status: 404 }));
+  assert.equal((await g.invoke("/v1/composio/disconnect", { accountId: "ca_mine" })).status, 404);
+});
+
+test("disconnecting refuses automations, impersonation and malformed accounts before provider calls", async () => {
+  for (const [body, actor, capability, impersonating, status] of [
+    [{ accountId: "ca_mine" }, null, { ...privateCap, liveActor: false, triggered: true }, false, 403],
+    [{ accountId: "ca_mine" }, "alice", undefined, true, 403],
+    [{ accountId: "../ca_mine" }, "alice", undefined, false, 400],
+    [{ accountId: "ca_mine" }, null, undefined, false, 401],
+  ] as const) {
+    const f = fixture();
+    await f.own();
+    assert.equal((await f.invoke("/v1/composio/disconnect", body, actor, capability, impersonating)).status, status);
+    assert.equal(f.calls.length, 0);
+  }
 });
 
 test("connections require credential access and fail visibly on upstream errors", async () => {
@@ -269,13 +428,12 @@ test("Slack connection links verified workspace identity to the web owner and pe
   const f = fixture();
   await f.own();
   const { createPrincipalLinkService } = await import("../src/identity/principal-links.ts");
-  const { createDirectoryStore } = await import("../src/directory/directory-store.ts");
   const { installPrincipalLinks, canonicalPerson } = await import("../src/directory/person.ts");
-  f.deps.principalLinks = createPrincipalLinkService();
+  f.deps.principalLinks = createPrincipalLinkService(testUserStore(), testAdvisoryLock());
   installPrincipalLinks(f.deps.principalLinks);
-  f.deps.slackAccounts = createMemoryMap();
+  f.deps.slackAccounts = testMap();
   f.deps.signingSecret = "qa-slack-link-secret";
-  f.deps.directory = createDirectoryStore();
+  f.deps.directory = createPostgresDirectoryStore(testDatabaseUrl());
   await f.deps.directory.replace([
     { principalId: "work@example.test", slackId: "U123", displayName: "Alice", type: "internal" },
   ]);
@@ -313,7 +471,6 @@ test("Slack connection links verified workspace identity to the web owner and pe
 
 test("Slack link rejects changed browser accounts, wrong owner, bots, other workspaces and inactive connections", async () => {
   const { createPrincipalLinkService } = await import("../src/identity/principal-links.ts");
-  const { createDirectoryStore } = await import("../src/directory/directory-store.ts");
   const { mintSignedPayload } = await import("../src/auth/signed-token.ts");
   for (const scenario of [
     "expired",
@@ -330,9 +487,9 @@ test("Slack link rejects changed browser accounts, wrong owner, bots, other work
     await f.own();
     await f.own("bob");
     f.deps.signingSecret = "slack-test";
-    f.deps.principalLinks = createPrincipalLinkService();
-    f.deps.slackAccounts = createMemoryMap();
-    f.deps.directory = createDirectoryStore();
+    f.deps.principalLinks = createPrincipalLinkService(testUserStore(), testAdvisoryLock());
+    f.deps.slackAccounts = testMap();
+    f.deps.directory = createPostgresDirectoryStore(testDatabaseUrl());
     await f.deps.directory.replace([
       { principalId: "work@example.test", slackId: "U123", displayName: "Alice", type: "internal" },
     ]);
@@ -524,7 +681,7 @@ test("oversized provider responses are reported with their status", async () => 
 test("callback completion is browser-only and preserves the durable return URL", async () => {
   const f = fixture();
   await f.own();
-  assert.equal((await f.invoke("/v1/composio/complete-auth", { sessionUri: "opaque" }, null, privateCap)).status, 403);
+  assert.equal((await f.invoke("/v1/composio/callback?session_uri=opaque", undefined, null, privateCap)).status, 403);
   const url = "https://qm.example/s/chat?composioReturn=state";
   f.replies.push(
     { session_id: "trs_example" },
@@ -532,14 +689,40 @@ test("callback completion is browser-only and preserves the durable return URL",
   );
   assert.equal((await f.invoke("/v1/composio/authorize", { toolkit: "gmail", callbackUrl: url })).status, 200);
   f.replies.push({ connected_account_id: "ca_test", toolkit_slug: "gmail" });
-  assert.deepEqual((await f.invoke("/v1/composio/complete-auth", { sessionUri: "opaque", user_id: "bob" })).data, {
-    returnTo: url,
-  });
+  const verified = await f.invoke("/v1/composio/callback?session_uri=opaque&user_id=bob");
+  assert.deepEqual([verified.status, verified.location], [303, url]);
   assert.deepEqual(JSON.parse(f.calls[2]!.init!.body as string), {
     session_uri: "opaque",
     user_id: composioUserId(orgId(), "alice"),
   });
   assert.equal((await f.deps.composioReturns!.entries()).length, 0);
+  assert.deepEqual(
+    f.audits.filter((e) => e.action.startsWith("composio.conn")).map((e) => [e.action, e.resource]),
+    [["composio.connected", "gmail"]],
+  );
+});
+
+test("connects without a return page are still audited on completion, and failed completions too", async () => {
+  const f = fixture();
+  await f.own();
+  f.replies.push(
+    { session_id: "trs_example" },
+    { redirect_url: "https://connect.composio.dev/link/lk_test", connected_account_id: "ca_test" },
+  );
+  assert.equal((await f.invoke("/v1/composio/authorize", { toolkit: "outlook" })).status, 200);
+  f.replies.push({ connected_account_id: "ca_test" });
+  assert.equal((await f.invoke("/v1/composio/callback?session_uri=opaque")).location, SETTINGS);
+  f.replies.push(new Response("bad", { status: 400 }));
+  assert.equal((await f.invoke("/v1/composio/callback?session_uri=opaque")).status, 400);
+  assert.equal((await f.invoke("/v1/composio/callback")).status, 400);
+  assert.deepEqual(
+    f.audits.filter((e) => e.action.startsWith("composio.conn")).map((e) => [e.action, e.resource]),
+    [
+      ["composio.connected", "outlook"],
+      ["composio.connect_failed", "unknown"],
+      ["composio.connect_failed", "unknown"],
+    ],
+  );
 });
 
 test("finished runs and stale lease capabilities cannot reuse backend connection access", async () => {
@@ -577,6 +760,23 @@ test("ending the run during account lookup prevents execution", async () => {
   assert.ok(f.calls.every((call) => call.init?.method === "GET"));
 });
 
+test("ending the run during account lookup prevents disconnecting", async () => {
+  const f = fixture();
+  await f.own();
+  const original = f.deps.composioFetch!;
+  f.deps.composioFetch = async (...args) => {
+    const response = await original(...args);
+    f.deps.runs = { get: async () => ({ status: "done" }) } as unknown as ServerDeps["runs"];
+    return response;
+  };
+  f.replies.push(aliceAccount);
+  assert.equal((await f.invoke("/v1/composio/disconnect", { accountId: "ca_alice" }, null, privateCap)).status, 403);
+  assert.deepEqual(
+    f.calls.map((call) => call.init?.method),
+    ["GET"],
+  );
+});
+
 test("shared org connections recheck grants for every audience member", async () => {
   const f = fixture();
   await f.shared(false);
@@ -605,13 +805,37 @@ test("shared org connections recheck grants for every audience member", async ()
   assert.equal((await f.invoke("/v1/composio/connections", undefined, null, cap)).status, 200);
 });
 
+test("the callback redirects only within the web origin and never caches", async () => {
+  const f = fixture();
+  await f.own();
+  const key = `${composioUserId(orgId(), "alice")}:ca_test`;
+  for (const [url, status, location] of [
+    ["https://qm.example//evil.example/path", 303, "https://qm.example//evil.example/path"],
+    ["https://evil.example/path", 400, undefined],
+  ] as const) {
+    await f.deps.composioReturns!.put(key, { url, toolkit: "gmail", expiresAt: Date.now() + 60_000 });
+    f.replies.push({ connected_account_id: "ca_test" });
+    const result = await f.invoke("/v1/composio/callback?session_uri=opaque");
+    assert.deepEqual([result.status, result.location], [status, location]);
+    assert.deepEqual(result.headers, { "cache-control": "no-store", "referrer-policy": "no-referrer" });
+  }
+  assert.equal(
+    (await f.invoke("/v1/composio/callback?session_uri=opaque", undefined, "alice", undefined, true)).status,
+    403,
+  );
+});
+
 test("expired callback returns are discarded after successful browser verification", async () => {
   const f = fixture();
   await f.own();
   const key = `${composioUserId(orgId(), "alice")}:ca_test`;
-  await f.deps.composioReturns!.put(key, { url: "https://qm.example/old", expiresAt: Date.now() - 1 });
+  await f.deps.composioReturns!.put(key, {
+    url: "https://qm.example/old",
+    toolkit: "gmail",
+    expiresAt: Date.now() - 1,
+  });
   f.replies.push({ connected_account_id: "ca_test" });
-  assert.deepEqual((await f.invoke("/v1/composio/complete-auth", { sessionUri: "opaque" })).data, { returnTo: null });
+  assert.equal((await f.invoke("/v1/composio/callback?session_uri=opaque")).location, SETTINGS);
   assert.equal(await f.deps.composioReturns!.get(key), null);
 });
 
@@ -620,7 +844,7 @@ test("linked aliases can execute their existing accounts until the identity link
   const { installPrincipalLinks } = await import("../src/directory/person.ts");
   const f = fixture();
   await f.shared();
-  const links = createPrincipalLinkService();
+  const links = createPrincipalLinkService(testUserStore(), testAdvisoryLock());
   installPrincipalLinks(links);
   const aliasId = "oidc:alice";
   const aliasUserId = composioUserId(orgId(), aliasId);
@@ -656,9 +880,9 @@ test("linked account discovery and Slack status preserve historical aliases with
   const { installPrincipalLinks } = await import("../src/directory/person.ts");
   const f = fixture();
   await f.shared();
-  const links = createPrincipalLinkService();
+  const links = createPrincipalLinkService(testUserStore(), testAdvisoryLock());
   f.deps.principalLinks = links;
-  f.deps.slackAccounts = createMemoryMap();
+  f.deps.slackAccounts = testMap();
   installPrincipalLinks(links);
   const aliasId = "oidc:alice";
   const canonicalUserId = composioUserId(orgId(), "alice");
@@ -687,8 +911,8 @@ test("linked account discovery and Slack status preserve historical aliases with
     const listed = await f.invoke("/v1/composio/connections?cursor=page");
     assert.equal(listed.status, 200);
     assert.deepEqual(listed.data.items, [
-      { id: "ca_legacy", toolkit: "slack", userId: composioUserId(orgId(), aliasId) },
-      { id: "ca_current", toolkit: "slack", userId: composioUserId(orgId(), "alice") },
+      { id: "ca_legacy", toolkit: "slack", userId: composioUserId(orgId(), aliasId), missingScopes: [] },
+      { id: "ca_current", toolkit: "slack", userId: composioUserId(orgId(), "alice"), missingScopes: [] },
     ]);
     assert.equal(listed.data.nextCursor, "next");
     const query = new URL(f.calls.at(-1)!.url).searchParams;
@@ -712,7 +936,7 @@ test("unlinking an account owner during tool lookup prevents provider execution"
   const { installPrincipalLinks } = await import("../src/directory/person.ts");
   const f = fixture();
   await f.shared();
-  const links = createPrincipalLinkService();
+  const links = createPrincipalLinkService(testUserStore(), testAdvisoryLock());
   installPrincipalLinks(links);
   const aliasId = "oidc:alice";
   try {
@@ -739,7 +963,7 @@ test("consent and browser verification use the canonical identity when signed in
   const { installPrincipalLinks } = await import("../src/directory/person.ts");
   const f = fixture();
   await f.shared();
-  const links = createPrincipalLinkService();
+  const links = createPrincipalLinkService(testUserStore(), testAdvisoryLock());
   installPrincipalLinks(links);
   const aliasId = "oidc:alice";
   const userId = composioUserId(orgId(), "alice");
@@ -754,9 +978,8 @@ test("consent and browser verification use the canonical identity when signed in
     assert.equal(JSON.parse(String(f.calls[0]!.init?.body)).user_id, userId);
     assert.equal((await f.deps.composioReturns!.get(`${userId}:ca_linked`))?.url, callbackUrl);
     f.replies.push({ connected_account_id: "ca_linked", toolkit_slug: "gmail" });
-    const result = await f.invoke("/v1/composio/complete-auth", { sessionUri: "opaque" }, aliasId);
-    assert.equal(result.status, 200);
-    assert.deepEqual(result.data, { returnTo: callbackUrl });
+    const result = await f.invoke("/v1/composio/callback?session_uri=opaque", undefined, aliasId);
+    assert.deepEqual([result.status, result.location], [303, callbackUrl]);
     assert.deepEqual(JSON.parse(String(f.calls.at(-1)!.init?.body)), { session_uri: "opaque", user_id: userId });
     assert.equal((await f.deps.composioReturns!.entries()).length, 0);
   } finally {
@@ -769,8 +992,8 @@ test("linked identities retain provider accounts and Slack status until unlinked
   const { installPrincipalLinks } = await import("../src/directory/person.ts");
   const f = fixture();
   await f.shared();
-  f.deps.principalLinks = createPrincipalLinkService();
-  f.deps.slackAccounts = createMemoryMap();
+  f.deps.principalLinks = createPrincipalLinkService(testUserStore(), testAdvisoryLock());
+  f.deps.slackAccounts = testMap();
   installPrincipalLinks(f.deps.principalLinks);
   const canonical = composioUserId(orgId(), "alice");
   const alias = composioUserId(orgId(), "oidc:alice");
@@ -809,8 +1032,8 @@ test("linked identities retain provider accounts and Slack status until unlinked
     const listed = await f.invoke("/v1/composio/connections?cursor=page");
     assert.deepEqual(listed.data, {
       items: [
-        { id: "ca_old", toolkit: "slack", userId: alias },
-        { id: "ca_new", toolkit: "slack", userId: canonical },
+        { id: "ca_old", toolkit: "slack", userId: alias, missingScopes: [] },
+        { id: "ca_new", toolkit: "slack", userId: canonical, missingScopes: [] },
       ],
       nextCursor: "next",
     });
@@ -861,4 +1084,277 @@ test("authorization failures keep a redacted upstream cause for operators", asyn
   assert.match(report, /toolkit not enabled/);
   assert.match(report, /req_123/);
   assert.doesNotMatch(report, /private-key|sk-other/);
+});
+
+async function slackReplyFixture() {
+  const f = fixture();
+  await f.own();
+  f.app.getSessionForViewer = async (id, viewer) =>
+    id === "session" && viewer === "alice" ? { session: { threadRef: "ch:C123:123.456" } } : null;
+  f.deps.slackAccounts = testMap();
+  await f.deps.slackAccounts.put("alice", {
+    principalId: "alice",
+    memberId: "alice",
+    accountId: "ca_alice",
+    userId: "U123",
+    teamId: "T123",
+    user: "Alice",
+    workspace: "Test",
+  });
+  const account = {
+    id: "ca_alice",
+    user_id: composioUserId(orgId(), "alice"),
+    toolkit: { slug: "slack" },
+    status: "ACTIVE",
+  };
+  const identity = { data: { ok: true, user_id: "U123", team_id: "T123" } };
+  const message = { sessionId: "session", text: "Hello", clientMessageId: "01234567-0123-4123-8123-012345678901" };
+  return { ...f, account, identity, message };
+}
+
+test("Slack replies use only the viewer's verified user connection and server-side thread destination", async () => {
+  const f = await slackReplyFixture();
+  f.replies.push(f.account, f.identity, { data: { ok: true } }, { data: { ok: true, ts: "123.789" } });
+  const result = await f.invoke("/v1/composio/slack/reply", {
+    ...f.message,
+    channel: "CATTACK",
+    accountId: "ca_other",
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.data.sent, true);
+  const receipts = await f.deps.deliveries!.pending("web");
+  assert.equal(receipts.length, 1);
+  assert.equal(receipts[0]!.text, "Hello");
+  assert.deepEqual(receipts[0]!.destination.webTranscript, {
+    kind: "slack_reply",
+    sessionId: "session",
+    ts: "123.789",
+    name: "Alice",
+  });
+  const request = JSON.parse(String(f.calls.at(-1)!.init!.body));
+  assert.equal(request.connected_account_id, "ca_alice");
+  assert.equal(request.endpoint, "https://slack.com/api/chat.postMessage");
+  assert.deepEqual(request.body, {
+    channel: "C123",
+    thread_ts: "123.456",
+    text: "Hello",
+    client_msg_id: f.message.clientMessageId,
+    as_user: true,
+    unfurl_links: false,
+    unfurl_media: false,
+  });
+});
+
+test("Slack reply status verifies personal access without posting or checking the conversation", async () => {
+  const f = await slackReplyFixture();
+  f.replies.push(f.account, f.identity);
+  assert.equal((await f.invoke("/v1/composio/slack/reply-status", f.message)).data.connected, true);
+  assert.equal(f.calls.length, 2);
+  assert.doesNotMatch(f.calls.map((c) => String(c.init?.body)).join("\n"), /conversations\.info|chat\.postMessage/);
+});
+
+test("Slack replies cannot target hidden sessions or accept blank messages", async () => {
+  const f = await slackReplyFixture();
+  assert.equal((await f.invoke("/v1/composio/slack/reply", { ...f.message, sessionId: "hidden" })).status, 404);
+  assert.equal((await f.invoke("/v1/composio/slack/reply", { ...f.message, text: " " })).status, 400);
+  assert.equal((await f.invoke("/v1/composio/slack/reply", f.message, null)).status, 403);
+  assert.equal(f.calls.length, 0);
+});
+
+test("Slack replies require a linked user account and never fall back to the bot token", async () => {
+  const f = await slackReplyFixture();
+  await f.deps.slackAccounts!.delete("alice");
+  f.deps.slackEnvBotToken = "must-not-use";
+  assert.equal((await f.invoke("/v1/composio/slack/reply-status", f.message)).data.connected, false);
+  assert.equal((await f.invoke("/v1/composio/slack/reply", f.message)).status, 409);
+  assert.equal(f.calls.length, 0);
+});
+
+for (const [label, accountPatch, identityPatch] of [
+  ["another owner", { user_id: "other" }, {}],
+  ["revoked connection", { status: "REVOKED" }, {}],
+  ["bot token", {}, { bot_id: "B123" }],
+  ["another user", {}, { user_id: "UOTHER" }],
+  ["another workspace", {}, { team_id: "TOTHER" }],
+] as const)
+  test(`Slack replies reject ${label}`, async () => {
+    const f = await slackReplyFixture();
+    f.replies.push({ ...f.account, ...accountPatch }, { data: { ...f.identity.data, ...identityPatch } });
+    assert.equal((await f.invoke("/v1/composio/slack/reply", f.message)).status, 409);
+    assert.ok(f.calls.length <= 2);
+  });
+
+test("Slack replies preserve an uncertain send result without retrying", async () => {
+  const f = await slackReplyFixture();
+  f.replies.push(f.account, f.identity, { data: { ok: true } }, new Error("timeout"));
+  const result = await f.invoke("/v1/composio/slack/reply", f.message);
+  assert.equal(result.status, 502);
+  assert.match(result.data.message, /outcome is unknown/);
+  assert.equal(f.calls.length, 4);
+});
+
+test("Slack replies stop when the personal account cannot access the conversation", async () => {
+  const f = await slackReplyFixture();
+  f.replies.push(f.account, f.identity, { data: { ok: false, error: "channel_not_found" } });
+  assert.equal((await f.invoke("/v1/composio/slack/reply", f.message)).status, 403);
+  assert.equal(f.calls.length, 3);
+});
+
+test("Slack replies reject impersonation and agent capabilities", async () => {
+  const f = await slackReplyFixture();
+  assert.equal((await f.invoke("/v1/composio/slack/reply", f.message, "alice", undefined, true)).status, 403);
+  assert.equal((await f.invoke("/v1/composio/slack/reply", f.message, "alice", {} as CapabilityClaims)).status, 403);
+  assert.equal(f.calls.length, 0);
+});
+
+test("Slack replies preserve unthreaded DMs and report Slack permission failures", async () => {
+  const f = await slackReplyFixture();
+  f.app.getSessionForViewer = async () => ({ session: { threadRef: "dm:D123" } });
+  f.replies.push(f.account, f.identity, { data: { ok: true } }, { data: { ok: false, error: "missing_scope" } });
+  assert.equal((await f.invoke("/v1/composio/slack/reply", f.message)).status, 403);
+  const request = JSON.parse(String(f.calls.at(-1)!.init!.body));
+  assert.equal(request.body.channel, "D123");
+  assert.equal("thread_ts" in request.body, false);
+});
+
+async function nativeSlackFixture(linked = true) {
+  const f = await slackReplyFixture();
+  f.deps.slackAccounts = testMap();
+  f.deps.connectorTokens = f.deps.keychain;
+  f.deps.oauthEnv = { SLACK_OAUTH_CLIENT_ID: "native-client", SLACK_OAUTH_CLIENT_SECRET: "native-secret" };
+  f.deps.directory = createPostgresDirectoryStore(testDatabaseUrl());
+  await f.deps.directory.replace([{ principalId: "alice", slackId: "U123", displayName: "Alice", type: "internal" }]);
+  f.deps.slackEnvBotToken = "workspace-bot";
+  if (linked) await f.deps.connectorTokens!.setConnectorToken("slack.com", "alice", { accessToken: "alice-user" });
+  const nativeCalls: Array<{ method: string; token: string; payload?: object }> = [];
+  const nativeReplies: unknown[] = [];
+  f.deps.slackWebClient = (token, options) => {
+    assert.equal(options.retryConfig?.retries, 0);
+    assert.equal(options.rejectRateLimitedCalls, true);
+    return {
+      async apiCall(method, payload) {
+        nativeCalls.push({ method, token, payload });
+        if (token === "workspace-bot") return { ok: true, team_id: "T123" };
+        const value = nativeReplies.shift();
+        if (value instanceof Error) throw value;
+        if ((value as { ok?: boolean })?.ok === false)
+          throw Object.assign(new Error("Slack API error"), { code: "slack_webapi_platform_error", data: value });
+        return value as { ok: boolean };
+      },
+    };
+  };
+  const nativeIdentity = { ok: true, user_id: "U123", team_id: "T123", user: "Alice", team: "Test" };
+  return { ...f, nativeCalls, nativeReplies, nativeIdentity };
+}
+
+test("native Slack replies use the authenticated user's token and server destination without Composio", async () => {
+  const f = await nativeSlackFixture();
+  f.nativeReplies.push(f.nativeIdentity, { ok: true }, { ok: true, ts: "123.789" });
+  const result = await f.invoke("/v1/composio/slack/reply", { ...f.message, channel: "COTHER" });
+  assert.equal(result.data.sent, true);
+  const receipts = await f.deps.deliveries!.pending("web");
+  assert.equal(receipts.length, 1);
+  assert.equal(receipts[0]!.text, "Hello");
+  assert.deepEqual(receipts[0]!.destination.webTranscript, {
+    kind: "slack_reply",
+    sessionId: "session",
+    ts: "123.789",
+    name: "Alice",
+  });
+  assert.equal(f.calls.length, 0);
+  const sent = f.nativeCalls.at(-1)!;
+  assert.equal(sent.method, "chat.postMessage");
+  assert.equal(sent.token, "alice-user");
+  assert.deepEqual(sent.payload, {
+    channel: "C123",
+    thread_ts: "123.456",
+    text: "Hello",
+    client_msg_id: f.message.clientMessageId,
+    as_user: true,
+    unfurl_links: false,
+    unfurl_media: false,
+  });
+});
+
+test("native Slack rejects bot, wrong person, and wrong workspace tokens", async () => {
+  for (const invalid of [{ bot_id: "B123" }, { user_id: "UOTHER" }, { team_id: "TOTHER" }]) {
+    const f = await nativeSlackFixture();
+    f.nativeReplies.push({ ...f.nativeIdentity, ...invalid });
+    const result = await f.invoke("/v1/composio/slack/reply", f.message);
+    assert.equal(result.status, 409);
+    assert.equal(
+      f.nativeCalls.some((c) => c.method === "chat.postMessage"),
+      false,
+    );
+  }
+});
+
+test("native Slack connection status and linking work without a Composio credential", async () => {
+  const f = await nativeSlackFixture(false);
+  f.deps.keychain = undefined;
+  f.deps.serviceCreds = undefined;
+  assert.deepEqual((await f.invoke("/v1/composio/slack")).data, {
+    connected: false,
+    nativeOAuth: true,
+    workspaceInstalled: true,
+  });
+  assert.equal((await f.invoke("/v1/composio/slack/reply-status", { sessionId: "session" })).data.connected, false);
+  await f.deps.connectorTokens!.setConnectorToken("slack.com", "alice", { accessToken: "alice-user" });
+  f.nativeReplies.push(f.nativeIdentity);
+  assert.equal((await f.invoke("/v1/composio/slack")).data.connected, true);
+});
+
+test("configured native OAuth preserves an existing Composio connection", async () => {
+  const f = await nativeSlackFixture(false);
+  await f.deps.slackAccounts!.put("alice", {
+    principalId: "alice",
+    memberId: "alice",
+    accountId: "ca_alice",
+    userId: "U123",
+    teamId: "T123",
+    user: "Alice",
+    workspace: "Test",
+  });
+  f.replies.push(f.account);
+  assert.equal((await f.invoke("/v1/composio/slack")).data.connected, true);
+  f.replies.push(f.account, f.identity, { data: { ok: true } }, { data: { ok: true, ts: "123.789" } });
+  assert.equal((await f.invoke("/v1/composio/slack/reply", f.message)).data.sent, true);
+  assert.equal(f.nativeCalls.length, 0);
+});
+
+test("native Slack access denial and uncertain sends never fall through to another transport", async () => {
+  for (const sending of [false, true]) {
+    const f = await nativeSlackFixture();
+    f.nativeReplies.push(f.nativeIdentity, { ok: sending });
+    if (sending) f.nativeReplies.push(new Error("timeout"));
+    const result = await f.invoke("/v1/composio/slack/reply", f.message);
+    assert.equal(result.status, sending ? 502 : 403);
+    if (sending) assert.match(result.data.message, /outcome is unknown/);
+    assert.equal(f.calls.length, 0);
+  }
+});
+
+test("a confirmed Slack send is distinguished from a failed transcript write", async () => {
+  const f = await slackReplyFixture();
+  f.deps.deliveries!.enqueue = async () => {
+    throw new Error("database unavailable");
+  };
+  f.replies.push(f.account, f.identity, { data: { ok: true } }, { data: { ok: true, ts: "123.789" } });
+  const result = await f.invoke("/v1/composio/slack/reply", f.message);
+  assert.equal(result.status, 502);
+  assert.equal(result.data.error, "transcript_unavailable");
+  assert.match(result.data.message, /Slack sent your message.*Do not resend/);
+});
+
+test("Slack reply failures redact both provider credentials from diagnostics", async (t) => {
+  const logged: string[] = [];
+  t.mock.method(console, "error", (...args: unknown[]) => logged.push(args.map(String).join(" ")));
+  const composio = await slackReplyFixture();
+  composio.replies.push(new Response("provider rejected private-key", { status: 502 }));
+  assert.equal((await composio.invoke("/v1/composio/slack/reply", composio.message)).status, 502);
+  const native = await nativeSlackFixture();
+  native.nativeReplies.push(new Error("provider rejected alice-user"));
+  assert.equal((await native.invoke("/v1/composio/slack/reply", native.message)).status, 502);
+  assert.match(logged.join("\n"), /provider rejected/);
+  assert.doesNotMatch(logged.join("\n"), /private-key|alice-user/);
 });

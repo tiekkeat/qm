@@ -1,9 +1,9 @@
 import type { Deployment, DeploymentVersion } from "./deploy-store.ts";
 import type { DeployEndpoint, DeployProvider } from "./deploy-provider.ts";
-import { spawnDockerExec, type DockerExec } from "../sandbox/docker-exec.ts";
+import { dockerContainerNetworks, ensureDockerNetwork, spawnDockerExec, type DockerExec } from "../sandbox/docker-exec.ts";
 import { errMessage } from "../util/errors.ts";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import { redactSecrets } from "../harness/redact-secrets.ts";
+import { redactSecrets } from "../util/redact-secrets.ts";
 import {
   appBoot,
   appGone,
@@ -16,9 +16,9 @@ import {
 } from "./shared-deploy-provider.ts";
 
 const APP_PORT = 8080;
+const LEGACY_NETWORK = "agent-deploynet";
 const APP_READY_WINDOW_SEC = 60;
 const RUN_TIMEOUT_MS = 300_000;
-const LEGACY_NETWORK = "agent-deploynet";
 const DAEMON_PROBE_TIMEOUT_MS = 10_000;
 const APP_READY_TIMEOUT_MS = 30_000;
 
@@ -81,6 +81,7 @@ export function createDockerDeployProvider(opts: DockerDeployProviderOptions = {
       dexec(["exec", name(d), "sh", "-c", script], timeoutSec * 1000);
   const checked = recentAppChecks();
   const network = (d: Deployment) => `${name(d)}-net`;
+  const exists = async (d: Deployment) => (await dockerContainerNetworks(dexec, name(d))) !== null;
   const dataVolume = (d: Deployment) => `${name(d)}-data`;
   const endpoint = (d: Deployment, hostPort: number): DeployEndpoint =>
     opts.coreContainer ? { host: name(d), port: APP_PORT } : { host: "127.0.0.1", port: hostPort };
@@ -137,6 +138,7 @@ export function createDockerDeployProvider(opts: DockerDeployProviderOptions = {
           signal: AbortSignal.timeout(2_000),
         });
         await response.body?.cancel();
+        if (response.status >= 500) throw new Error(`deployment returned HTTP ${response.status}`);
         return;
       } catch (error) {
         lastProbeError = error;
@@ -150,15 +152,7 @@ export function createDockerDeployProvider(opts: DockerDeployProviderOptions = {
       { cause: new Error(redactSecrets(errMessage(lastProbeError))) },
     );
   };
-  const ensureNetwork = async (net: string): Promise<string> => {
-    if ((await dexec(["network", "inspect", net])).code !== 0) {
-      const r = await dexec(["network", "create", net]);
-      if (r.code !== 0 && !/already exists/i.test(r.stderr)) {
-        throw new Error(`docker network create ${net} failed: ${r.stderr.trim()}`);
-      }
-    }
-    return net;
-  };
+  const ensureNetwork = (net: string) => ensureDockerNetwork(dexec, net);
 
   const migrateContainer = async (container: string): Promise<boolean> => {
     if (!(await running(container))) return false;
@@ -247,19 +241,19 @@ export function createDockerDeployProvider(opts: DockerDeployProviderOptions = {
           windowSec: APP_READY_WINDOW_SEC,
           report: appReporter(opts.onError, d, version.env),
         });
+        await connectCore(net);
+        await waitReady(name(d), address);
       } catch (e) {
         await dexec(["rm", "-f", name(d)]);
         await dexec(["network", "rm", net]);
         freePort(name(d));
         throw e;
       }
-      await connectCore(net);
-      await waitReady(name(d), address);
       return address;
     },
 
     async logs(d: Deployment, opts: { tailLines: number }): Promise<string | null> {
-      if (!(await migrateTarget(name(d)))) return null;
+      if (!(await exists(d))) return null;
       return appLogs(execIn(d), opts.tailLines);
     },
 
@@ -271,6 +265,7 @@ export function createDockerDeployProvider(opts: DockerDeployProviderOptions = {
     },
 
     async resolveEndpoint(d, version): Promise<DeployEndpoint | null> {
+      if (!(await exists(d))) return null;
       if (!(await migrateTarget(name(d)))) return null;
       if (checked.has(d.id)) return endpoint(d, d.endpoint?.port ?? 0);
       const report = appReporter(opts.onError, d, version.env);

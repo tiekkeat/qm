@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { createPgPool } from "../persistence/pg-pool.ts";
+import { createPgPool, definePgMigration } from "../persistence/pg-pool.ts";
 import type { LoginPolicy, PasswordTicket } from "../../plugins/chassis/src/accounts.ts";
 
 interface PasswordAccount {
@@ -40,7 +40,7 @@ const ticket = (row: Record<string, unknown>): PasswordTicket => ({
   ...(row.invite_id ? { inviteId: String(row.invite_id) } : {}),
 });
 export function createPostgresAccounts(connectionString: string, org: string): AccountStore {
-  const pg = createPgPool(connectionString, "auth/accounts/0001", SCHEMA);
+  const pg = createPgPool(connectionString, [definePgMigration({ id: "auth/accounts/0001", statements: SCHEMA })]);
   return {
     async policy() {
       return (

@@ -1,24 +1,28 @@
+import { item } from "./item-fixture.ts";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { harness, SESSION } from "./deep-link-boot-fixture.ts";
 
 for (const count of [1, 2]) {
   test(`${count} tool items use only useful activity folds`, async () => {
-    const entries = Array.from({ length: count }, (_, index) => [
-      {
+    const items = Array.from({ length: count }, (_, index) => [
+      item("ToolCall", {
         seq: index * 2,
-        type: "tool_call",
         createdAt: 1000,
-        payload: { tool: "execute", callId: String(index), command: `echo ${index}` },
-      },
-      {
+        tool: "execute",
+        callId: String(index),
+        body: { command: `echo ${index}` },
+      }),
+      item("ToolResult", {
         seq: index * 2 + 1,
-        type: "tool_result",
         createdAt: 2000,
-        payload: { tool: "execute", callId: String(index), code: 0, result: String(index) },
-      },
+        tool: "execute",
+        callId: String(index),
+        text: String(index),
+        body: { code: 0 },
+      }),
     ]).flat();
-    const h = await harness({ path: `/s/${SESSION.id}`, listSessions: [SESSION], entries });
+    const h = await harness({ path: `/s/${SESSION.id}`, listSessions: [SESSION], items });
     try {
       h.releaseSessions();
       await h.boot();
@@ -36,11 +40,9 @@ for (const count of [1, 2]) {
 }
 
 test("a subagent header includes its parent title in the breadcrumb", async () => {
-  const parent = { ...SESSION, id: "parent", title: "Build report" };
-  const h = await harness({
-    path: `/s/${SESSION.id}`,
-    listSessions: [parent, { ...SESSION, parentSessionId: parent.id }],
-  });
+  const parent = { ...SESSION, id: "parent", threadRef: "web:tester:parent", title: "Build report" };
+  const child = { ...SESSION, type: "dm" as const, createdAt: 1, parentSessionId: parent.id };
+  const h = await harness({ path: `/s/${SESSION.id}`, session: child, listSessions: [parent, child] });
   try {
     h.releaseSessions();
     await h.boot();
@@ -55,29 +57,32 @@ test("a subagent header includes its parent title in the breadcrumb", async () =
 
 test("steering separates tool folds with a visible unlabelled user message", async () => {
   const tool = (seq: number) => [
-    {
+    item("ToolCall", {
       seq,
-      type: "tool_call",
       createdAt: seq * 1000,
-      payload: { tool: "execute", callId: String(seq), command: `echo step-${seq}` },
-    },
-    {
+      tool: "execute",
+      callId: String(seq),
+      body: { command: `echo step-${seq}` },
+    }),
+    item("ToolResult", {
       seq: seq + 1,
-      type: "tool_result",
       createdAt: (seq + 1) * 1000,
-      payload: { tool: "execute", callId: String(seq), code: 0, result: String(seq) },
-    },
+      tool: "execute",
+      callId: String(seq),
+      text: String(seq),
+      body: { code: 0 },
+    }),
   ];
-  const entries = [
-    { seq: 0, type: "user", createdAt: 0, payload: { text: "Original request" } },
+  const items = [
+    item("UserMessage", { seq: 0, createdAt: 0, text: "Original request" }),
     ...tool(1),
     ...tool(3),
-    { seq: 5, type: "user", createdAt: 5000, payload: { text: "Use the smaller sample", steered: true } },
+    item("SteeringMessage", { seq: 5, createdAt: 5000, text: "Use the smaller sample" }),
     ...tool(6),
     ...tool(8),
-    { seq: 10, type: "assistant", createdAt: 10000, payload: { text: "Done" } },
+    item("AgentMessage", { seq: 10, createdAt: 10000, text: "Done" }),
   ];
-  const h = await harness({ path: `/s/${SESSION.id}`, listSessions: [SESSION], entries });
+  const h = await harness({ path: `/s/${SESSION.id}`, listSessions: [SESSION], items });
   try {
     h.releaseSessions();
     await h.boot();
@@ -121,16 +126,16 @@ test("steering separates tool folds with a visible unlabelled user message", asy
 });
 
 test("stopping a steered run preserves earlier singleton tools and labels only its last segment stopped", async () => {
-  const entries = [
-    { seq: 0, type: "user", createdAt: 0, payload: { text: "Original request" } },
-    { seq: 1, type: "tool_call", createdAt: 1000, payload: { tool: "execute", callId: "a", command: "echo before" } },
-    { seq: 2, type: "tool_result", createdAt: 2000, payload: { tool: "execute", callId: "a", code: 0 } },
-    { seq: 3, type: "user", createdAt: 3000, payload: { text: "Change direction", steered: true } },
-    { seq: 4, type: "tool_call", createdAt: 4000, payload: { tool: "execute", callId: "b", command: "echo after" } },
-    { seq: 5, type: "tool_result", createdAt: 5000, payload: { tool: "execute", callId: "b", code: 0 } },
-    { seq: 6, type: "assistant", createdAt: 6000, payload: { text: "(stopped)", stopped: true } },
+  const items = [
+    item("UserMessage", { seq: 0, createdAt: 0, text: "Original request" }),
+    item("ToolCall", { seq: 1, createdAt: 1000, tool: "execute", callId: "a", body: { command: "echo before" } }),
+    item("ToolResult", { seq: 2, createdAt: 2000, tool: "execute", callId: "a", body: { code: 0 } }),
+    item("SteeringMessage", { seq: 3, createdAt: 3000, text: "Change direction" }),
+    item("ToolCall", { seq: 4, createdAt: 4000, tool: "execute", callId: "b", body: { command: "echo after" } }),
+    item("ToolResult", { seq: 5, createdAt: 5000, tool: "execute", callId: "b", body: { code: 0 } }),
+    item("Stop", { seq: 6, createdAt: 6000, body: { reason: "by user" } }),
   ];
-  const h = await harness({ path: `/s/${SESSION.id}`, listSessions: [SESSION], entries });
+  const h = await harness({ path: `/s/${SESSION.id}`, listSessions: [SESSION], items });
   try {
     h.releaseSessions();
     await h.boot();
@@ -142,6 +147,46 @@ test("stopping a steered run preserves earlier singleton tools and labels only i
     assert.ok(tools[1]!.closest(".stopped-work"));
     assert.equal(document.querySelectorAll(".stopped-head").length, 1);
     assert.equal(document.querySelector(".inline-steer")!.closest("details"), null);
+  } finally {
+    await h.close();
+  }
+});
+
+test("a steer the model has not read shows once in the transcript, then once inside the work", async () => {
+  const items = [
+    item("UserMessage", { seq: 0, createdAt: 0, text: "Original request" }),
+    item("ToolCall", { seq: 1, createdAt: 1000, tool: "execute", callId: "a", body: { command: "echo a" } }),
+    item("ToolResult", { seq: 2, createdAt: 2000, tool: "execute", callId: "a", body: { code: 0 } }),
+  ];
+  const h = await harness({ path: `/s/${SESSION.id}`, listSessions: [SESSION], items });
+  try {
+    h.releaseSessions();
+    await h.boot();
+    await h.sessionsReady();
+    const conv = h.visibleConversation();
+    let waiting = [{ runId: "q1", text: "Use the smaller sample" }];
+    conv.composer.waitingSteers = () => waiting;
+    conv.drawActiveChat();
+    const row = document.querySelector(".message-stack > .waiting-steer")!;
+    assert.ok(row);
+    assert.equal(document.querySelectorAll(".inline-steer").length, 1);
+    assert.ok(row.querySelector(".steered-row .user-bubble"));
+    assert.equal(
+      row.querySelector<HTMLElement & { content: string }>("qm-markdown")?.content,
+      "Use the smaller sample",
+    );
+    assert.equal(document.querySelector(".queued-chip"), null);
+    waiting = [];
+    conv.state.agent!.state.messages.push({
+      role: "user",
+      content: "Use the smaller sample",
+      steered: true,
+      entrySeq: 3,
+      timestamp: 3000,
+    } as never);
+    conv.drawActiveChat();
+    assert.equal(document.querySelectorAll(".waiting-steer").length, 0);
+    assert.equal(document.querySelectorAll(".message-stack > .steered-row").length, 0);
   } finally {
     await h.close();
   }

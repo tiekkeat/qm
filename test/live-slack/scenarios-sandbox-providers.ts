@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import type { SandboxBackendName } from "../../src/sandbox/sandbox-routing.ts";
-import { isObj } from "../../src/util/objects.ts";
+import { redactSecrets } from "../../plugins/chassis/src/redact-secrets.ts";
+import type { Item } from "../../src/sessions/items.ts";
+import { headSlice, tailSlice } from "../../src/util/text.ts";
 import type { Scenario } from "./harness.ts";
 
 const providerCoverage: Record<SandboxBackendName, true> = {
@@ -14,33 +16,45 @@ const providerCoverage: Record<SandboxBackendName, true> = {
   porter: true,
   agent37: true,
   superserve: true,
+  render: true,
   "do-managed-agents": true,
 };
 
 export const sandboxProviders = Object.keys(providerCoverage) as SandboxBackendName[];
 
-export function succeededWithStdout(p: Record<string, unknown>, stdout: string): boolean {
-  const structured = "code" in p || "timedOut" in p || "action" in p;
+function succeededWithStdout(item: Item, stdout: string): boolean {
+  const body = item.body;
+  const structured = "code" in body || "timedOut" in body || "action" in body;
   return (
-    p.isError === false && p.result === `${stdout}\n[exit 0]` && (!structured || (p.code === 0 && p.timedOut === false))
+    item.isError === false &&
+    item.text === `${stdout}\n[exit 0]` &&
+    (!structured || (body.code === 0 && body.timedOut === false))
   );
 }
 
-export function assertSandboxExecution(entries: readonly unknown[], sandboxId: string, stdout: string): void {
+function describeExecuteResult(item: Item): string {
+  const result = item.text === null ? null : redactSecrets(item.text);
+  const shown = result !== null && result.length > 400 ? `${headSlice(result, 150)}…${tailSlice(result, 250)}` : result;
+  return JSON.stringify({ isError: item.isError, code: item.body.code, timedOut: item.body.timedOut, result: shown });
+}
+
+export function assertSandboxExecution(items: readonly Item[], sandboxId: string, stdout: string): void {
   const calls = new Set<string>();
+  const unmatched: string[] = [];
   let executed = false;
-  for (const entry of entries) {
-    if (!isObj(entry) || !isObj(entry.payload)) continue;
-    const p = entry.payload;
-    if (p.tool !== "execute" || p.background === true || typeof p.callId !== "string") continue;
-    if (entry.type === "tool_call" && p.background !== true && p.sandbox_id === sandboxId) {
-      calls.add(p.callId);
+  for (const item of items) {
+    if (item.tool !== "execute" || item.body.background === true || !item.callId) continue;
+    if (item.kind === "ToolCall" && item.body.sandbox_id === sandboxId) {
+      calls.add(item.callId);
       continue;
     }
-    if (entry.type === "tool_result" && calls.has(p.callId) && succeededWithStdout(p, stdout)) executed = true;
+    if (item.kind !== "ToolResult" || !calls.has(item.callId)) continue;
+    if (succeededWithStdout(item, stdout)) executed = true;
+    else unmatched.push(describeExecuteResult(item));
   }
   assert.ok(calls.size, `no execute call targeted ${sandboxId}`);
-  assert.ok(executed, `no successful execute result with exact stdout on ${sandboxId}`);
+  const seen = unmatched.length ? `; results: ${unmatched.join(" | ")}` : "; no result recorded";
+  assert.ok(executed, `no successful execute result with exact stdout on ${sandboxId}${seen}`);
 }
 
 export const sandboxProviderScenarios: Scenario[] = sandboxProviders.map((backend) => ({
@@ -73,7 +87,7 @@ export const sandboxProviderScenarios: Scenario[] = sandboxProviders.map((backen
       await ch.waitForBotReply(root, { timeoutMs: 3 * 60_000 });
       const session = await core.findSessionByThread(ch.id, root);
       assert.ok(session, `no session for ${backend} execution`);
-      assertSandboxExecution(session.entries, sandbox.id, `${left}${right}\n`);
+      assertSandboxExecution(session.items, sandbox.id, `${left}${right}\n`);
     } catch (error) {
       failures.push(error);
     }

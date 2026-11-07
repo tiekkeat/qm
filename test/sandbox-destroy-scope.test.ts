@@ -1,9 +1,5 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { createLocalWorkspaceStore } from "../src/workspace/workspace-store.ts";
 import {
   createLocalSandbox,
   localContainerName,
@@ -18,34 +14,56 @@ import { sandboxScopeName } from "../src/sandbox/exec-sandbox-base.ts";
 import { installFakeSmolmachines } from "./support/fake-smolmachines.ts";
 import { installFakeSprites } from "./support/fake-sprites.ts";
 import { installFakeAgent37 } from "./support/fake-agent37.ts";
-
-const workspace = () => createLocalWorkspaceStore(mkdtempSync(join(tmpdir(), "destroy-scope-")));
+import { installFakeDocker } from "./support/fake-docker.ts";
+import { singleProcessDeps } from "./support/single-process.ts";
+import { testAdvisoryLock, testMap } from "./support/test-database.ts";
 
 test("Local scope deletion removes deterministic resources without provisioning, tolerates absence and propagates failures", async () => {
   const calls: string[][] = [];
   let fail = false;
-  const sandbox = createLocalSandbox(workspace(), {
+  const sandbox = createLocalSandbox({
     dockerExec: async (args) => {
       calls.push(args);
-      return { code: 1, stdout: "", stderr: fail ? "daemon unavailable" : "No such object" };
+      return fail ? { code: 1, stdout: "", stderr: "daemon unavailable" } : { code: 0, stdout: "", stderr: "" };
     },
   });
   await sandbox.destroyScope!("missing");
   assert.deepEqual(calls, [
     ["rm", "-f", localContainerName("missing")],
-    ["network", "rm", localNetworkName(localContainerName("missing"))],
-    ["volume", "rm", localVolumeName("missing")],
+    ["network", "rm", "-f", localNetworkName(localContainerName("missing"))],
+    ["volume", "rm", "-f", localVolumeName("missing")],
   ]);
   fail = true;
   await assert.rejects(sandbox.destroyScope!("missing"), /daemon unavailable/);
   assert.equal(calls.length, 4);
 });
 
+test("Local scope deletion fails a refused core disconnect only while the core is still attached", async () => {
+  const fake = installFakeDocker(0);
+  const network = localNetworkName(localContainerName("scope"));
+  const sandbox = createLocalSandbox({
+    coreContainer: "qm-core",
+    dockerExec: async (args) =>
+      args[1] === "disconnect" ? { code: 1, stdout: "", stderr: "is not connected" } : fake.dockerExec(args),
+  });
+  fake.connections.add(`other-net|qm-core`);
+  await sandbox.destroyScope!("scope");
+  fake.networks.add(network);
+  fake.connections.add(`${network}|qm-core`);
+  await assert.rejects(sandbox.destroyScope!("scope"), /network disconnect .*: is not connected/);
+  assert.equal(fake.networks.has(network), true);
+});
+
 test("Sprites scope deletion sends only DELETE, retries provider errors, and accepts missing bodies", async () => {
   const fake = installFakeSprites();
   try {
-    const sandbox = createSpritesSandbox(workspace(), { token: "test", baseUrl: fake.baseUrl });
-    await sandbox.provision([{ scopeId: "scope", mountPath: "", mode: "rw" }]);
+    const sandbox = createSpritesSandbox({
+      initializationStore: testMap(),
+      advisoryLock: testAdvisoryLock(),
+      token: "test",
+      baseUrl: fake.baseUrl,
+    });
+    await sandbox.provision("scope");
     fake.calls.length = 0;
     fake.refuseDelete(503);
     await assert.rejects(sandbox.destroyScope!("scope"), /503/);
@@ -71,7 +89,9 @@ for (const [name, create, resource] of [
     const calls: string[] = [];
     let status = 503;
     let exists = true;
-    const sandbox = create(workspace(), {
+    const sandbox = create({
+      ...singleProcessDeps(),
+      store: testMap(),
       token: "test",
       fetchImpl: async (input, init) => {
         const path = new URL(String(input)).pathname;
@@ -101,7 +121,7 @@ for (const [name, create, resource] of [
 test("Local deletion retries remaining disk cleanup after partial failure without creating a container", async () => {
   const calls: string[][] = [];
   let volumeBusy = true;
-  const sandbox = createLocalSandbox(workspace(), {
+  const sandbox = createLocalSandbox({
     dockerExec: async (args) => {
       calls.push(args);
       return args[0] === "volume" && volumeBusy
@@ -124,13 +144,12 @@ for (const [name, create, install] of [
   test(`${name} stale adapter deletes another adapter's replacement for the same scope`, async () => {
     const fake = install();
     try {
-      const options = { token: "test-token", fetchImpl: fake.fetchImpl };
-      const a = create(workspace(), options);
-      const b = create(workspace(), options);
-      const layers = [{ scopeId: "replaced", mountPath: "", mode: "rw" as const }];
-      await a.provision(layers);
+      const options = { ...singleProcessDeps(), token: "test-token", fetchImpl: fake.fetchImpl };
+      const a = create({ ...options, store: testMap() });
+      const b = create({ ...options, store: testMap() });
+      await a.provision("replaced");
       await b.destroyScope!("replaced");
-      await b.provision(layers);
+      await b.provision("replaced");
       assert.equal(fake.names().length, 1);
       const callsBefore = fake.calls.length;
       await a.destroyScope!("replaced");

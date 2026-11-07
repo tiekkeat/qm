@@ -1,18 +1,23 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
-const patch = join(root, "vendor/pi-ai/provider-error.patch");
+const patches = ["provider-error", "served-tier", "served-tier-types"].map((name) =>
+  join(root, `vendor/pi-ai/${name}.patch`),
+);
 const installer = join(root, "scripts/patch-pi-ai.mjs");
-const paths = [...readFileSync(patch, "utf8").matchAll(/^--- a\/(.+)$/gm)].map((match) => match[1]!);
+const paths = [
+  ...new Set(
+    patches.flatMap((patch) => [...readFileSync(patch, "utf8").matchAll(/^--- a\/(.+)$/gm)].map((match) => match[1]!)),
+  ),
+];
 
 test("Pi installation patch applies to a clean package and is idempotent", (t) => {
-  const work = mkdtempSync(join(tmpdir(), "qm-pi-patch-"));
+  const work = mkdtempSync(join(root, "node_modules/.qm-pi-patch-"));
   t.after(() => rmSync(work, { recursive: true, force: true }));
   const target = join(work, "node_modules/@earendil-works/pi-ai");
   mkdirSync(target, { recursive: true });
@@ -21,7 +26,8 @@ test("Pi installation patch applies to a clean package and is idempotent", (t) =
     mkdirSync(dirname(join(target, path)), { recursive: true });
     cpSync(join(root, "node_modules/@earendil-works/pi-ai", path), join(target, path));
   }
-  execFileSync("git", ["apply", "--unsafe-paths", `--directory=${target}`, "--reverse", patch]);
+  for (const patch of [...patches].reverse())
+    execFileSync("git", ["apply", "--unsafe-paths", `--directory=${target}`, "--reverse", patch]);
   execFileSync(process.execPath, [installer], { cwd: work });
   const contents = paths.map((path) => readFileSync(join(target, path), "utf8"));
   execFileSync(process.execPath, [installer], { cwd: work });

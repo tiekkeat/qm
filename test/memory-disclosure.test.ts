@@ -1,6 +1,5 @@
 import { createSemanticMemoryService } from "../src/memory/semantic-recall.ts";
 import { createCurrentScopeMembers } from "../src/resolution/scope-membership.ts";
-import { createDirectoryStore } from "../src/directory/directory-store.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { disclosedMemory, MemoryDisclosureDenied, type MemoryDisclosure } from "../src/memory/disclosure.ts";
@@ -8,6 +7,8 @@ import { MemoryFactsMissing, renderFacts, type MemoryFact } from "../src/memory/
 import { createRoutedMemoryService } from "../src/memory/provider-router.ts";
 import type { MemoryService } from "../src/memory/memory-service.ts";
 import { recallText } from "./support/recall-text.ts";
+import { createPostgresDirectoryStore } from "../src/directory/postgres-directory-store.ts";
+import { testDatabaseUrl } from "./support/test-database.ts";
 
 const actor = { id: "alice", type: "internal" as const };
 const bob = { id: "bob", type: "internal" as const };
@@ -273,7 +274,7 @@ test("source decisions are shared within one read but never cached across reads"
 });
 
 test("complete memory audience rejects external or unresolved members rather than dropping them", async () => {
-  const directory = createDirectoryStore();
+  const directory = createPostgresDirectoryStore(testDatabaseUrl());
   await directory.replace([{ principalId: "alice", displayName: "Alice", type: "internal" }]);
   await directory.replaceChannels(
     [{ channelId: "room", name: "room", isPrivate: true }],
@@ -323,8 +324,11 @@ test("semantic recall ranks only currently disclosed facts and rechecks membersh
   const queries: string[][] = [];
   const semantic = createSemanticMemoryService(f.raw, async () => ({ id: "test", embed: async () => [[1, 0]] }), {
     async search(input) {
-      queries.push(input.facts.map((fact) => fact.id));
-      return input.facts.map((fact) => ({ factId: fact.id, hash: fact.hash, score: 1 }));
+      queries.push([...input.ids]);
+      const facts = f.notebooks.get(input.scope) ?? [];
+      return facts
+        .filter((fact) => input.ids.includes(fact.id))
+        .map((fact) => ({ factId: fact.id, updatedAt: fact.updatedAt, score: 1 }));
     },
   });
   const view = disclosedMemory(semantic, f.access);

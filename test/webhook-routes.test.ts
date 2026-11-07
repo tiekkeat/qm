@@ -1,4 +1,5 @@
 import "./support/auto-fake-sprites.ts";
+import { settle } from "./support/settle.ts";
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -9,8 +10,10 @@ import type { AddressInfo } from "node:net";
 import { createHmac } from "node:crypto";
 import { createInsecureTestServer, createServer } from "../src/api/server.ts";
 import { signRequest } from "../src/auth/source-auth.ts";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { testConfig } from "./support/test-config.ts";
+import { createPostgresReplayDedupe } from "../src/auth/replay-dedupe.ts";
+import { testDatabaseUrl } from "./support/test-database.ts";
 
 const SECRET = "core-signing-secret".repeat(3);
 const HOOK_SECRET = "hook-secret";
@@ -19,7 +22,7 @@ function start(signingSecret?: string, publicUrl?: string): { base: string; clos
   const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "wh-")) }));
   const deps = { ...(publicUrl ? { publicUrl } : {}), webhookReceiver: built.webhookReceiver };
   const server = signingSecret
-    ? createServer(built.app, { ...deps, signingSecret })
+    ? createServer(built.app, { replayDedupe: createPostgresReplayDedupe(testDatabaseUrl()), ...deps, signingSecret })
     : createInsecureTestServer(built.app, deps);
   server.listen(0);
   return {
@@ -270,19 +273,23 @@ test("signed webhook history enforces viewer permissions and links to an owner-r
     assert.equal(accepted.status, 202);
     const historyPath = `/v1/webhooks/${webhook.id}/events?viewer=U1`;
     let events: Array<{ sessionId?: string; payload: string }> = [];
-    for (let i = 0; i < 100; i++) {
+    await settle(async () => {
       const history = await fetch(`${srv.base}${historyPath}`, { headers: sign("GET", historyPath, "") });
       ({ events } = (await history.json()) as { events: typeof events });
-      if (events[0]?.sessionId) break;
-      await new Promise((r) => setTimeout(r, 10));
-    }
+      return Boolean(events[0]?.sessionId);
+    });
     assert.equal(events.length, 1);
     assert.ok(events[0]?.sessionId);
     assert.match(events[0]!.payload, /agent message for worklog/);
     const sessionPath = `/v1/sessions/${events[0]!.sessionId}?viewer=U1`;
-    const worklog = await fetch(`${srv.base}${sessionPath}`, { headers: sign("GET", sessionPath, "") });
-    assert.equal(worklog.status, 200);
-    assert.match(JSON.stringify(await worklog.json()), /agent message for worklog/);
+    let worklog = "";
+    await settle(async () => {
+      const res = await fetch(`${srv.base}${sessionPath}`, { headers: sign("GET", sessionPath, "") });
+      assert.equal(res.status, 200);
+      worklog = JSON.stringify(await res.json());
+      return /agent message for worklog/.test(worklog);
+    });
+    assert.match(worklog, /agent message for worklog/);
     const otherPath = `/v1/sessions/${events[0]!.sessionId}?viewer=U2`;
     assert.equal((await fetch(`${srv.base}${otherPath}`, { headers: sign("GET", otherPath, "") })).status, 404);
   } finally {

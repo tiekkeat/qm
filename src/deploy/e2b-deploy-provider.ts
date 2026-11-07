@@ -16,8 +16,8 @@ import {
 } from "./shared-deploy-provider.ts";
 import { makeTar } from "../sandbox/tar.ts";
 import { E2bSandboxGoneError, runE2bScript, type E2bClient, type E2bSession } from "../sandbox/e2b-client.ts";
-import { createMemoryMap, type DurableMap } from "../persistence/durable-map.ts";
-import { createNoopAdvisoryLock, type AdvisoryLock } from "../persistence/advisory-lock.ts";
+import type { DurableMap } from "../persistence/durable-map.ts";
+import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
 import { createKeyedQueue } from "../util/async.ts";
 import { shq } from "../util/shell.ts";
 import { execFailure, swallow } from "../util/errors.ts";
@@ -50,8 +50,8 @@ export interface E2bDeployProviderOptions {
   readyWindowSec?: number;
   idleTimeoutSec?: number;
   resolveCacheMs?: number;
-  store?: DurableMap<StoredE2bDeployBody>;
-  advisoryLock?: AdvisoryLock;
+  store: DurableMap<StoredE2bDeployBody>;
+  advisoryLock: AdvisoryLock;
   onError?: AppErrorSink;
 }
 
@@ -62,8 +62,8 @@ export function createE2bDeployProvider(opts: E2bDeployProviderOptions): DeployP
   const readyWindowSec = opts.readyWindowSec ?? READY_WINDOW_SEC_DEFAULT;
   const idleTimeoutMs = (opts.idleTimeoutSec ?? E2B_DEPLOY_IDLE_TIMEOUT_SEC) * 1000;
   const resolveCacheMs = opts.resolveCacheMs ?? RESOLVE_CACHE_MS_DEFAULT;
-  const store = opts.store ?? createMemoryMap<StoredE2bDeployBody>();
-  const advisoryLock = opts.advisoryLock ?? createNoopAdvisoryLock();
+  const store = opts.store;
+  const advisoryLock = opts.advisoryLock;
   const queue = createKeyedQueue<string>();
   const resolveCache = new LRUCache<string, DeployEndpoint>({
     max: RESOLVE_CACHE_MAX,
@@ -159,7 +159,6 @@ export function createE2bDeployProvider(opts: E2bDeployProviderOptions): DeployP
           timeoutMs: d.alwaysOn ? ALWAYS_ON_TIMEOUT_MS : idleTimeoutMs,
           autoPause: true,
           autoResume: true,
-          privateTraffic: true,
         });
         try {
           await install(d, session, version);

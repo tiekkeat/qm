@@ -1,15 +1,17 @@
 import { html, nothing, render, type TemplateResult } from "lit";
 import { CornerDownLeft, Search } from "lucide";
-import { api, userSendMessage, type CoreSession } from "./core-bridge";
+import { api, fetchSessionRow, userSendMessage } from "./core-bridge";
 import { startNewChat } from "./sessions";
 import { recencyGroup } from "./session-list";
 import { searchGroup } from "./search-group";
 import { slackWireToPlain, stripSlackDirectives } from "./slack-text";
-import { openSession, refreshSessions, sessionsState, sessionTitle } from "./sessions";
+import { sessionsState, sessionTitle } from "./sessions";
+import { openSessionAtMessage } from "./open-message";
 import { destinations } from "./browse";
 import { UI_BASE } from "./deep-link";
 import { resourceResults, matchResources, type ResourceHit, type ResourceSearchResponse } from "./search-resources";
 import { icon } from "./icons";
+import { swallow, swallowAs } from "../../chassis/src/errors.ts";
 
 interface ChatSearchHit {
   sessionId: string;
@@ -163,8 +165,9 @@ async function runSearch(q: string): Promise<void> {
     }
     searchState.hits = hits;
     searchState.failed = false;
-  } catch {
+  } catch (e) {
     if (seq !== fetchSeq || ctl.signal.aborted) return;
+    swallow("web-ui: chat search", e);
     searchState.hits = [];
     searchState.failed = true;
   }
@@ -190,8 +193,9 @@ async function runResourceSearch(q: string, ctl: AbortController, seq: number): 
     searchState.resources = result.hits;
     searchState.resourcesLimited = Boolean(response.limited?.length);
     searchState.resourceFailures = result.failed;
-  } catch {
+  } catch (e) {
     if (seq !== fetchSeq || ctl.signal.aborted) return;
+    swallow("web-ui: resource search", e);
     searchState.resourceFailures = ["resources"];
   }
   searchState.resourcesLoading = false;
@@ -254,15 +258,13 @@ function scrollSelectedIntoView(): void {
 }
 
 async function openHit(hit: ChatSearchHit): Promise<void> {
-  const find = (): CoreSession | undefined => sessionsState.list.find((s) => s.id === hit.sessionId);
-  let session = find();
-  if (!session) {
-    await refreshSessions({ silent: true });
-    session = find();
-  }
-  if (!session) return;
   closeChatSearch();
-  await openSession(session);
+  await openSessionAtMessage(
+    hit.sessionId,
+    hit.entryType === "title" ? null : hit.seq,
+    () => fetchSessionRow({ id: hit.sessionId }).catch(swallowAs("web-ui: open search hit", null)),
+    "push",
+  );
 }
 
 function askQm(): void {

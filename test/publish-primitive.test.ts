@@ -9,18 +9,20 @@ import { createDeployStore, type DeployStore, type Deployment } from "../src/dep
 import { createDeployService, type DeployService, type DeployOrUpdateInput } from "../src/deploy/deploy-service.ts";
 import { readTree } from "../src/deploy/deploy-fs.ts";
 import { createAclStore, type AclStore } from "../src/acl/acl-store.ts";
-import { createMemoryConfigStore } from "../src/resolution/config-store.ts";
-import type { ToolLedger } from "../src/runs/tool-ledger.ts";
 import { CapabilityUnsupportedError } from "../src/sandbox/sandbox.ts";
 import type { AgentComputerExportEntry, Sandbox, SandboxHandle } from "../src/sandbox/sandbox.ts";
 import { scopeId } from "../src/types.ts";
+import { singleProcessDeps } from "./support/single-process.ts";
+import { testConfigStore, testDeployBackings, testDatabaseUrl } from "./support/test-database.ts";
+import { createPostgresGrantStore } from "../src/acl/postgres-grant-store.ts";
 
 function svc() {
-  const deployStore: DeployStore = createDeployStore();
-  const acl: AclStore = createAclStore();
+  const deployStore: DeployStore = createDeployStore(testDeployBackings());
+  const acl: AclStore = createAclStore(createPostgresGrantStore(testDatabaseUrl()));
   let starts = 0;
   const appliedSnapshots: string[] = [];
   const deploy: DeployService = createDeployService({
+    ...singleProcessDeps(),
     deployStore,
     provider: {
       profile: { managedScaleToZero: false },
@@ -50,9 +52,7 @@ interface CtxOpts {
   files?: Array<{ path: string; data: Uint8Array; mode?: number }>;
   sandbox?: Sandbox;
   provision?: () => Promise<SandboxHandle>;
-  ledger?: ToolLedger;
   runId?: string;
-  rw?: boolean;
   splitEnv?: Record<string, string>;
 }
 
@@ -77,15 +77,14 @@ function ctx(deploy: DeployService, opts: CtxOpts = {}) {
   return createToolContext({
     sandbox,
     provision: opts.provision ?? (async () => ({}) as SandboxHandle),
-    layers: opts.rw === false ? [] : [{ scopeId: scopeId("personal", "U1"), mountPath: "", mode: "rw" }],
+    writableScopeId: scopeId("personal", "U1"),
+    readOnlyScopeIds: [],
     commandPolicy: () => ({}) as never,
     authorizeCommand: () => false,
     grantedHandles: [],
-    workspace: {} as never,
     deploy,
     acl: {} as never,
     createdBy: "U1",
-    ...(opts.ledger ? { ledger: opts.ledger } : {}),
     ...(opts.runId ? { runId: opts.runId } : {}),
     ...(opts.splitEnv
       ? { actingSlackUserId: "U1", layerAuth: { credentialPaths: [], splitEnvTemplates: [opts.splitEnv] } }
@@ -315,11 +314,11 @@ test("publish: a different scope claiming a taken name is rejected", async () =>
   const other = createToolContext({
     sandbox: fileSandbox(appFile()),
     provision: async () => ({}) as SandboxHandle,
-    layers: [{ scopeId: scopeId("personal", "U2"), mountPath: "", mode: "rw" }],
+    writableScopeId: scopeId("personal", "U2"),
+    readOnlyScopeIds: [],
     commandPolicy: () => ({}) as never,
     authorizeCommand: () => false,
     grantedHandles: [],
-    workspace: {} as never,
     deploy: s.deploy,
     acl: {} as never,
     createdBy: "U2",
@@ -391,11 +390,11 @@ test("publish collects the app tree as ONE archive (not file-by-file)", async ()
   const tc = createToolContext({
     sandbox,
     provision: async () => ({}) as SandboxHandle,
-    layers: [{ scopeId: scopeId("personal", "U1"), mountPath: "", mode: "rw" }],
+    writableScopeId: scopeId("personal", "U1"),
+    readOnlyScopeIds: [],
     commandPolicy: () => ({}) as never,
     authorizeCommand: () => false,
     grantedHandles: [],
-    workspace: {} as never,
     deploy,
     acl: {} as never,
     createdBy: "U1",
@@ -423,11 +422,11 @@ test("publish FAILS LOUDLY on a flaky archive read — it never silently drops f
   const tc = createToolContext({
     sandbox,
     provision: async () => ({}) as SandboxHandle,
-    layers: [{ scopeId: scopeId("personal", "U1"), mountPath: "", mode: "rw" }],
+    writableScopeId: scopeId("personal", "U1"),
+    readOnlyScopeIds: [],
     commandPolicy: () => ({}) as never,
     authorizeCommand: () => false,
     grantedHandles: [],
-    workspace: {} as never,
     deploy: s.deploy,
     acl: {} as never,
     createdBy: "U1",
@@ -459,11 +458,11 @@ test("publish on a sandbox WITHOUT exportFiles (AWS) still collects the tree, an
     const tc = createToolContext({
       sandbox: awsLike((p) => files.find((f) => f.path === p)?.data ?? null),
       provision: async () => ({}) as SandboxHandle,
-      layers: [{ scopeId: scopeId("personal", "U1"), mountPath: "", mode: "rw" }],
+      writableScopeId: scopeId("personal", "U1"),
+      readOnlyScopeIds: [],
       commandPolicy: () => ({}) as never,
       authorizeCommand: () => false,
       grantedHandles: [],
-      workspace: {} as never,
       deploy,
       acl: {} as never,
       createdBy: "U1",
@@ -481,11 +480,11 @@ test("publish on a sandbox WITHOUT exportFiles (AWS) still collects the tree, an
     const tc = createToolContext({
       sandbox: awsLike((p) => (p === "app/ok.txt" ? null : (files.find((f) => f.path === p)?.data ?? null))),
       provision: async () => ({}) as SandboxHandle,
-      layers: [{ scopeId: scopeId("personal", "U1"), mountPath: "", mode: "rw" }],
+      writableScopeId: scopeId("personal", "U1"),
+      readOnlyScopeIds: [],
       commandPolicy: () => ({}) as never,
       authorizeCommand: () => false,
       grantedHandles: [],
-      workspace: {} as never,
       deploy: s.deploy,
       acl: {} as never,
       createdBy: "U1",
@@ -536,35 +535,6 @@ test("publish: rollbackTo flips the named deployment's pointer", async () => {
   assert.equal((await s.deployStore.getByName("roll"))!.currentVersion, 1);
 });
 
-test("publish is ledgered (G6): a crash-replay returns the cached result, not a second deploy", async () => {
-  const s = svc();
-  const seen = new Map<string, string>();
-  const ledger: ToolLedger = {
-    async begin(runId, attempt, i) {
-      const key = `${runId}:${attempt}:${i}`;
-      return seen.has(key) ? { cached: true, output: seen.get(key)! } : { cached: false };
-    },
-    async record(runId, attempt, i, output) {
-      seen.set(`${runId}:${attempt}:${i}`, output);
-    },
-  };
-  const files = [{ path: "app/s.js", data: bytes("x") }];
-  const r1 = await ctx(s.deploy, { files, ledger, runId: "r1" }).publish({
-    dir: "app",
-    entrypoint: "x",
-    name: "once-app",
-  });
-  const r2 = await ctx(s.deploy, { files, ledger, runId: "r1" }).publish({
-    dir: "app",
-    entrypoint: "x",
-    name: "once-app",
-  });
-
-  assert.deepEqual(r2, r1, "replay returns the cached PublishResult");
-  assert.equal((await s.deployStore.list()).length, 1, "no second deployment created");
-  assert.equal(s.starts, 1, "the container was started exactly once");
-});
-
 test("publish never copies resident credentials into the deployment", async () => {
   const home: AgentComputerExportEntry[] = [
     { area: "home", path: ".aws/credentials", data: bytes("[default]") },
@@ -600,11 +570,11 @@ test("publish never copies resident credentials into the deployment", async () =
   const tc = createToolContext({
     sandbox,
     provision: async () => ({}) as SandboxHandle,
-    layers: [{ scopeId: scopeId("personal", "U1"), mountPath: "", mode: "rw" }],
+    writableScopeId: scopeId("personal", "U1"),
+    readOnlyScopeIds: [],
     commandPolicy: () => ({}) as never,
     authorizeCommand: () => false,
     grantedHandles: [],
-    workspace: {} as never,
     deploy,
     acl: {} as never,
     createdBy: "U1",
@@ -669,16 +639,16 @@ const RESIDENT_HOME: AgentComputerExportEntry[] = [
 ];
 
 test("publish always splits: bakes NO resident creds and injects no acting-as env", async () => {
-  const config = createMemoryConfigStore("default-org");
+  const config = testConfigStore("default-org");
   const { deploy, captured } = spyDeploy();
   const tc = createToolContext({
     sandbox: exportSandbox(RESIDENT_HOME),
     provision: async () => ({}) as SandboxHandle,
-    layers: [{ scopeId: scopeId("personal", "U1"), mountPath: "", mode: "rw" }],
+    writableScopeId: scopeId("personal", "U1"),
+    readOnlyScopeIds: [],
     commandPolicy: () => ({}) as never,
     authorizeCommand: () => false,
     grantedHandles: [],
-    workspace: {} as never,
     deploy,
     acl: {} as never,
     createdBy: "U1",
@@ -691,7 +661,7 @@ test("publish always splits: bakes NO resident creds and injects no acting-as en
   assert.equal(c.env, undefined, "the layer never injects an acting-as env; identity rides the broker token");
 });
 
-test("publish rejects an invalid or id-shaped name, and a turn with no writable scope", async () => {
+test("publish rejects an invalid or id-shaped name", async () => {
   const s = svc();
   await assert.rejects(
     () => ctx(s.deploy, { files: appFile() }).publish({ entrypoint: "x", name: "Bad_Name" }),
@@ -701,10 +671,6 @@ test("publish rejects an invalid or id-shaped name, and a turn with no writable 
     () =>
       ctx(s.deploy, { files: appFile() }).publish({ entrypoint: "x", name: "00000000-0000-4000-8000-000000000000" }),
     /looks like an id/,
-  );
-  await assert.rejects(
-    () => ctx(s.deploy, { rw: false }).publish({ entrypoint: "x", name: "noscope" }),
-    /writable scope/,
   );
 });
 

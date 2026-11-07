@@ -1,7 +1,6 @@
-import { migrateInbox } from "../../loops/inbox-migration.ts";
-import { canonicalPerson } from "../../directory/person.ts";
-import { scopeId, type Loop } from "../../types.ts";
-import { ensureDefaultInboxLoops, findInboxLoop } from "../../loops/inbox-loop.ts";
+import { scopeId } from "../../types.ts";
+import type { Loop, LoopItem } from "../../loops/types.ts";
+import { ensureDefaultInboxLoops } from "../../loops/inbox-loop.ts";
 import {
   compareKeys,
   consolidates,
@@ -17,28 +16,93 @@ import { cronSummary } from "./loop-items.ts";
 import { isObj } from "./shared.ts";
 import type { ApiCtx, Route } from "./route.ts";
 
-async function inbox(ctx: ApiCtx): Promise<void> {
+interface InboxView {
+  status: number;
+  body: Record<string, unknown>;
+}
+
+function reply(status: number, body: Record<string, unknown>): InboxView {
+  return { status, body };
+}
+
+async function refreshSlackAvatars(
+  ctx: ApiCtx,
+  deps: NonNullable<ReturnType<typeof loopDeps>>,
+  actorId: string,
+  page: Array<Omit<LoopItem, "proposal" | "agentDrafts" | "thread" | "sourcePayload">>,
+  loopsById: Map<string, Loop>,
+): Promise<void> {
+  if (ctx.method === "GET" && ctx.deps.inboxSourceRefresh) {
+    const slack = (
+      await Promise.all(
+        page
+          .filter(
+            (item) =>
+              item.source === "slack" &&
+              loopsById.get(item.loopId)?.owner === actorId &&
+              !(
+                typeof item.inboxPreview?.slackAvatarsRefreshAt === "number" &&
+                Date.now() < item.inboxPreview.slackAvatarsRefreshAt
+              ),
+          )
+          .map((item) => deps.items.get(item.id)),
+      )
+    ).filter((item) => item !== null);
+    await ctx.deps.inboxSourceRefresh(actorId, slack, "avatars");
+    for (const refreshed of await Promise.all(slack.map((item) => deps.items.get(item.id)))) {
+      const summary = page.find((entry) => entry.id === refreshed?.id);
+      if (summary && refreshed && refreshed.sourceAt === summary.sourceAt)
+        summary.inboxPreview = { ...summary.inboxPreview, participants: refreshed.sourcePayload?.participants };
+    }
+  }
+}
+
+async function selectedLoopView(
+  ctx: ApiCtx,
+  deps: NonNullable<ReturnType<typeof loopDeps>>,
+  loop: Loop,
+  summaries: Array<{ loopId: string; source?: string }>,
+  counts: Map<string, number>,
+): Promise<Record<string, unknown>> {
+  return {
+    id: loop.id,
+    name: loop.name,
+    icon: loop.icon,
+    sources: [
+      ...new Set([
+        ...(loop.sources ?? []),
+        ...summaries.filter((item) => item.loopId === loop.id).flatMap((item) => (item.source ? [item.source] : [])),
+      ]),
+    ],
+    count: counts.get(loop.id) ?? 0,
+    state: loop.state,
+    cronId: loop.cronId,
+    syncCron: loop.cronId ? cronSummary((await deps.crons?.get(loop.cronId)) ?? null) : null,
+    ingestionActive: (await ctx.deps.loopIngress?.list(loop.id))?.some((source) => source.enabled) ?? false,
+    source: loop.surface?.startsWith("inbox:") ? loop.sources?.[0] : undefined,
+    prioritize: prioritizes(loop),
+    consolidate: consolidates(loop),
+  };
+}
+
+export async function inboxView(ctx: ApiCtx): Promise<InboxView | null> {
   const deps = loopDeps(ctx);
   const preferences = ctx.deps.uiState;
-  if (!deps || !preferences) return sendJson(ctx.res, 503, { error: "inbox_unavailable" });
+  if (!deps || !preferences) return reply(503, { error: "inbox_unavailable" });
   const acting = actingPrincipal(ctx);
-  if (!acting) return;
+  if (!acting) return null;
   if (!(await ctx.deps.featureFlags?.enabled("inbox_loops", scopeId("personal", acting.actorId))))
-    return sendJson(ctx.res, 403, { error: "feature_disabled" });
-  if (ctx.capability && ctx.capability.privateScope !== true) return sendJson(ctx.res, 403, { error: "forbidden" });
+    return reply(403, { error: "feature_disabled" });
+  if (ctx.capability && ctx.capability.privateScope !== true) return reply(403, { error: "forbidden" });
   const defaults = await ensureDefaultInboxLoops(deps.store, acting.actorId);
-  const legacy = await findInboxLoop(deps.store, acting.actorId);
-  const migrated = legacy ? await migrateInbox(deps, preferences, legacy, defaults) : true;
-  const legacyItems = legacy ? await deps.items.summaries([legacy.id]) : [];
   const id = uiStateId(acting.actorId, "inbox-loops");
   const pref = await preferences.putIfAbsent(id, {
-    value: [...defaults.map((loop) => loop.id), ...(legacy && (!migrated || legacyItems.length) ? [legacy.id] : [])],
+    value: defaults.map((loop) => loop.id),
     updatedAt: Date.now(),
   });
   const available: Loop[] = [];
   for (const loop of await deps.store.list()) {
-    if (loop.id === legacy?.id && migrated && legacyItems.length === 0) continue;
-    if (await canAdministerLoop(ctx, loop, acting)) available.push(loop);
+    if (loop.state !== "archived" && (await canAdministerLoop(ctx.app, loop, acting.actorId))) available.push(loop);
   }
   let ids = Array.isArray(pref.value) ? pref.value.filter((value): value is string => typeof value === "string") : [];
   if (ctx.method === "PUT") {
@@ -48,11 +112,10 @@ async function inbox(ctx: ApiCtx): Promise<void> {
       body.loopIds.length > 100 ||
       body.loopIds.some((value) => typeof value !== "string")
     ) {
-      return sendJson(ctx.res, 400, { error: "invalid_selection" });
+      return reply(400, { error: "invalid_selection" });
     }
     ids = [...new Set(body.loopIds as string[])];
-    if (ids.some((value) => !available.some((loop) => loop.id === value)))
-      return sendJson(ctx.res, 403, { error: "forbidden" });
+    if (ids.some((value) => !available.some((loop) => loop.id === value))) return reply(403, { error: "forbidden" });
     await preferences.put(id, { value: ids, updatedAt: Date.now() });
   }
   const selected = ids.flatMap((value) => available.filter((loop) => loop.id === value));
@@ -61,12 +124,12 @@ async function inbox(ctx: ApiCtx): Promise<void> {
     const mailLoops = selected.filter(
       (loop) =>
         loop.owner === acting.actorId &&
-        (loop.surface === "inbox" || loop.surface?.startsWith("inbox:")) &&
+        loop.surface?.startsWith("inbox:") &&
         (!loop.sources?.length || loop.sources.includes("gmail")),
     );
     const mail = (await Promise.all(mailLoops.map((loop) => deps.items.byLoop(loop.id))))
       .flat()
-      .filter((item) => !isResolved(item) && (item.source ?? item.sourcePayload?.source) === "gmail");
+      .filter((item) => !isResolved(item) && item.source === "gmail");
     await ctx.deps.inboxSourceRefresh(acting.actorId, mail);
   }
   const summaries = (await deps.items.summaries(selectedIds, { includeInboxMetadata: true })).filter(
@@ -75,8 +138,8 @@ async function inbox(ctx: ApiCtx): Promise<void> {
   const itemId = ctx.url.searchParams.get("itemId");
   if (itemId) {
     const item = await deps.items.get(itemId);
-    if (!item || !selectedIds.includes(item.loopId)) return sendJson(ctx.res, 404, { error: "not_found" });
-    return sendJson(ctx.res, 200, {
+    if (!item || !selectedIds.includes(item.loopId)) return reply(404, { error: "not_found" });
+    return reply(200, {
       item: ledgerItemView(
         item,
         selected.find((loop) => loop.id === item.loopId)!,
@@ -86,7 +149,7 @@ async function inbox(ctx: ApiCtx): Promise<void> {
   }
   const requestedFilter = ctx.url.searchParams.get("filter");
   if (requestedFilter !== null && !["all", "human", "triaged"].includes(requestedFilter))
-    return sendJson(ctx.res, 400, { error: "invalid_filter" });
+    return reply(400, { error: "invalid_filter" });
   const savedFilter = requestedFilter ?? (await preferences.get(uiStateId(acting.actorId, "inbox-filter")))?.value;
   const inboxFilter = savedFilter === "all" || savedFilter === "triaged" ? savedFilter : "human";
   const handled = ctx.url.searchParams.get("view") === "handled";
@@ -132,62 +195,18 @@ async function inbox(ctx: ApiCtx): Promise<void> {
     try {
       value = JSON.parse(Buffer.from(cursor, "base64url").toString());
     } catch {
-      return sendJson(ctx.res, 400, { error: "invalid_cursor" });
+      return reply(400, { error: "invalid_cursor" });
     }
     if (!Array.isArray(value) || value.some((part) => typeof part !== "number" && typeof part !== "string"))
-      return sendJson(ctx.res, 400, { error: "invalid_cursor" });
+      return reply(400, { error: "invalid_cursor" });
     const after = value as Array<number | string>;
     feed = feed.filter((item) => compareKeys(keys.get(item.id)!, after) > 0);
   }
   const page = feed.slice(0, 40);
   const last = page.at(-1);
-  if (ctx.method === "GET" && ctx.deps.inboxSourceRefresh) {
-    const slack = (
-      await Promise.all(
-        page
-          .filter(
-            (item) =>
-              item.source === "slack" &&
-              loopsById.get(item.loopId)?.owner === acting.actorId &&
-              !(
-                typeof item.inboxPreview?.slackAvatarsRefreshAt === "number" &&
-                Date.now() < item.inboxPreview.slackAvatarsRefreshAt
-              ),
-          )
-          .map((item) => deps.items.get(item.id)),
-      )
-    ).filter((item) => item !== null);
-    await ctx.deps.inboxSourceRefresh(acting.actorId, slack, "avatars");
-    for (const refreshed of await Promise.all(slack.map((item) => deps.items.get(item.id)))) {
-      const summary = page.find((entry) => entry.id === refreshed?.id);
-      if (summary && refreshed && refreshed.sourceAt === summary.sourceAt)
-        summary.inboxPreview = { ...summary.inboxPreview, participants: refreshed.sourcePayload?.participants };
-    }
-  }
-  sendJson(ctx.res, 200, {
-    selected: await Promise.all(
-      selected.map(async (loop) => ({
-        id: loop.id,
-        name: loop.name,
-        icon: loop.icon,
-        sources: [
-          ...new Set([
-            ...(loop.sources ?? []),
-            ...summaries
-              .filter((item) => item.loopId === loop.id)
-              .flatMap((item) => (item.source ? [item.source] : [])),
-          ]),
-        ],
-        count: counts.get(loop.id) ?? 0,
-        state: loop.state,
-        cronId: loop.cronId,
-        syncCron: loop.cronId ? cronSummary((await deps.crons?.get(loop.cronId)) ?? null) : null,
-        ingestionActive: (await ctx.deps.loopIngress?.list(loop.id))?.some((source) => source.enabled) ?? false,
-        source: loop.surface?.startsWith("inbox:") ? loop.sources?.[0] : undefined,
-        prioritize: prioritizes(loop),
-        consolidate: consolidates(loop),
-      })),
-    ),
+  await refreshSlackAvatars(ctx, deps, acting.actorId, page, loopsById);
+  return reply(200, {
+    selected: await Promise.all(selected.map((loop) => selectedLoopView(ctx, deps, loop, summaries, counts))),
     available: available.map((loop) => ({
       id: loop.id,
       name: loop.name,
@@ -196,7 +215,6 @@ async function inbox(ctx: ApiCtx): Promise<void> {
       source: loop.surface?.startsWith("inbox:") ? loop.sources?.[0] : undefined,
       selected: selectedIds.includes(loop.id),
     })),
-    migrationPending: !migrated,
     filter: inboxFilter,
     total: [...counts.values()].reduce((sum, count) => sum + count, 0),
     items: page.map((item) =>
@@ -216,37 +234,23 @@ async function inbox(ctx: ApiCtx): Promise<void> {
   });
 }
 
+async function inbox(ctx: ApiCtx): Promise<void> {
+  const view = await inboxView(ctx);
+  if (view) sendJson(ctx.res, view.status, view.body);
+}
+
+export async function inboxPreviewEnabled(deps: ApiCtx["deps"], principalId: string): Promise<boolean> {
+  return (await deps.featureFlags?.enabled("inbox_loops", scopeId("personal", principalId))) === true;
+}
+
 async function access(ctx: ApiCtx): Promise<void> {
   const acting = actingPrincipal(ctx);
   if (!acting) return;
-  sendJson(ctx.res, 200, {
-    enabled: (await ctx.deps.featureFlags?.enabled("inbox_loops", scopeId("personal", acting.actorId))) === true,
-  });
-}
-
-async function viewers(ctx: ApiCtx): Promise<void> {
-  if (ctx.capability || ctx.actor) return sendJson(ctx.res, 403, { error: "forbidden" });
-  const body = isObj(ctx.body) ? ctx.body : {};
-  const loop = typeof body.loopId === "string" ? await loopDeps(ctx)?.store.get(body.loopId) : undefined;
-  if (!loop) return sendJson(ctx.res, 404, { error: "not_found" });
-  const candidates = Array.isArray(body.candidates)
-    ? [...new Set(body.candidates.filter((value): value is string => typeof value === "string"))]
-    : [];
-  const identity = ctx.deps.identity;
-  await identity?.refresh();
-  const allowed = await Promise.all(
-    candidates.map(
-      async (id) =>
-        (!identity || identity.classify(id).type === "internal") &&
-        canAdministerLoop(ctx, loop, { actorId: canonicalPerson(id), liveHuman: false }),
-    ),
-  );
-  sendJson(ctx.res, 200, { viewers: candidates.filter((_, i) => allowed[i]) });
+  sendJson(ctx.res, 200, { enabled: await inboxPreviewEnabled(ctx.deps, acting.actorId) });
 }
 
 export const inboxRoutes: ReadonlyArray<Route<ApiCtx>> = [
-  { method: "GET", path: "/v1/inbox", auth: "source", handle: inbox },
-  { method: "POST", path: "/v1/inbox/viewers", auth: "source", handle: viewers },
-  { method: "GET", path: "/v1/inbox/access", auth: "source", handle: access },
-  { method: "PUT", path: "/v1/inbox", auth: "source", handle: inbox },
+  { method: "GET", path: "/v1/inbox", actor: "query.principalId", auth: "source", handle: inbox },
+  { method: "GET", path: "/v1/inbox/access", actor: "query.principalId", auth: "source", handle: access },
+  { method: "PUT", path: "/v1/inbox", actor: "query.principalId", auth: "source", handle: inbox },
 ];

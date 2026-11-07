@@ -4,6 +4,7 @@ import { createDockerDeployProvider, dockerDaemonFailure } from "../src/deploy/d
 import { createDeployStore } from "../src/deploy/deploy-store.ts";
 import type { DockerExec } from "../src/sandbox/docker-exec.ts";
 import { scopeId } from "../src/types.ts";
+import { testDeployBackings } from "./support/test-database.ts";
 
 test("Docker deployments use isolated networks and remove them on destroy", async () => {
   const calls: string[][] = [];
@@ -16,7 +17,7 @@ test("Docker deployments use isolated networks and remove them on destroy", asyn
       stderr: args[1] === "inspect" ? "No such network" : "",
     };
   };
-  const store = createDeployStore();
+  const store = createDeployStore(testDeployBackings());
   const first = await store.create({
     ownerScopeId: scopeId("personal", "U1"),
     createdBy: "U1",
@@ -50,7 +51,7 @@ test("containerized core mounts its host snapshot, routes over a private network
   const calls: string[][] = [];
   let running = true;
   let probed = "";
-  const store = createDeployStore();
+  const store = createDeployStore(testDeployBackings());
   const deployment = await store.create({
     ownerScopeId: scopeId("personal", "U1"),
     createdBy: "U1",
@@ -61,6 +62,7 @@ test("containerized core mounts its host snapshot, routes over a private network
   const net = `${name}-net`;
   const dockerExec: DockerExec = async (args) => {
     calls.push(args);
+    if (args[0] === "ps") return { code: 0, stdout: `${name}\t${net}\n`, stderr: "" };
     if (args[0] === "inspect" && args[2] === "{{json .Mounts}}")
       return { code: 0, stdout: JSON.stringify([{ Source: "/host/core-data", Destination: "/data" }]), stderr: "" };
     if (args[0] === "inspect" && args[2] === "{{.State.Running}}")
@@ -100,7 +102,7 @@ test("containerized core mounts its host snapshot, routes over a private network
 });
 
 test("containerized core refuses snapshots outside its Docker mounts", async () => {
-  const store = createDeployStore();
+  const store = createDeployStore(testDeployBackings());
   const deployment = await store.create({
     ownerScopeId: scopeId("personal", "U1"),
     createdBy: "U1",
@@ -120,7 +122,7 @@ test("containerized core refuses snapshots outside its Docker mounts", async () 
 });
 
 test("Docker publish reports startup errors from an exited app", async () => {
-  const store = createDeployStore();
+  const store = createDeployStore(testDeployBackings());
   const deployment = await store.create({
     ownerScopeId: scopeId("personal", "U1"),
     createdBy: "U1",
@@ -145,6 +147,7 @@ test("Docker provider migrates running deployments off the legacy shared network
   let legacyAttached = true;
   const dockerExec: DockerExec = async (args) => {
     calls.push(args);
+    if (args[0] === "ps") return { code: 0, stdout: `${containerName}\tbridge\n`, stderr: "" };
     if (args.join(" ") === "network inspect --format {{range .Containers}}{{println .Name}}{{end}} agent-deploynet") {
       return { code: 0, stdout: legacyAttached ? `${containerName}\n` : "", stderr: "" };
     }
@@ -169,7 +172,7 @@ test("Docker provider migrates running deployments off the legacy shared network
     }
     return { code: 0, stdout: "", stderr: "" };
   };
-  const store = createDeployStore();
+  const store = createDeployStore(testDeployBackings());
   const deployment = await store.create({
     ownerScopeId: scopeId("personal", "U1"),
     createdBy: "U1",
@@ -208,7 +211,7 @@ test("an unrelated legacy migration failure does not block a new deployment", as
     if (args[0] === "network" && args[1] === "inspect") return { code: 1, stdout: "", stderr: "missing" };
     return { code: 0, stdout: "", stderr: "" };
   };
-  const store = createDeployStore();
+  const store = createDeployStore(testDeployBackings());
   const deployment = await store.create({
     ownerScopeId: scopeId("personal", "U1"),
     createdBy: "U1",
@@ -225,10 +228,10 @@ test("a transient target inspection failure does not report the deployment missi
     if (args.join(" ") === "network inspect --format {{range .Containers}}{{println .Name}}{{end}} agent-deploynet") {
       return { code: 1, stdout: "", stderr: "No such network" };
     }
-    if (args[0] === "inspect") return { code: 1, stdout: "", stderr: "daemon unavailable" };
+    if (args[0] === "inspect" || args[0] === "ps") return { code: 1, stdout: "", stderr: "daemon unavailable" };
     return { code: 0, stdout: "", stderr: "" };
   };
-  const store = createDeployStore();
+  const store = createDeployStore(testDeployBackings());
   const deployment = await store.create({
     ownerScopeId: scopeId("personal", "U1"),
     createdBy: "U1",
@@ -240,6 +243,56 @@ test("a transient target inspection failure does not report the deployment missi
   const provider = createDockerDeployProvider({ dockerExec });
 
   await assert.rejects(provider.resolveEndpoint!(running, running.versions[0]!), /daemon unavailable/);
+});
+
+test("a deployment is missing unless docker lists a container with exactly its name", async () => {
+  const dockerExec: DockerExec = async (args) => {
+    if (args[0] === "ps") return { code: 0, stdout: "agent-deploy-other\tbridge\n", stderr: "" };
+    return { code: 1, stdout: "", stderr: "daemon unavailable" };
+  };
+  const store = createDeployStore(testDeployBackings());
+  const deployment = await store.create({
+    ownerScopeId: scopeId("personal", "U1"),
+    createdBy: "U1",
+    entrypoint: "node server.js",
+    snapshotDir: "/snap/gone",
+  });
+  await store.setEndpoint(deployment.id, { host: "127.0.0.1", port: 9200 });
+  const running = (await store.get(deployment.id))!;
+  const provider = createDockerDeployProvider({ dockerExec });
+
+  assert.equal(await provider.resolveEndpoint!(running, running.versions[0]!), null);
+  assert.equal(await provider.logs!(running, { tailLines: 10 }), null);
+});
+
+test("a deployment network created concurrently is reused, and a create that leaves none fails", async () => {
+  let networkExists = false;
+  let createLeavesNetwork = true;
+  const dockerExec: DockerExec = async (args) => {
+    if (args[0] === "inspect" && args[2] === "{{.State.Running}}") return { code: 0, stdout: "true\n", stderr: "" };
+    if (args[0] === "network" && args[1] === "inspect") return { code: networkExists ? 0 : 1, stdout: "", stderr: "" };
+    if (args[0] === "network" && args[1] === "create") {
+      networkExists = createLeavesNetwork;
+      return { code: 1, stdout: "", stderr: "network with name x already exists" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const store = createDeployStore(testDeployBackings());
+  const deployment = await store.create({
+    ownerScopeId: scopeId("personal", "U1"),
+    createdBy: "U1",
+    entrypoint: "node server.js",
+    snapshotDir: "/snap/race",
+  });
+  const provider = createDockerDeployProvider({ dockerExec, fetchImpl: async () => new Response() });
+
+  await assert.doesNotReject(provider.apply(deployment, deployment.versions[0]!));
+  networkExists = false;
+  createLeavesNetwork = false;
+  await assert.rejects(
+    provider.apply(deployment, deployment.versions[0]!),
+    /network create .* failed: .*already exists/,
+  );
 });
 
 test("the daemon probe reports nothing when Docker answers", async () => {
@@ -296,7 +349,7 @@ test("a Docker app that only answers 5xx fails publish, reports its output and l
     return { code: 0, stdout: "", stderr: "" };
   };
   const reported: Array<{ code: string; message: string }> = [];
-  const store = createDeployStore();
+  const store = createDeployStore(testDeployBackings());
   const d = await store.create({
     ownerScopeId: scopeId("personal", "U1"),
     createdBy: "U1",
@@ -314,7 +367,7 @@ test("a Docker app that only answers 5xx fails publish, reports its output and l
 });
 
 test("Docker startup timeout retains a redacted probe cause and bounded app logs", async (t) => {
-  const store = createDeployStore();
+  const store = createDeployStore(testDeployBackings());
   const deployment = await store.create({
     ownerScopeId: scopeId("personal", "U1"),
     createdBy: "U1",

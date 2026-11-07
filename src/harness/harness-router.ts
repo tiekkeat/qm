@@ -40,7 +40,7 @@ function inputTokens(result: HarnessTurnResult): number {
 async function runTurnEnforcingGoal(
   adapter: Harness,
   input: HarnessTurnInput,
-  harnessId: HarnessId,
+  _harnessId: HarnessId,
 ): Promise<HarnessTurnResult> {
   const emitted: SessionEntry[] = [];
   let saved: GoalRecord | undefined;
@@ -78,11 +78,9 @@ async function runTurnEnforcingGoal(
       (remaining !== undefined && remaining < GOAL_ROUND_MIN_WALL_MS)
     );
   };
-  await enforceGoal<"ok" | "halted">({
+  await enforceGoal({
     goal,
     meter,
-    outcome: blocked() ? "halted" : "ok",
-    ok: "ok",
     blocked,
     ...(input.governGoal
       ? {
@@ -95,9 +93,6 @@ async function runTurnEnforcingGoal(
             }),
         }
       : {}),
-    beforePrompt: () => {
-      console.error(`[goal] continuation session=${input.session.id} harness=${harnessId} turns=${meter.turns}`);
-    },
     prompt: async (note) => {
       const remaining = remainingWallMs();
       result = await adapter.turns.runTurn({
@@ -110,7 +105,7 @@ async function runTurnEnforcingGoal(
         ...(remaining !== undefined ? { turnWallClockMs: Math.max(1, remaining) } : {}),
       });
       account();
-      return blocked() ? "halted" : "ok";
+      return !blocked();
     },
   });
   if (saved && saved !== goal) return result;
@@ -258,10 +253,13 @@ export async function resolveRuntimeChoiceDurable(
     "getApprovedHarnesses" | "getRuntimeSelection" | "getBaseModel" | "getPurposeRuntime"
   > = {
     getApprovedHarnesses: () => approved,
-    getPurposeRuntime: () => purposeRuntime,
+    getPurposeRuntime: () =>
+      purposeRuntime ? { ...purposeRuntime, harnessId: purposeRuntime.harnessId ?? fallback.harnessId } : undefined,
     getRuntimeSelection: (id: ScopeId) => {
-      if (id === orgScopeId) return orgStored;
-      return id === scope ? scopedStored : null;
+      let stored = null;
+      if (id === orgScopeId) stored = orgStored;
+      else if (id === scope) stored = scopedStored;
+      return stored ? { ...stored, harnessId: stored.harnessId ?? fallback.harnessId } : null;
     },
     getBaseModel: (id: ScopeId) => {
       if (id === orgScopeId) return orgLegacy;

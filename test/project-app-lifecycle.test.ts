@@ -1,3 +1,7 @@
+import { testMap } from "./support/test-database.ts";
+import { singleProcessDeps } from "./support/single-process.ts";
+import { testDeployBackings } from "./support/test-database.ts";
+import { createPostgresGrantStore } from "../src/acl/postgres-grant-store.ts";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { mkdtempSync } from "node:fs";
@@ -6,10 +10,11 @@ import { join } from "node:path";
 import { createDeployService } from "../src/deploy/deploy-service.ts";
 import { createDeployStore } from "../src/deploy/deploy-store.ts";
 import { createAclStore } from "../src/acl/acl-store.ts";
-import { createAuditLog } from "../src/audit/audit-log.ts";
+import { createPostgresAuditLog } from "../src/admin/postgres-audit-log.ts";
+import { testDatabaseUrl } from "./support/test-database.ts";
 import { createProjectStore, projectGroupRef, projectScopeId } from "../src/projects/project-store.ts";
 import { createProjectScopeGuard } from "../src/projects/project-scope-guard.ts";
-import { createMemoryAdvisoryLock } from "../src/persistence/advisory-lock.ts";
+import { testAdvisoryLock } from "./support/test-database.ts";
 import {
   createCanManageScope,
   createCanWriteScope,
@@ -18,14 +23,15 @@ import {
 import { mintCapabilityToken } from "../src/auth/capability-token.ts";
 
 async function fixture() {
-  const lock = createMemoryAdvisoryLock();
-  const projects = createProjectStore(undefined, { id: () => "p1", advisoryLock: lock });
+  const lock = testAdvisoryLock();
+  const projects = createProjectStore(testMap(), { id: () => "p1", advisoryLock: lock });
   await projects.create({ name: "Launch", ownerId: "owner" });
   const scope = projectScopeId("p1");
   const guard = createProjectScopeGuard(projects, lock);
   const membership = { managedGroups: projects };
-  const store = createDeployStore();
+  const store = createDeployStore(testDeployBackings());
   const deploy = createDeployService({
+    ...singleProcessDeps(),
     deployStore: store,
     deployDir: mkdtempSync(join(tmpdir(), "project-app-")),
     provider: {
@@ -33,8 +39,8 @@ async function fixture() {
       apply: async () => ({ host: "127.0.0.1", port: 9000 }),
       destroy: async () => {},
     },
-    acl: createAclStore(),
-    auditLog: createAuditLog(),
+    acl: createAclStore(createPostgresGrantStore(testDatabaseUrl())),
+    auditLog: createPostgresAuditLog(testDatabaseUrl()),
     advisoryLock: lock,
     withScopeWrite: guard.write,
     scopeIsActive: guard.active,

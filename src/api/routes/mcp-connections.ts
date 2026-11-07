@@ -3,7 +3,7 @@ import { isObj, authorizeAdmin, orgScope } from "./shared.ts";
 import { samePerson, canonicalPerson } from "../../directory/person.ts";
 import { McpAccessError, type McpConnectionInput, type McpAccountInput } from "../../mcp/mcp-connection-service.ts";
 import type { McpAccess } from "../../mcp/mcp-connection-store.ts";
-import type { ApiCtx, Route } from "./route.ts";
+import { withAdmin, type ApiCtx, type Route } from "./route.ts";
 
 function actor(ctx: ApiCtx): string {
   const body = isObj(ctx.body) ? ctx.body : {};
@@ -167,60 +167,66 @@ async function handle(ctx: ApiCtx): Promise<void> {
     return sendJson(ctx.res, 400, { error: "mcp_request_failed", message });
   }
 }
-export const mcpConnectionRoutes: ReadonlyArray<Route<ApiCtx>> = [
-  {
-    method: "GET",
-    path: "/v1/mcp-oauth/client-metadata",
-    auth: "public",
-    handle: (ctx) => {
-      if (!ctx.deps.mcpConnections) return sendJson(ctx.res, 404, { error: "not_found" });
-      return sendJson(ctx.res, 200, ctx.deps.mcpConnections.clientMetadata());
-    },
-  },
-
-  ...["GET", "POST"].map((method) => ({ method, path: "/v1/mcp-connections", auth: "either" as const, handle })),
-  ...["GET", "PATCH", "DELETE"].map((method) => ({
-    method,
-    path: "/v1/mcp-connections/:id",
-    auth: "either" as const,
-    handle,
-  })),
-  { method: "POST", path: "/v1/mcp-connections/:id/test", auth: "either", handle },
-  { method: "GET", path: "/v1/mcp-connections/:id/tools", auth: "either", handle },
-  ...["POST", "DELETE"].map((method) => ({
-    method,
-    path: "/v1/mcp-connections/:id/account",
-    auth: "either" as const,
-    handle,
-  })),
-  ...["POST", "DELETE"].map((method) => ({
-    method,
-    path: "/v1/mcp-connections/:id/shares",
-    auth: "either" as const,
-    handle,
-  })),
-  { method: "GET", path: "/v1/admin/mcp-connections", auth: "either", handle },
-  { method: "POST", path: "/v1/admin/mcp-connections/:id/disable", auth: "either", handle },
-  { method: "POST", path: "/v1/admin/mcp-connections/:id/unblock", auth: "either", handle },
-  ...["GET", "PUT"].map((method) => ({ method, path: "/v1/admin/mcp-policy", auth: "either" as const, handle })),
-  {
-    method: "GET",
-    path: "/v1/mcp-oauth/callback",
-    auth: "public",
-    handle: async (ctx) => {
-      try {
+export const mcpConnectionRoutes: ReadonlyArray<Route<ApiCtx>> = (
+  [
+    {
+      method: "GET",
+      path: "/v1/mcp-oauth/client-metadata",
+      auth: "public",
+      handle: (ctx) => {
         if (!ctx.deps.mcpConnections) return sendJson(ctx.res, 404, { error: "not_found" });
-        const id = await ctx.deps.mcpConnections.callback(
-          ctx.url.searchParams.get("state") ?? "",
-          ctx.url.searchParams.get("code") ?? "",
-        );
-        return sendJson(ctx.res, 200, { connected: true, connectionId: id });
-      } catch {
-        return sendJson(ctx.res, 400, {
-          error: "oauth_failed",
-          message: "Authorization failed or expired; return to MCP and reconnect",
-        });
-      }
+        return sendJson(ctx.res, 200, ctx.deps.mcpConnections.clientMetadata());
+      },
     },
-  },
-];
+
+    ...["GET", "POST"].map((method) => ({ method, path: "/v1/mcp-connections", auth: "either" as const, handle })),
+    ...["GET", "PATCH", "DELETE"].map((method) => ({
+      method,
+      path: "/v1/mcp-connections/:id",
+      auth: "either" as const,
+      handle,
+    })),
+    { method: "POST", path: "/v1/mcp-connections/:id/test", auth: "either", handle },
+    { method: "GET", path: "/v1/mcp-connections/:id/tools", auth: "either", handle },
+    ...["POST", "DELETE"].map((method) => ({
+      method,
+      path: "/v1/mcp-connections/:id/account",
+      auth: "either" as const,
+      handle,
+    })),
+    ...["POST", "DELETE"].map((method) => ({
+      method,
+      path: "/v1/mcp-connections/:id/shares",
+      auth: "either" as const,
+      handle,
+    })),
+    { method: "GET", path: "/v1/admin/mcp-connections", auth: "either", handle },
+    { method: "POST", path: "/v1/admin/mcp-connections/:id/disable", auth: "either", handle },
+    { method: "POST", path: "/v1/admin/mcp-connections/:id/unblock", auth: "either", handle },
+    ...["GET", "PUT"].map((method) => ({ method, path: "/v1/admin/mcp-policy", auth: "either" as const, handle })),
+    {
+      method: "GET",
+      path: "/v1/mcp-oauth/callback",
+      auth: "public",
+      handle: async (ctx) => {
+        try {
+          if (!ctx.deps.mcpConnections) return sendJson(ctx.res, 404, { error: "not_found" });
+          const id = await ctx.deps.mcpConnections.callback(
+            ctx.url.searchParams.get("state") ?? "",
+            ctx.url.searchParams.get("code") ?? "",
+          );
+          return sendJson(ctx.res, 200, { connected: true, connectionId: id });
+        } catch {
+          return sendJson(ctx.res, 400, {
+            error: "oauth_failed",
+            message: "Authorization failed or expired; return to MCP and reconnect",
+          });
+        }
+      },
+    },
+  ] as Route<ApiCtx>[]
+).map((route) => {
+  if (!("path" in route) || route.auth === "public") return route;
+  if (route.path.startsWith("/v1/admin/")) return { ...withAdmin([route])[0]!, browser: "self" as const };
+  return { ...route, actor: "query.principalId" as const, browser: true as const };
+});

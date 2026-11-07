@@ -1,10 +1,12 @@
-import { desktopTurnId, serveDesktopRun } from "./desktop-computer.ts";
+import { desktopTurnId, serveDesktopRun, webClientSurface } from "./desktop-computer.ts";
+import { CLIENT_SURFACE_HEADER } from "../../chassis/src/client-surface.ts";
 import { reportHandledError, reportRequestTiming, stopBrowserErrors } from "./browser-errors.ts";
 import { captureMessage, stopAnalytics } from "./product-analytics.ts";
 import { streamedAnswer } from "./timeline.ts";
 import { fetchServerSentEvents } from "@tanstack/ai-client";
 import { postCallText, postResultOk } from "./surface-post.ts";
 import type { RuntimeChange, RuntimeConfig } from "./runtime-config-cache.ts";
+import type { ChatBrowseStatus } from "./session-list.ts";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type { Attachment } from "@earendil-works/pi-web-ui";
 import type { Api, AssistantMessage, AssistantMessageEventStream, Context, Model, Usage } from "@earendil-works/pi-ai";
@@ -17,10 +19,22 @@ import { errMessage, swallow } from "../../chassis/src/errors.ts";
 import { userFacingFailureText } from "../../chassis/src/failure-copy.ts";
 import { groupDmText } from "./group-dm-label.ts";
 import { base64ToBytes } from "./paste-text.ts";
-import { defaultEffortForModel, harnessSupportsEffort } from "./runtime-capabilities.ts";
 import { SIGNIN_REQUIRED_EVENT, signinRedirect } from "./signin-return.ts";
 import { messageEntrySeqs } from "./message-link.ts";
 import type { GoalStripState } from "./goal-strip.ts";
+import {
+  activityCreatedAt,
+  activityItems,
+  isHidden,
+  isNarration,
+  isUserMessage,
+  messageTs,
+  proddedReason,
+  retractedReason,
+  stepMessage,
+  type Item,
+  type RunActivityEntry,
+} from "./items.ts";
 
 const BASE_URL = ((import.meta as unknown as { env?: { BASE_URL?: string } }).env?.BASE_URL ?? "/").replace(/\/$/, "");
 
@@ -119,7 +133,6 @@ type WebUserMessage = AgentMessage & {
   role: "user" | "user-with-attachments";
   content: string | Array<{ type: string; text?: string }>;
   attachments?: PiAttachment[];
-  clientTurnId?: string;
   sendFailure?: string;
 };
 
@@ -144,6 +157,7 @@ export interface CoreSession {
   color?: string | null;
   unread?: boolean;
   lastActivityAt?: number;
+  lastUserPreview?: string | null;
   working?: boolean;
   awaitingInput?: boolean;
   lastTurnFailed?: boolean;
@@ -154,28 +168,77 @@ export interface CoreSession {
   goal?: { objective: string; activeMs: number; runningSince?: number; floor?: Record<string, number> };
   forkedFrom?: { sessionId: string; title?: string | null };
   forkBoundarySeq?: number;
+  sideChat?: { entrySeq: number; quote: string; occurrence: number; expanded: boolean };
   parentSessionId?: string;
   surface?: string;
+  subagents?: { running: number; waiting: number };
+  workingSince?: number;
+  purpose?: string;
+  personaId?: string;
+}
+
+export interface SessionPageQuery {
+  limit: number;
+  before?: string | null;
+  status?: ChatBrowseStatus;
+  surface?: string;
+  scope?: string | null;
+  q?: string;
+}
+
+export interface SessionPage {
+  sessions: CoreSession[];
+  pinned?: CoreSession[];
+  nextCursor: string | null;
+  hasArchived?: boolean;
+}
+
+export function fetchSessionPage(query: SessionPageQuery): Promise<SessionPage> {
+  const qs = new URLSearchParams({ limit: String(query.limit) });
+  if (query.before) qs.set("before", query.before);
+  if (query.status && query.status !== "active") qs.set("status", query.status);
+  if (query.surface) qs.set("surface", query.surface);
+  if (query.scope) qs.set("scope", query.scope);
+  if (query.q?.trim()) qs.set("q", query.q.trim());
+  return api<SessionPage>(`/api/sessions?${qs.toString()}`);
+}
+
+export async function fetchSessionChildren(id: string): Promise<CoreSession[] | null> {
+  try {
+    return (await api<{ sessions: CoreSession[] }>(`/api/sessions/${encodeURIComponent(id)}/children`)).sessions;
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 404) return null;
+    throw err;
+  }
+}
+
+export async function fetchSessionRow(ref: { id: string } | { threadRef: string }): Promise<CoreSession | null> {
+  const qs = new URLSearchParams("id" in ref ? { id: ref.id } : { threadRef: ref.threadRef });
+  try {
+    return (await api<{ session: CoreSession }>(`/api/sessions/row?${qs.toString()}`)).session;
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 404) return null;
+    throw err;
+  }
 }
 
 export function inheritedTranscript(
   session: Pick<CoreSession, "forkedFrom" | "forkBoundarySeq">,
-  entries: SessionEntry[],
-): { inherited: SessionEntry[]; current: SessionEntry[] } {
-  if (!session.forkedFrom || session.forkBoundarySeq === undefined) return { inherited: [], current: entries };
-  const inherited: SessionEntry[] = [];
-  const current: SessionEntry[] = [];
-  for (const entry of entries)
-    (entry.seq !== undefined && entry.seq <= session.forkBoundarySeq ? inherited : current).push(entry);
+  items: Item[],
+): { inherited: Item[]; current: Item[] } {
+  if (!session.forkedFrom || session.forkBoundarySeq === undefined) return { inherited: [], current: items };
+  const inherited: Item[] = [];
+  const current: Item[] = [];
+  for (const item of items) (item.seq <= session.forkBoundarySeq ? inherited : current).push(item);
   return { inherited, current };
 }
 
-export function inheritedRefreshEntries(
+export function inheritedRefreshItems(
   session: Pick<CoreSession, "forkedFrom" | "forkBoundarySeq">,
-  entries: SessionEntry[],
+  items: Item[],
   inheritedLoaded: boolean,
-): SessionEntry[] | null {
-  const inherited = inheritedTranscript(session, entries).inherited;
+): Item[] | null {
+  const inherited = inheritedTranscript(session, items).inherited;
   return inherited.length && !inheritedLoaded ? inherited : null;
 }
 
@@ -193,26 +256,26 @@ export function forkOriginDetails(
 
 export function currentEarlierCount(
   session: Pick<CoreSession, "forkedFrom" | "forkBoundarySeq">,
-  earlierEntries: number,
+  earlierItems: number,
 ): number {
-  if (!session.forkedFrom || session.forkBoundarySeq === undefined) return earlierEntries;
-  return Math.max(0, earlierEntries - (session.forkBoundarySeq + 1));
+  if (!session.forkedFrom || session.forkBoundarySeq === undefined) return earlierItems;
+  return Math.max(0, earlierItems - (session.forkBoundarySeq + 1));
 }
 
 export async function loadInheritedTranscript(
   session: Pick<CoreSession, "id" | "forkedFrom" | "forkBoundarySeq">,
-  loaded: SessionEntry[],
+  loaded: Item[],
   fetcher: typeof fetchTranscript = fetchTranscript,
-): Promise<SessionEntry[]> {
+): Promise<Item[]> {
   if (loaded.length || !session.forkedFrom || session.forkBoundarySeq === undefined) return loaded;
   let beforeSeq = session.forkBoundarySeq + 1;
-  let inherited: SessionEntry[] = [];
+  let inherited: Item[] = [];
   for (;;) {
     const page = await fetcher(session.id, { beforeSeq, tailTurns: TAIL_TURNS });
-    const entries = inheritedTranscript(session, page.entries ?? []).inherited;
-    inherited = [...entries, ...inherited];
-    const earliestSeq = entries[0]?.seq;
-    if (!(page.earlierEntries ?? 0) || earliestSeq === undefined || earliestSeq <= 0 || earliestSeq >= beforeSeq) break;
+    const items = inheritedTranscript(session, page.items).inherited;
+    inherited = [...items, ...inherited];
+    const earliestSeq = items[0]?.seq;
+    if (!(page.earlierItems ?? 0) || earliestSeq === undefined || earliestSeq <= 0 || earliestSeq >= beforeSeq) break;
     beforeSeq = earliestSeq;
   }
   return inherited;
@@ -253,7 +316,10 @@ export interface CoreContext {
   sessionCount: number;
   lastActivityAt: number | null;
   project?: CoreProject;
+  groupMembers?: Array<{ principalId: string; displayName: string; avatarUrl?: string }>;
 }
+
+export type ProjectIcon = { kind: "emoji"; value: string } | { kind: "custom"; name: string };
 
 export interface CoreProject {
   lifecycle?: "active" | "deleting" | "archived";
@@ -266,6 +332,8 @@ export interface CoreProject {
   scopeId: string;
   members: Array<{ principalId: string; displayName: string; avatarUrl?: string; viaChannel?: boolean }>;
   slackChannel?: { channelId: string; channelName: string; linkedBy?: string; linkedAt?: number };
+  /** Sidebar icon; absent shows the folder. */
+  icon?: ProjectIcon;
   createdAt?: number;
   updatedAt?: number;
 }
@@ -305,15 +373,18 @@ export async function updateSession(
 export async function forkSession(
   id: string,
   upToSeq?: number,
-): Promise<{ session: CoreSession; entries: SessionEntry[] }> {
-  return api<{ session: CoreSession; entries: SessionEntry[] }>(`/api/sessions/${encodeURIComponent(id)}/fork`, {
-    method: "POST",
-    body: JSON.stringify(upToSeq !== undefined ? { upToSeq } : {}),
-  });
+  sideChat?: { entrySeq: number; quote: string; occurrence: number },
+): Promise<{ session: CoreSession; items: Item[] }> {
+  return withItems(
+    await api<{ session: CoreSession; items: Item[] }>(`/api/sessions/${encodeURIComponent(id)}/fork`, {
+      method: "POST",
+      body: JSON.stringify({ upToSeq, sideChat }),
+    }),
+  );
 }
 
 export function forkCutSeq(
-  entries: SessionEntry[],
+  items: Item[],
   messages: readonly unknown[],
   index: number,
   floorSeq = -1,
@@ -333,12 +404,12 @@ export function forkCutSeq(
     if (isUser(messages[i])) unsaved++;
   }
   if (isUser(messages[index]) && !unsaved) return base;
-  const later = entries.flatMap((entry) =>
-    entry.type === "user" && entry.seq !== undefined && entry.seq > base && userEntryMessage(entry) ? [entry.seq] : [],
+  const later = items.flatMap((item) =>
+    isUserMessage(item) && item.seq > base && userItemMessage(item) ? [item.seq] : [],
   );
   if (isUser(messages[index])) return later[unsaved - 1];
   const nextUser = later[unsaved];
-  return nextUser !== undefined ? nextUser - 1 : entries.at(-1)?.seq;
+  return nextUser !== undefined ? nextUser - 1 : items.at(-1)?.seq;
 }
 
 export const TAIL_TURNS = 25;
@@ -354,8 +425,8 @@ export interface SessionPin {
 
 export interface TranscriptPage {
   session?: CoreSession;
-  entries: SessionEntry[];
-  earlierEntries?: number;
+  items: Item[];
+  earlierItems?: number;
   pins?: SessionPin[];
   goal?: GoalStripState;
   runtime?: TurnRuntime;
@@ -370,13 +441,23 @@ export async function fetchTranscript(
   if (window?.sinceSeq !== undefined) qs.set("sinceSeq", String(window.sinceSeq));
   if (window?.beforeSeq !== undefined) qs.set("beforeSeq", String(window.beforeSeq));
   const suffix = qs.size ? `?${qs.toString()}` : "";
-  return api<TranscriptPage>(`/api/sessions/${encodeURIComponent(id)}${suffix}`);
+  return withItems(await api<TranscriptPage>(`/api/sessions/${encodeURIComponent(id)}${suffix}`));
+}
+
+function withItems<T extends { items: Item[] }>(page: T): T {
+  if (!Array.isArray(page.items)) throw new Error("Unexpected transcript response");
+  return page;
 }
 
 const resolvedCredentialApprovals = new Set<string>();
 
+const decidedDuringRunApprovals = new Set<string>();
+
 export function unresolvedApprovals(approvals: PendingApproval[]): PendingApproval[] {
-  const pending = approvals.filter((approval) => !resolvedCredentialApprovals.has(approval.requestId));
+  const pending = approvals.filter(
+    (approval) =>
+      !resolvedCredentialApprovals.has(approval.requestId) && !decidedDuringRunApprovals.has(approval.requestId),
+  );
   return pending.length === approvals.length ? approvals : pending;
 }
 
@@ -389,11 +470,11 @@ export function fetchSessionApprovals(id: string): Promise<{ approvals: PendingA
     });
 }
 
-export async function fetchEntry(sessionId: string, seq: number): Promise<SessionEntry> {
-  const r = await api<{ entry: SessionEntry }>(
-    `/api/sessions/${encodeURIComponent(sessionId)}/entries/${encodeURIComponent(String(seq))}`,
+export async function fetchItem(sessionId: string, seq: number): Promise<Item> {
+  const r = await api<{ item: Item }>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/items/${encodeURIComponent(String(seq))}`,
   );
-  return r.entry;
+  return r.item;
 }
 
 export async function regenerateTitle(id: string): Promise<{ title: string | null }> {
@@ -407,43 +488,6 @@ export async function detachSession(id: string): Promise<{ detached: true }> {
 export async function cancelSessionGoal(id: string): Promise<{ cancelled: true }> {
   return api<{ cancelled: true }>(`/api/sessions/${encodeURIComponent(id)}/goal/cancel`, { method: "POST" });
 }
-export interface SessionEntry {
-  type:
-    | "user"
-    | "assistant"
-    | "thinking"
-    | "text_start"
-    | "text"
-    | "tool_call"
-    | "tool_result"
-    | "soul"
-    | "system"
-    | "approval_request"
-    | "approval_resolved"
-    | "delivery";
-  payload: unknown;
-  createdAt: number;
-  seq?: number;
-  parentSeq?: number | null;
-  truncated?: boolean;
-}
-
-export interface ToolActivity {
-  seq: number;
-  parentSeq: number | null;
-  type:
-    | "tool_call"
-    | "tool_result"
-    | "approval_request"
-    | "approval_resolved"
-    | "thinking"
-    | "text"
-    | "text_start"
-    | "user";
-  payload: unknown;
-  createdAt: number;
-  truncated?: boolean;
-}
 type WorkStatus = "thinking" | "working" | "complete" | "failed";
 export interface WorkBlock {
   streamStartOffset?: number;
@@ -451,14 +495,21 @@ export interface WorkBlock {
   startedAt?: number;
   finishedAt?: number;
   stale?: boolean;
-  activity: ToolActivity[];
+  activity: RunActivityEntry[];
+  reasoning?: LiveReasoning[];
+  attempt?: number;
   pendingApprovals?: PendingApproval[];
   goal?: GoalStripState;
   runtime?: TurnRuntime;
 }
 
+interface LiveReasoning {
+  step: string;
+  index: number;
+  text: string;
+}
+
 export interface TurnRuntime {
-  harnessId: string;
   modelId: string;
   label?: string;
   change?: { rule: string } | { agent: "task" | "scope" };
@@ -470,10 +521,10 @@ export function switchedDefault(runtime: TurnRuntime | null | undefined): boolea
 
 export function workPausedForApproval(work: WorkBlock): boolean {
   const last = work.activity.at(-1);
+  if (!last || !("item" in last)) return false;
+  const { kind, body } = last.item;
   return (
-    last?.type === "approval_request" ||
-    ((last?.type === "tool_result" || last?.type === "tool_call") &&
-      (last.payload as { blocked?: unknown } | null)?.blocked === "needs_approval")
+    kind === "Elicitation" || ((kind === "ToolResult" || kind === "ToolCall") && body.blocked === "needs_approval")
   );
 }
 
@@ -486,6 +537,11 @@ export interface PendingApproval {
   matched?: string;
   grantModes?: { session: boolean; always: boolean };
   blocksInput?: boolean;
+  executesOnApprove?: boolean;
+}
+
+export function approvalDecidableDuringRun(approval: PendingApproval): boolean {
+  return approval.executesOnApprove === true && approval.blocksInput === false;
 }
 
 export function approvalBlocksComposer(approval: PendingApproval): boolean {
@@ -507,6 +563,7 @@ export type AssistantWork = AssistantMessage & {
   sendBlocked?: "pending_approval";
   sendFailed?: "attachments";
   droppedAttachmentIds?: string[];
+  continuing?: string;
 };
 
 export interface RunPoll {
@@ -524,6 +581,7 @@ export interface RunPoll {
     status: string;
     reply?: string;
     reason?: string;
+    refusalKind?: string;
     stopped?: boolean;
     pendingApprovals?: PendingApproval[];
     attachments?: Array<{ name: string; mimetype?: string; sizeBytes?: number; artifactId?: string }>;
@@ -533,14 +591,16 @@ export interface RunPoll {
   alive?: boolean;
   stale?: boolean;
   replyComplete?: boolean;
-  activity?: unknown[];
+  activity?: RunActivityEntry[];
+  reasoning?: LiveReasoning[];
+  attempt?: number;
   startedAt?: number | null;
   finishedAt?: number | null;
 }
 export interface TurnOptions {
+  harness?: string;
   effortLevel?: string;
   fastMode?: boolean;
-  harness?: string;
   scopeId?: string | null;
   channelName?: string | null;
 }
@@ -561,13 +621,12 @@ export function runIsTerminal(run: Pick<RunPoll, "status" | "result" | "replyCom
   return run.status === "done" || run.status === "failed" || run.result != null || run.replyComplete === true;
 }
 
-export function hasRecordedRunReply(entries: SessionEntry[], runId: string): boolean {
+export function hasRecordedRunReply(items: Item[], runId: string): boolean {
   let matchesRun = false;
-  for (const entry of entries) {
-    const payload = entry.payload as { runId?: string; steered?: boolean } | null;
-    if (entry.type === "user") {
-      if (!payload?.steered || payload.runId !== undefined) matchesRun = payload?.runId === runId;
-    } else if (matchesRun && entry.type === "assistant") {
+  for (const item of items) {
+    if (isUserMessage(item)) {
+      if (item.kind === "UserMessage" || item.turnId !== null) matchesRun = item.turnId === runId;
+    } else if (matchesRun && item.kind === "AgentMessage" && item.variant === null) {
       return true;
     }
   }
@@ -614,8 +673,8 @@ export function continuableMessages(
     return { messages: [...kept, user as AgentMessage], popped };
   }
   while (kept.length && (kept[kept.length - 1] as { role?: string }).role === "assistant") {
-    const work = (kept.at(-1) as AssistantWork).work;
-    if (!input && work && workPausedForApproval(work)) {
+    const last = kept.at(-1) as AssistantWork;
+    if (last.stopReason === "aborted" || (!input && last.work && workPausedForApproval(last.work))) {
       kept.push(resumeAnchor());
       break;
     }
@@ -878,7 +937,10 @@ export async function loadChatPrefs(): Promise<void> {
 }
 
 export async function api<T = unknown>(path: string, init?: RequestInit): Promise<T> {
-  const r = await webFetch(withBase(path), { headers: { "content-type": "application/json" }, ...init });
+  const headers = new Headers({ "content-type": "application/json" });
+  new Headers(init?.headers).forEach((value, name) => headers.set(name, value));
+  headers.set(CLIENT_SURFACE_HEADER, webClientSurface());
+  const r = await webFetch(withBase(path), { ...init, headers });
   const text = await r.text();
   let body: unknown = {};
   try {
@@ -957,7 +1019,7 @@ export function hasLiveRun(slot: RunSlot): boolean {
   return slot.runId !== null;
 }
 
-export type SignalOutcome = { ok: true } | { ok: false; reason: string; replayed?: boolean };
+export type SignalOutcome = { ok: true } | { ok: false; reason: string; why?: string; replayed?: boolean };
 
 export interface SteerContext {
   threadRef: string | null;
@@ -999,10 +1061,11 @@ export async function signalLiveRun(
     // text as a fresh turn when it can; surface that outcome instead of failing so the
     // caller can attach to the replay run or resend, rather than dropping the message.
     if (err instanceof ApiError && (err.status === 409 || err.status === 404)) {
-      const body = (err.body ?? {}) as { reason?: string; replayed?: boolean };
+      const body = (err.body ?? {}) as { reason?: string; why?: string; replayed?: boolean };
       return {
         ok: false,
         reason: body.reason ?? (err.status === 404 ? "not_found" : "terminal"),
+        ...(body.why ? { why: body.why } : {}),
         ...(body.replayed ? { replayed: true } : {}),
       };
     }
@@ -1048,16 +1111,27 @@ export async function queueTurn(
   getTurnOptions?: () => TurnOptions,
   idempotencyKey?: string,
   attachments: CoreAttachment[] = [],
-): Promise<QueuedRun> {
-  const submit = await api<{ status?: string; runId?: string; reason?: string }>("/api/turn", {
-    method: "POST",
-    body: JSON.stringify(
-      turnRequestBody(threadRef, text, agent.state.model, agent, getTurnOptions, { idempotencyKey, attachments }),
-    ),
-  });
+  midTurn: "steer" | "queue" = "queue",
+): Promise<QueuedRun & { steered?: boolean; steerTs?: string }> {
+  const submit = await api<{ status?: string; runId?: string; reason?: string; steered?: boolean; steerTs?: string }>(
+    "/api/turn",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        ...turnRequestBody(threadRef, text, agent.state.model, agent, getTurnOptions, { idempotencyKey, attachments }),
+        midTurn,
+      }),
+    },
+  );
   if (submit.status === "pending_approval") throw new Error(submit.reason ?? PENDING_APPROVAL_REASON);
-  if (!submit.runId) throw new Error("Could not queue the message.");
-  return { runId: submit.runId, text, ...(attachments.length ? { hasAttachments: true } : {}) };
+  if (!submit.runId && !submit.steered) throw new Error("Could not queue the message.");
+  return {
+    runId: submit.runId ?? "",
+    text,
+    ...(attachments.length ? { hasAttachments: true } : {}),
+    ...(submit.steered ? { steered: true } : {}),
+    ...(submit.steerTs ? { steerTs: submit.steerTs } : {}),
+  };
 }
 
 export async function editQueuedRun(runId: string, text: string, expectedText: string): Promise<void> {
@@ -1103,15 +1177,19 @@ export async function resolveApproval(decision: ApprovalDecision): Promise<strin
     resolvedCredentialApprovals.add(decision.requestId);
     return "";
   }
-  const submit = await api<{ runId?: string }>(`/api/approvals/${encodeURIComponent(decision.requestId)}`, {
-    method: "POST",
-    body: JSON.stringify({ approved: decision.approved, ...(decision.scope ? { scope: decision.scope } : {}) }),
-  }).catch((err: unknown) => {
+  const submit = await api<{ runId?: string; steered?: boolean }>(
+    `/api/approvals/${encodeURIComponent(decision.requestId)}`,
+    {
+      method: "POST",
+      body: JSON.stringify({ approved: decision.approved, ...(decision.scope ? { scope: decision.scope } : {}) }),
+    },
+  ).catch((err: unknown) => {
     if (err instanceof ApiError && err.status === 404) return null;
     throw err;
   });
   if (!submit) return null;
   if (!submit.runId) throw new Error("Could not continue after the approval.");
+  if (submit.steered) decidedDuringRunApprovals.add(decision.requestId);
   return submit.runId;
 }
 
@@ -1221,17 +1299,14 @@ function turnRequestBody(
 ): Record<string, unknown> {
   const { idempotencyKey, attachments = [] } = send;
   const turnOptions = getTurnOptions?.() ?? {};
-  const thinkingLevel =
-    turnOptions.harness && harnessSupportsEffort(turnOptions.harness)
-      ? (turnOptions.effortLevel ?? agent.state.thinkingLevel ?? defaultEffortForModel(model))
-      : undefined;
+  const thinkingLevel = turnOptions.effortLevel;
   const timezone = browserTimezone();
   return {
     desktopClientId: desktopTurnId(),
     text,
     threadRef,
-    ...(turnOptions.harness ? { harness: turnOptions.harness, model: model.id } : {}),
-    ...(thinkingLevel ? { thinkingLevel } : {}),
+    ...(thinkingLevel ? { model: model.id, thinkingLevel } : {}),
+    ...(turnOptions.harness ? { harness: turnOptions.harness } : {}),
     ...(typeof turnOptions.fastMode === "boolean" ? { fastMode: turnOptions.fastMode } : {}),
     ...(timezone ? { timezone } : {}),
     ...(turnOptions.scopeId ? { scopeId: turnOptions.scopeId } : {}),
@@ -1293,7 +1368,7 @@ async function drive(
           retryable: [] as Attachment[],
         }
       : await latestUserTurn(agent);
-    if (!opener && !text.trim() && attachments.length === 0) {
+    if (!opener && ((!text.trim() && attachments.length === 0) || retryable.length > 0)) {
       work.status = "failed";
       work.finishedAt = Date.now();
       notify();
@@ -1310,6 +1385,7 @@ async function drive(
       method: "POST",
       body: JSON.stringify({
         ...turnRequestBody(threadRef, text, model, agent, getTurnOptions, { idempotencyKey, attachments }),
+        midTurn: "queue",
         ...(opener ? { proactiveOpener: true, desktopClientId: undefined } : {}),
       }),
     });
@@ -1430,6 +1506,15 @@ async function followRun(
   }
 }
 
+export async function stopThreadRun(threadRef: string): Promise<"stopped" | "ended"> {
+  const { runId } = await activeRunForThread(threadRef);
+  if (!runId) return "ended";
+  const outcome = await signalLiveRun({ ...createRunSlot(), runId }, "abort", undefined, { threadRef: null });
+  if (outcome.ok) return "stopped";
+  if (outcome.reason === "terminal" || outcome.reason === "not_found") return "ended";
+  throw new Error(outcome.why ?? outcome.reason);
+}
+
 function runPath(runId: string, suffix: string): string {
   return `/api/runs/${encodeURIComponent(runId)}${suffix}`;
 }
@@ -1441,29 +1526,37 @@ export interface Acc {
   staleSince?: number;
 }
 
-function isRenderableThinking(payload: unknown): boolean {
-  const p = payload as { thinking?: string; redacted?: boolean } | null;
-  return !!p && !p.redacted && typeof p.thinking === "string" && p.thinking.trim().length > 0;
+function isRenderableThinking(item: Item): boolean {
+  return item.body.redacted !== true && Boolean(item.text?.trim());
 }
 
-function parseActivity(raw: unknown): ToolActivity[] {
+function isWorkItem(item: Item): boolean {
+  if (item.kind === "Reasoning") return isRenderableThinking(item);
+  if (item.kind === "AgentMessage") return item.variant === "narration";
+  if (item.kind === "SteeringMessage") return !isHidden(item);
+  return ACTIVITY_KINDS.has(item.kind);
+}
+
+function parseActivity(raw: RunPoll["activity"]): RunActivityEntry[] {
   if (!Array.isArray(raw)) return [];
-  const out: ToolActivity[] = [];
-  for (const item of raw) {
-    const a = item as Partial<ToolActivity> | null;
-    if (!a || typeof a.seq !== "number" || typeof a.type !== "string" || !ACTIVITY_TYPES.has(a.type)) continue;
-    if (a.type === "thinking" && !isRenderableThinking(a.payload)) continue;
-    if (a.type === "user" && !(a.payload as { steered?: boolean; hidden?: boolean } | null)?.steered) continue;
-    if (a.type === "user" && (a.payload as { hidden?: boolean } | null)?.hidden) continue;
-    out.push({
-      seq: a.seq,
-      parentSeq: a.parentSeq ?? null,
-      type: a.type as ToolActivity["type"],
-      payload: a.payload,
-      createdAt: a.createdAt ?? 0,
-    });
-  }
-  return out;
+  return raw.filter((entry): entry is RunActivityEntry =>
+    "item" in entry ? isWorkItem(entry.item) : entry.marker === "text_start",
+  );
+}
+
+function mergeReasoning(work: WorkBlock | undefined, block: LiveReasoning, offset = 0): boolean {
+  if (!work || typeof block.step !== "string" || !Number.isSafeInteger(block.index) || typeof block.text !== "string")
+    return false;
+  const blocks = work.reasoning ?? [];
+  const at = blocks.findIndex((b) => b.step === block.step && b.index === block.index);
+  const current = at >= 0 ? blocks[at]!.text : "";
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > current.length) return false;
+  const text = current.slice(0, offset) + block.text;
+  if (text.length <= current.length) return false;
+  const next = { step: block.step, index: block.index, text };
+  work.reasoning =
+    at >= 0 ? blocks.map((b, i) => (i === at ? next : b)) : [...blocks.filter((b) => b.step === block.step), next];
+  return true;
 }
 
 function setWorkStale(work: WorkBlock | undefined, stale: boolean, notify?: () => void): void {
@@ -1472,7 +1565,10 @@ function setWorkStale(work: WorkBlock | undefined, stale: boolean, notify?: () =
   notify?.();
 }
 
-function mergeWork(work: WorkBlock | undefined, run: { activity?: unknown[]; startedAt?: number | null }): boolean {
+function mergeWork(
+  work: WorkBlock | undefined,
+  run: { activity?: RunActivityEntry[]; startedAt?: number | null },
+): boolean {
   if (!work) return false;
   let changed = false;
   if (typeof run.startedAt === "number" && work.startedAt == null) {
@@ -1504,6 +1600,12 @@ function applyRun(
     if ((work?.activity.length ?? 0) > beforeActivity) st.lastProgressAt = now();
     notify?.();
   }
+  if (work && typeof run.attempt === "number" && work.attempt !== run.attempt) {
+    if (work.attempt !== undefined && work.reasoning?.length) work.reasoning = [];
+    work.attempt = run.attempt;
+  }
+  if (Array.isArray(run.reasoning) && run.reasoning.map((block) => mergeReasoning(work, block)).some(Boolean))
+    notify?.();
   setWorkStale(work, run.stale === true, notify);
   if (work && run.goal && JSON.stringify(run.goal) !== JSON.stringify(work.goal)) {
     work.goal = run.goal;
@@ -1531,7 +1633,7 @@ function applyRun(
   }
   const approvals = res?.pendingApprovals ?? [];
   const paused = approvals.length > 0;
-  const approvalDenied = approvalDeniedMessage(res?.reason);
+  const approvalDenied = res?.refusalKind === "approval_denied";
   const quiet = res?.status === "silent" || res?.status === "react";
   if (work) {
     work.finishedAt = typeof run.finishedAt === "number" ? run.finishedAt : Date.now();
@@ -1552,7 +1654,7 @@ function applyRun(
   }
   if (approvalDenied) {
     (partial as AssistantWork & { approvalDecision?: "denied" }).approvalDecision = "denied";
-    finish(stream, partial, st, approvalDenied);
+    finish(stream, partial, st, "Denied.");
     return "terminal";
   }
   if (!paused && !quiet && (run.status === "failed" || (res && res.status !== "ok"))) {
@@ -1699,6 +1801,13 @@ async function streamRunViaSse(
           return "fallback";
         if (value.offset > Math.max(st.startOffset + st.acc.length, value.startOffset ?? 0)) return "fallback";
         applyStreamText(stream, partial, st, value.delta, value.offset, value.startOffset ?? 0);
+      } else if (event.name === "reasoning") {
+        const value = event.value as { step: string; index: number; offset: number; delta: string };
+        const work = (partial as AssistantWork).work;
+        if (mergeReasoning(work, { step: value.step, index: value.index, text: value.delta }, value.offset)) {
+          st.lastProgressAt = now();
+          notify?.();
+        }
       } else if (event.name === "run") {
         const run = event.value as RunPoll;
         // Completion must carry the final result, including files and approvals.
@@ -1810,26 +1919,16 @@ function deliveredFilesFromAttachments(
     }));
 }
 
-function approvalDeniedMessage(reason?: string): string | null {
-  const trimmed = reason?.trim();
-  if (!trimmed) return null;
-  if (trimmed === "approval denied") return "Denied.";
-  return trimmed.startsWith("approval denied for ") ? "Denied." : null;
-}
-
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-const ACTIVITY_TYPES = new Set<string>([
-  "user",
-  "tool_call",
-  "tool_result",
-  "approval_request",
-  "approval_resolved",
-  "thinking",
-  "text_start",
-  "text",
+const ACTIVITY_KINDS = new Set<Item["kind"]>([
+  "SteeringMessage",
+  "ToolCall",
+  "ToolResult",
+  "Elicitation",
+  "ElicitationResponse",
 ]);
 
 interface HistoryAttachment {
@@ -1873,9 +1972,8 @@ function xmlAttrUnescape(s: string): string {
     .replace(/&amp;/g, "&");
 }
 
-function subagentMailOf(payload: unknown): SubagentMailRef | undefined {
-  const text = (payload as { text?: unknown } | null)?.text;
-  if (typeof text !== "string") return undefined;
+function subagentMailOf(text: string | null): SubagentMailRef | undefined {
+  if (text === null) return undefined;
   const m = SUBAGENT_MAIL_RE.exec(text);
   if (!m) return undefined;
   return { title: xmlAttrUnescape(m[1]!), sessionId: m[2]!, kind: m[3]! };
@@ -1888,6 +1986,7 @@ interface MessageRevisionNote {
   ts: string;
   content: string;
   speaker?: string;
+  byAgent?: boolean;
   timestamp?: number;
 }
 
@@ -1898,10 +1997,18 @@ interface GoalCancelledNote {
   timestamp?: number;
 }
 
-export type HistorySystemNote = MessageRevisionNote | GoalCancelledNote;
+interface TranscriptNotice {
+  role: "system-note";
+  note: "notice";
+  content: string;
+  timestamp?: number;
+}
+
+export type HistorySystemNote = MessageRevisionNote | GoalCancelledNote | TranscriptNotice;
 
 export interface HistoryApprovalDecision {
   role: "approval-decision";
+  entrySeq?: number;
   requestId?: string;
   approved: boolean;
   command: string;
@@ -1909,25 +2016,18 @@ export interface HistoryApprovalDecision {
   timestamp: number;
 }
 
-function approvalDecisionMessage(
-  entry: Pick<SessionEntry, "type" | "payload" | "createdAt" | "seq">,
-): HistoryApprovalDecision | null {
-  if (entry.type !== "approval_resolved") return null;
-  const decision = entry.payload as {
-    requestId?: unknown;
-    approved?: unknown;
-    command?: unknown;
-    scope?: unknown;
-  } | null;
-  if (typeof decision?.approved !== "boolean" || typeof decision.command !== "string") return null;
+function approvalDecisionMessage(item: Item): HistoryApprovalDecision | null {
+  if (item.kind !== "ElicitationResponse") return null;
+  const { command, scope } = item.body;
+  if (typeof item.approved !== "boolean" || typeof command !== "string") return null;
   return {
     role: "approval-decision",
-    ...(entry.seq !== undefined ? { entrySeq: entry.seq } : {}),
-    approved: decision.approved,
-    command: decision.command,
-    ...(typeof decision.requestId === "string" ? { requestId: decision.requestId } : {}),
-    ...(typeof decision.scope === "string" ? { scope: decision.scope } : {}),
-    timestamp: entry.createdAt,
+    entrySeq: item.seq,
+    approved: item.approved,
+    command,
+    requestId: item.elicitId,
+    ...(typeof scope === "string" ? { scope } : {}),
+    timestamp: item.createdAt,
   };
 }
 
@@ -1938,8 +2038,8 @@ export function messagesWithStreaming(messages: AgentMessage[], streaming?: Agen
     (message) => (message as { role: string }).role === "approval-decision",
   ) as unknown as HistoryApprovalDecision[];
   for (const message of source) {
-    for (const activity of (message as AssistantWork).work?.activity ?? []) {
-      const decision = approvalDecisionMessage(activity);
+    for (const item of activityItems((message as AssistantWork).work?.activity ?? [])) {
+      const decision = approvalDecisionMessage(item);
       if (!decision) continue;
       const exists = recorded.some((existing) =>
         decision.requestId
@@ -1959,9 +2059,7 @@ export function messagesWithStreaming(messages: AgentMessage[], streaming?: Agen
     const assistant = message as AssistantWork;
     const work = assistant.work;
     if (!work?.pendingApprovals?.length) return message;
-    const requestedAt = work.activity.length
-      ? Math.max(...work.activity.map((activity) => activity.createdAt))
-      : assistant.timestamp;
+    const requestedAt = work.activity.length ? Math.max(...work.activity.map(activityCreatedAt)) : assistant.timestamp;
     const pendingApprovals = work.pendingApprovals.filter(
       (approval) =>
         !recorded.some((decision) => decision.requestId === approval.requestId && decision.timestamp >= requestedAt),
@@ -1971,69 +2069,64 @@ export function messagesWithStreaming(messages: AgentMessage[], streaming?: Agen
   });
 }
 
-function goalCancelledPayload(payload: unknown): GoalCancelledNote | null {
-  const p = payload as { kind?: unknown; objective?: unknown } | null;
-  if (p?.kind !== "goal_cancelled" || typeof p.objective !== "string") return null;
-  return { role: "system-note", note: "goal_cancelled", content: p.objective };
+function goalCancelledNote(item: Item): GoalCancelledNote | null {
+  if (item.kind !== "Wake" || item.body.kind !== "goal_cancelled" || typeof item.body.objective !== "string")
+    return null;
+  return { role: "system-note", note: "goal_cancelled", content: item.body.objective };
 }
 
-function messageRevisionPayload(payload: unknown): MessageRevisionNote | null {
-  const p = payload as { kind?: unknown; action?: unknown; ts?: unknown; text?: unknown; name?: unknown } | null;
-  if (p?.kind !== "message_revision") return null;
-  if (p.action !== "edited" && p.action !== "deleted") return null;
-  if (typeof p.ts !== "string" || !p.ts) return null;
+function messageRevisionNote(item: Item): MessageRevisionNote | null {
+  if (item.kind !== "Retraction") return null;
+  const { action, ts, text, name, sourceRole } = item.body;
+  if (action !== "edited" && action !== "deleted") return null;
+  if (typeof ts !== "string" || !ts) return null;
+  const byAgent = sourceRole === "agent";
   return {
     role: "system-note",
     note: "message_revision",
-    action: p.action,
-    ts: p.ts,
-    content: typeof p.text === "string" ? p.text : "",
-    ...(typeof p.name === "string" && p.name.trim() ? { speaker: p.name.trim() } : {}),
+    action,
+    ts,
+    content: typeof text === "string" ? text : "",
+    ...(byAgent ? { byAgent } : {}),
+    ...(!byAgent && typeof name === "string" && name.trim() ? { speaker: name.trim() } : {}),
   };
 }
 
-function userEntryText(payload: unknown): string | null {
-  const p = (payload ?? {}) as { text?: unknown; display?: unknown; hidden?: unknown };
-  if (p.hidden) return null;
-  let display = "";
-  if (typeof p.display === "string" && p.display.trim()) display = p.display;
-  else if (typeof p.text === "string") display = p.text;
-  return display.trim() ? display : null;
+function isAgentEcho(item: Item): boolean {
+  return item.body.overheard === true && item.body.sourceRole === "agent";
 }
 
-export function userEntryMessage(
-  entry: Pick<SessionEntry, "payload" | "seq" | "createdAt">,
-): HistoryUserMessage | null {
-  const payload = entry.payload as {
-    text?: string;
-    hidden?: boolean;
-    runId?: string;
-    steered?: boolean;
-    name?: string;
-    speakerId?: string;
-    ts?: string;
-    attachments?: Array<{ name?: string; mimetype?: string; sizeBytes?: number; artifactId?: string }>;
-  } | null;
-  if (payload?.hidden) return null;
-  const text = userEntryText(payload) ?? "";
-  const attachments = payload?.attachments ?? [];
+function userItemText(item: Item): string | null {
+  const display = item.body.display;
+  if (typeof display === "string" && display.trim()) return display;
+  return item.text?.trim() ? item.text : null;
+}
+
+type UserAttachment = { name?: string; mimetype?: string; sizeBytes?: number; artifactId?: string };
+
+export function userItemMessage(item: Item): HistoryUserMessage | null {
+  if (isHidden(item) || isAgentEcho(item)) return null;
+  const text = userItemText(item) ?? "";
+  const attachments = Array.isArray(item.body.attachments) ? (item.body.attachments as UserAttachment[]) : [];
   if (!text && !attachments.length) return null;
-  const mail = subagentMailOf(payload);
+  const mail = subagentMailOf(item.text);
+  const { name, speakerId } = item.body;
+  const ts = messageTs(item);
   return {
     role: "user",
-    ...(typeof payload?.runId === "string" ? { runId: payload.runId } : {}),
-    ...(entry.seq !== undefined ? { entrySeq: entry.seq } : {}),
+    ...(item.turnId !== null ? { runId: item.turnId } : {}),
+    entrySeq: item.seq,
     content: text,
-    timestamp: entry.createdAt,
+    timestamp: item.createdAt,
     ...(mail ? { subagentMail: mail } : {}),
-    ...(payload?.steered ? { steered: true } : {}),
-    ...(typeof payload?.speakerId === "string" && payload.speakerId ? { speakerId: payload.speakerId } : {}),
-    ...(typeof payload?.name === "string" && payload.name.trim() ? { speaker: payload.name.trim() } : {}),
-    ...(typeof payload?.ts === "string" && payload.ts ? { ts: payload.ts } : {}),
+    ...(item.kind === "SteeringMessage" ? { steered: true } : {}),
+    ...(typeof speakerId === "string" && speakerId ? { speakerId } : {}),
+    ...(typeof name === "string" && name.trim() ? { speaker: name.trim() } : {}),
+    ...(ts ? { ts } : {}),
     ...(attachments.length
       ? {
           attachments: attachments.map((a, i) => ({
-            id: a.artifactId ?? `${entry.seq ?? entry.createdAt}:${i}`,
+            id: a.artifactId ?? `${item.seq}:${i}`,
             type: a.mimetype?.startsWith("image/") ? ("image" as const) : ("document" as const),
             fileName: a.name ?? "file",
             mimeType: a.mimetype ?? "application/octet-stream",
@@ -2047,41 +2140,50 @@ export function userEntryMessage(
 
 export function appendConsumedSteers(messages: AgentMessage[], work: WorkBlock): void {
   const recorded = new Set(messages.map((message) => (message as { entrySeq?: number }).entrySeq));
-  for (const activity of work.activity) {
-    if (activity.type !== "user" || recorded.has(activity.seq)) continue;
-    const message = userEntryMessage(activity);
-    if (!message?.steered) continue;
+  for (const item of activityItems(work.activity)) {
+    if (item.kind !== "SteeringMessage" || recorded.has(item.seq)) continue;
+    const message = userItemMessage(item);
+    if (!message) continue;
     messages.push(message as AgentMessage);
-    recorded.add(activity.seq);
+    recorded.add(item.seq);
   }
 }
 
 const SILENCE_TOOLS = new Set(["finish_silently", "stay_silent"]);
 
-function deliveredSilence(a: ToolActivity): boolean {
-  if (a.type !== "tool_result") return false;
-  const p = a.payload as { tool?: string; silent?: boolean; ok?: boolean } | null;
-  return (p?.tool === "finish_silently" && p?.silent === true) || (p?.tool === "stay_silent" && p?.ok === true);
+function deliveredSilence(item: Item): boolean {
+  if (item.kind !== "ToolResult") return false;
+  return (
+    (item.tool === "finish_silently" && item.body.silent === true) ||
+    (item.tool === "stay_silent" && item.body.ok === true)
+  );
 }
 
-function isFinishedReplyEntry(entry: SessionEntry): boolean {
-  if (entry.type !== "text") return false;
-  const step = (entry.payload as { step?: { stopReason?: unknown } } | null)?.step;
-  if (step?.stopReason !== "stop") return false;
-  return Boolean((entry.payload as { text?: string } | null)?.text?.trim());
+function isFinishedReplyItem(item: Item): boolean {
+  return (
+    isNarration(item) &&
+    !retractedReason(item) &&
+    stepMessage(item)?.stopReason === "stop" &&
+    Boolean(item.text?.trim())
+  );
 }
 
-export function entriesToMessages(entries: SessionEntry[], model?: Model<Api>): AgentMessage[] {
+function isWorkHistoryItem(item: Item): boolean {
+  if (item.kind === "Reasoning") return isRenderableThinking(item);
+  return item.kind === "ToolCall" || item.kind === "ToolResult" || item.kind === "Elicitation" || isNarration(item);
+}
+
+export function itemsToMessages(items: Item[], model?: Model<Api>): AgentMessage[] {
   const out: AgentMessage[] = [];
   const userByTs = new Map<string, HistoryUserMessage>();
-  let pending: ToolActivity[] = [];
+  let pending: Item[] = [];
   let deliveryFiles: DeliveredFile[] = [];
   let posted = false;
   let stoppedShown = false;
   let hiddenPrompt = false;
-  const heldPosts = new Map<string, { text: string; activity: ToolActivity }>();
+  const heldPosts = new Map<string, { text: string; item: Item }>();
   const spillHeldPosts = (): void => {
-    for (const held of heldPosts.values()) pending.push(held.activity);
+    for (const held of heldPosts.values()) pending.push(held.item);
     heldPosts.clear();
   };
   const appendDeliveryFiles = (files: DeliveredFile[]): void => {
@@ -2093,18 +2195,13 @@ export function entriesToMessages(entries: SessionEntry[], model?: Model<Api>): 
     }
     deliveryFiles.push(...files);
   };
-  const appendPostFiles = (resultPayload: unknown): void => {
-    const files = (
-      resultPayload as {
-        files?: Array<{ name?: string; mimetype?: string; sizeBytes?: number; artifactId?: string }>;
-      } | null
-    )?.files;
-    deliveryFiles.push(...deliveredFilesFromAttachments(files));
+  const appendPostFiles = (result: Item): void => {
+    deliveryFiles.push(...deliveredFilesFromAttachments(result.body.files as UserAttachment[] | undefined));
   };
 
-  const appendAttachedFiles = (resultPayload: unknown): void => {
+  const appendAttachedFiles = (result: Item): void => {
     const before = deliveryFiles.length;
-    appendPostFiles(resultPayload);
+    appendPostFiles(result);
     const restaged = new Set(deliveryFiles.slice(before).map((f) => f.name));
     if (restaged.size)
       deliveryFiles = [
@@ -2123,22 +2220,18 @@ export function entriesToMessages(entries: SessionEntry[], model?: Model<Api>): 
     if (!text && !pending.length && !deliveryFiles.length && !stopped) return;
     if (stopped) stoppedShown = true;
     if (hiddenPrompt && !text && !stopped && pending.some(deliveredSilence)) {
-      pending = pending.filter((a) => !SILENCE_TOOLS.has((a.payload as { tool?: string } | null)?.tool ?? ""));
-      if (!pending.some((a) => a.type === "tool_call") && !deliveryFiles.length) {
+      pending = pending.filter((item) => !SILENCE_TOOLS.has(item.tool ?? ""));
+      if (!pending.some((item) => item.kind === "ToolCall") && !deliveryFiles.length) {
         pending = [];
         return;
       }
     }
-    entrySeqs = [...entrySeqs, ...pending.map((entry) => entry.seq)];
-    const lastText = pending.findLastIndex((a) => a.type === "text");
+    entrySeqs = [...entrySeqs, ...pending.map((item) => item.seq)];
+    const lastText = pending.findLastIndex((item) => isNarration(item) && !retractedReason(item));
     if (lastText >= 0) {
-      const segment = ((pending[lastText]!.payload as { text?: string } | null)?.text ?? "").trim();
+      const segment = (pending[lastText]!.text ?? "").trim();
       if (text) {
-        if (
-          segment === text.trim() &&
-          (pending[lastText]!.payload as { phase?: string } | null)?.phase !== "commentary"
-        )
-          pending.splice(lastText, 1);
+        if (segment === text.trim() && pending[lastText]!.body.phase !== "commentary") pending.splice(lastText, 1);
       } else if (closed && !stopped && segment && !pending.some(deliveredSilence)) {
         text = segment;
         pending.splice(lastText, 1);
@@ -2157,14 +2250,13 @@ export function entriesToMessages(entries: SessionEntry[], model?: Model<Api>): 
       timestamp: at ?? pending[pending.length - 1]?.createdAt,
     };
     if (pending.length || (stopped && timing?.startedAt !== undefined)) {
-      const boundary = pending.findLast(
-        (entry) => typeof (entry.payload as { workStartedAt?: unknown } | null)?.workStartedAt === "number",
-      )?.payload as { workStartedAt: number } | undefined;
+      const boundary = pending.findLast((item) => typeof item.body.workStartedAt === "number")?.body.workStartedAt as
+        number | undefined;
       msg.work = {
         status: "complete",
-        startedAt: timing?.startedAt ?? boundary?.workStartedAt ?? pending[0]?.createdAt,
+        startedAt: timing?.startedAt ?? boundary ?? pending[0]?.createdAt,
         finishedAt: timing?.finishedAt ?? at ?? pending[pending.length - 1]?.createdAt,
-        activity: pending,
+        activity: pending.map((item) => ({ item })),
       };
     }
     if (deliveryFiles.length) msg.deliveredFiles = deliveryFiles;
@@ -2172,24 +2264,9 @@ export function entriesToMessages(entries: SessionEntry[], model?: Model<Api>): 
     pending = [];
     deliveryFiles = [];
   };
-  for (const e of entries) {
-    const payload = e.payload as {
-      text?: string;
-      display?: string;
-      callId?: string;
-      attachments?: Array<{ name?: string; mimetype?: string; sizeBytes?: number; artifactId?: string }>;
-      files?: Array<{ name?: string; mimetype?: string; sizeBytes?: number; artifactId?: string }>;
-      hidden?: boolean;
-      steered?: boolean;
-      name?: string;
-      ts?: string;
-      workStartedAt?: number;
-      workFinishedAt?: number;
-      stopped?: boolean;
-      runId?: string;
-    } | null;
-    const text = payload?.text ?? "";
-    if (e.type === "approval_resolved") {
+  for (const e of items) {
+    const text = e.text ?? "";
+    if (e.kind === "ElicitationResponse") {
       const decision = approvalDecisionMessage(e);
       if (decision) {
         spillHeldPosts();
@@ -2198,148 +2275,124 @@ export function entriesToMessages(entries: SessionEntry[], model?: Model<Api>): 
       }
       continue;
     }
-    if (isFinishedReplyEntry(e)) {
+    if (isFinishedReplyItem(e)) {
       spillHeldPosts();
-      flushWork(text, e.createdAt, true, undefined, false, e.seq === undefined ? [] : [e.seq]);
+      flushWork(text, e.createdAt, true, undefined, false, [e.seq]);
+      const prodded = proddedReason(e);
+      const flushed = out.at(-1) as AssistantWork | undefined;
+      if (prodded && flushed?.role === "assistant") flushed.continuing = prodded;
       posted = false;
       continue;
     }
-    if (e.type !== "user" && ACTIVITY_TYPES.has(e.type)) {
-      const activity: ToolActivity = {
-        seq: e.seq ?? out.length,
-        parentSeq: e.parentSeq ?? null,
-        type: e.type as ToolActivity["type"],
-        payload: e.payload,
-        createdAt: e.createdAt,
-        ...(e.truncated ? { truncated: true } : {}),
-      };
-      if (e.type === "tool_call") {
-        const postText = postCallText(e.payload);
-        if (postText !== null && typeof payload?.callId === "string") {
-          heldPosts.set(payload.callId, { text: postText, activity });
+    if (isWorkHistoryItem(e)) {
+      if (e.kind === "ToolCall") {
+        const postText = postCallText(e);
+        if (postText !== null && e.callId) {
+          heldPosts.set(e.callId, { text: postText, item: e });
           continue;
         }
       }
-      if (e.type === "tool_result" && typeof payload?.callId === "string" && heldPosts.has(payload.callId)) {
-        const held = heldPosts.get(payload.callId)!;
-        heldPosts.delete(payload.callId);
-        if (postResultOk(e.payload)) {
-          appendPostFiles(e.payload);
-          flushWork(held.text, e.createdAt, false, undefined, false, [
-            held.activity.seq,
-            ...(e.seq === undefined ? [] : [e.seq]),
-          ]);
+      if (e.kind === "ToolResult" && e.callId && heldPosts.has(e.callId)) {
+        const held = heldPosts.get(e.callId)!;
+        heldPosts.delete(e.callId);
+        if (postResultOk(e)) {
+          appendPostFiles(e);
+          flushWork(held.text, e.createdAt, false, undefined, false, [held.item.seq, e.seq]);
           posted = true;
         } else {
-          pending.push(held.activity, activity);
+          pending.push(held.item, e);
         }
         continue;
       }
-      if (
-        e.type === "tool_result" &&
-        (e.payload as { tool?: unknown } | null)?.tool === "attach" &&
-        postResultOk(e.payload)
-      ) {
-        appendAttachedFiles(e.payload);
-      }
-      if (e.type !== "thinking" || isRenderableThinking(e.payload)) {
-        pending.push(activity);
-      }
+      if (e.kind === "ToolResult" && e.tool === "attach" && postResultOk(e)) appendAttachedFiles(e);
+      pending.push(e);
       continue;
     }
-    if (e.type === "user") {
-      if (!payload?.steered) {
-        stoppedShown = false;
-        hiddenPrompt = payload?.hidden === true;
+    if (isUserMessage(e)) {
+      if (isAgentEcho(e)) {
+        posted = false;
+        spillHeldPosts();
+        flushWork("", e.createdAt);
+        continue;
       }
-      if (payload?.hidden) continue;
-      if (!payload?.steered) {
+      const steered = e.kind === "SteeringMessage";
+      if (!steered) {
+        stoppedShown = false;
+        hiddenPrompt = isHidden(e);
+      }
+      if (isHidden(e)) continue;
+      if (!steered) {
         posted = false;
         spillHeldPosts();
         flushWork("", e.createdAt);
       }
-      const msg = userEntryMessage(e);
+      const msg = userItemMessage(e);
       if (msg) {
         if (msg.ts) userByTs.set(msg.ts, msg);
-        if (msg.steered) {
-          pending.push({
-            seq: e.seq ?? out.length,
-            parentSeq: e.parentSeq ?? null,
-            type: "user",
-            payload: e.payload,
-            createdAt: e.createdAt,
-          });
-        }
+        if (steered) pending.push(e);
         out.push(msg as AgentMessage);
       }
-    } else if (e.type === "assistant") {
+    } else if (e.kind === "AgentMessage" && e.variant === null) {
+      const { workStartedAt, workFinishedAt } = e.body;
       const timing = {
-        ...(typeof payload?.workStartedAt === "number" ? { startedAt: payload.workStartedAt } : {}),
-        ...(typeof payload?.workFinishedAt === "number" ? { finishedAt: payload.workFinishedAt } : {}),
+        ...(typeof workStartedAt === "number" ? { startedAt: workStartedAt } : {}),
+        ...(typeof workFinishedAt === "number" ? { finishedAt: workFinishedAt } : {}),
       };
-      const stopped = payload?.stopped === true || text.trim() === "(stopped)";
+      const stopped = e.body.stopped === true;
       if (text || pending.length || heldPosts.size || stopped) {
         spillHeldPosts();
         if (posted && text) {
-          pending.push({
-            seq: e.seq ?? out.length,
-            parentSeq: e.parentSeq ?? null,
-            type: "text",
-            payload: { text, demoted: true },
-            createdAt: e.createdAt,
-          });
-          flushWork("", e.createdAt, false, timing, stopped, e.seq === undefined ? [] : [e.seq]);
+          pending.push({ ...e, variant: "narration", body: { demoted: true } });
+          flushWork("", e.createdAt, false, timing, stopped, [e.seq]);
         } else {
-          flushWork(text, e.createdAt, !posted, timing, stopped, e.seq === undefined ? [] : [e.seq]);
+          flushWork(text, e.createdAt, !posted, timing, stopped, [e.seq]);
         }
       }
       posted = false;
-    } else if (e.type === "delivery") {
-      appendDeliveryFiles(deliveredFilesFromAttachments(payload?.files));
-    } else if (e.type === "system") {
-      if ((e.payload as { kind?: unknown } | null)?.kind === "turn_stopped") {
-        spillHeldPosts();
-        if (pending.length || !stoppedShown)
-          flushWork("", e.createdAt, !posted, undefined, true, e.seq === undefined ? [] : [e.seq]);
-        posted = false;
-        continue;
+    } else if (e.kind === "AgentMessage" && e.variant === "files_delivered") {
+      appendDeliveryFiles(deliveredFilesFromAttachments(e.body.files as UserAttachment[] | undefined));
+    } else if (e.kind === "Stop") {
+      spillHeldPosts();
+      if (pending.length || !stoppedShown) flushWork("", e.createdAt, !posted, undefined, true, [e.seq]);
+      posted = false;
+    } else if (goalCancelledNote(e)) {
+      spillHeldPosts();
+      flushWork("", e.createdAt);
+      out.push({ ...goalCancelledNote(e)!, timestamp: e.createdAt } as unknown as AgentMessage);
+    } else if (messageRevisionNote(e)) {
+      const revision = messageRevisionNote(e)!;
+      spillHeldPosts();
+      flushWork("", e.createdAt);
+      const original = userByTs.get(revision.ts);
+      if (original) {
+        if (revision.action === "deleted") original.deleted = true;
+        else original.edited = true;
       }
-      const goalNote = goalCancelledPayload(e.payload);
-      if (goalNote) {
-        spillHeldPosts();
-        flushWork("", e.createdAt);
-        out.push({ ...goalNote, timestamp: e.createdAt } as unknown as AgentMessage);
-        continue;
-      }
-      const revision = messageRevisionPayload(e.payload);
-      if (revision) {
-        spillHeldPosts();
-        flushWork("", e.createdAt);
-        const original = userByTs.get(revision.ts);
-        if (original) {
-          if (revision.action === "deleted") original.deleted = true;
-          else original.edited = true;
-        }
-        out.push({ ...revision, timestamp: e.createdAt } as unknown as AgentMessage);
-        continue;
-      }
-      const failure = e.payload as { kind?: string; message?: string } | null;
-      if (failure?.kind === "turn_failure" && typeof failure.message === "string" && failure.message) {
-        spillHeldPosts();
-        flushWork("", e.createdAt);
-        const msg: AssistantMessage = {
-          role: "assistant",
-          content: [{ type: "text", text: "" }],
-          api: model?.api ?? "unknown",
-          provider: model?.provider ?? "unknown",
-          model: model?.id ?? "unknown",
-          usage: zeroUsage(),
-          stopReason: "error",
-          errorMessage: failure.message,
-          timestamp: e.createdAt,
-        };
-        out.push(msg as AgentMessage);
-      }
+      out.push({ ...revision, timestamp: e.createdAt } as unknown as AgentMessage);
+    } else if (e.kind === "Error" && e.text && e.errorCode === "steer_withheld") {
+      spillHeldPosts();
+      flushWork("", e.createdAt);
+      out.push({
+        role: "system-note",
+        note: "notice",
+        content: e.text,
+        timestamp: e.createdAt,
+      } as unknown as AgentMessage);
+    } else if (e.kind === "Error" && e.text) {
+      spillHeldPosts();
+      flushWork("", e.createdAt);
+      const msg: AssistantMessage = {
+        role: "assistant",
+        content: [{ type: "text", text: "" }],
+        api: model?.api ?? "unknown",
+        provider: model?.provider ?? "unknown",
+        model: model?.id ?? "unknown",
+        usage: zeroUsage(),
+        stopReason: "error",
+        errorMessage: e.text,
+        timestamp: e.createdAt,
+      };
+      out.push(msg as AgentMessage);
     }
   }
   spillHeldPosts();
@@ -2359,11 +2412,7 @@ export function attachPendingApprovals(
     for (let i = messages.length - 1; i >= 0; i--) {
       const m = messages[i] as AssistantWork;
       if (m.role !== "assistant" || !m.work) continue;
-      if (
-        m.work.activity.some(
-          (a) => a.type === "tool_call" && (a.payload as { command?: string } | null)?.command === command,
-        )
-      )
+      if (activityItems(m.work.activity).some((item) => item.kind === "ToolCall" && item.body.command === command))
         return m;
     }
     return undefined;

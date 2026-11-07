@@ -5,9 +5,13 @@ import type { AddressInfo } from "node:net";
 import { createServer } from "../src/api/server.ts";
 import type { App, RedeployInput } from "../src/api/app.ts";
 import { signRequest } from "../src/auth/source-auth.ts";
+import { mintSignedPayload } from "../src/auth/signed-token.ts";
 import { scopeId } from "../src/types.ts";
+import { createPostgresReplayDedupe } from "../src/auth/replay-dedupe.ts";
+import { testDatabaseUrl } from "./support/test-database.ts";
 
 const SECRET = "deploy-redeploy-route-secret".repeat(2);
+const PID = "deploy-redeploy-route-portal".repeat(2);
 
 describe("deployment redeploy route", () => {
   let server: Server;
@@ -23,6 +27,7 @@ describe("deployment redeploy route", () => {
         "content-type": "application/json",
         "x-timestamp": String(ts),
         "x-signature": signRequest(SECRET, ts, `POST\n${path}\n${raw}`),
+        "x-portal-identity": await mintSignedPayload({ p: "U1", exp: Date.now() + 60_000 }, PID),
       },
       body: raw,
     });
@@ -40,14 +45,18 @@ describe("deployment redeploy route", () => {
       versions: [{ version: 1, createdAt: 1, entrypoint: "x", snapshotDir: "/tmp" }],
     };
     const app = {
-      listDeployments: async () => [deployment],
+      getDeployment: async (id: string) => (id === deployment.id || id === deployment.name ? deployment : null),
       canManageDeployment: async () => true,
       redeploy: async (_id: string, input: RedeployInput) => {
         received = input;
         return deployment;
       },
     } as unknown as App;
-    server = createServer(app, { signingSecret: SECRET });
+    server = createServer(app, {
+      replayDedupe: createPostgresReplayDedupe(testDatabaseUrl()),
+      signingSecret: SECRET,
+      portalIdentitySecret: PID,
+    });
     await new Promise<void>((resolve) => server.listen(0, resolve));
     base = `http://localhost:${(server.address() as AddressInfo).port}`;
   });
@@ -66,7 +75,7 @@ describe("deployment redeploy route", () => {
     };
     const response = await post("/v1/deployments/envy/redeploy", body);
     assert.equal(response.status, 200);
-    assert.deepEqual(received, body);
+    assert.deepEqual(received, { ...body, actor: "U1" });
     const { deployment } = (await response.json()) as { deployment: { versions: Record<string, unknown>[] } };
     assert.deepEqual(Object.keys(deployment.versions[0]!), ["version", "createdAt"], "no snapshot paths or env");
   });

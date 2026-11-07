@@ -2,10 +2,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createAclStore } from "../src/acl/acl-store.ts";
 import { encodeRef, skillRef, parseRef } from "../src/acl/resource-ref.ts";
-import { principalEntitledToScope } from "../src/resolution/context-filter.ts";
-import { createMemoryMap, type DurableMap } from "../src/persistence/durable-map.ts";
+import { entitledScopes } from "../src/resolution/context-filter.ts";
+import { type DurableMap } from "../src/persistence/durable-map.ts";
 import { createSkillStore, type Skill, type SkillManifest, type SkillStore } from "../src/skills/skill-store.ts";
 import { scopeId, type Principal, type ScopeId } from "../src/types.ts";
+import { testMap, testAdvisoryLock, testDatabaseUrl } from "./support/test-database.ts";
+import { createPostgresGrantStore } from "../src/acl/postgres-grant-store.ts";
 
 const ORG = scopeId("org", "default-org");
 const JOSH = scopeId("personal", "josh");
@@ -26,7 +28,7 @@ async function publishedSkill(store: SkillStore, scope: ScopeId, name: string) {
 }
 
 test("person-to-person skill grant reaches the grantee's audience", async () => {
-  const acl = createAclStore();
+  const acl = createAclStore(createPostgresGrantStore(testDatabaseUrl()));
   await acl.grant({
     ownerScopeId: JOSH,
     ref: encodeRef(skillRef("s1")),
@@ -35,7 +37,7 @@ test("person-to-person skill grant reaches the grantee's audience", async () => 
     grantedBy: "josh",
   });
 
-  const inEricsDm = await acl.sharedOfKindForAudience("skill", [P("eric")], ERIC, ORG, principalEntitledToScope);
+  const inEricsDm = await acl.sharedOfKindForAudience("skill", [P("eric")], ERIC, ORG, entitledScopes);
   assert.deepEqual(
     inEricsDm.map((g) => parseRef(g.ref).id),
     ["s1"],
@@ -46,7 +48,7 @@ test("person-to-person skill grant reaches the grantee's audience", async () => 
     [P("eric"), P("josh")],
     scopeId("channel", "C"),
     ORG,
-    principalEntitledToScope,
+    entitledScopes,
   );
   assert.equal(together.length, 1);
 
@@ -55,7 +57,7 @@ test("person-to-person skill grant reaches the grantee's audience", async () => 
     [P("eric"), P("mallory")],
     scopeId("channel", "C"),
     ORG,
-    principalEntitledToScope,
+    entitledScopes,
   );
   assert.deepEqual(mixed, []);
 
@@ -64,13 +66,13 @@ test("person-to-person skill grant reaches the grantee's audience", async () => 
     [P("alice")],
     scopeId("personal", "alice"),
     ORG,
-    principalEntitledToScope,
+    entitledScopes,
   );
   assert.deepEqual(other, []);
 });
 
 test("visibleFor includes granted skills, shadowed by scope-owned skills of the same name", async () => {
-  const store = createSkillStore({ signingSecret: "grant-test" });
+  const store = createSkillStore({ advisoryLock: testAdvisoryLock(), backing: testMap(), signingSecret: "grant-test" });
   const granted = await publishedSkill(store, JOSH, "quickbooks");
   const own = await publishedSkill(store, ERIC, "quickbooks");
   const unique = await publishedSkill(store, JOSH, "reconcile");
@@ -104,7 +106,11 @@ test("visibleFor includes granted skills, shadowed by scope-owned skills of the 
 });
 
 test("a grant redundant with scope visibility does not self-shadow", async () => {
-  const store = createSkillStore({ signingSecret: "self-shadow-test" });
+  const store = createSkillStore({
+    advisoryLock: testAdvisoryLock(),
+    backing: testMap(),
+    signingSecret: "self-shadow-test",
+  });
   const own = await publishedSkill(store, ERIC, "quickbooks");
 
   const rows = await store.visibleFor([ERIC, ORG], [{ id: own.id, ownerScopeId: ERIC }]);
@@ -113,22 +119,31 @@ test("a grant redundant with scope visibility does not self-shadow", async () =>
   assert.deepEqual(rows[0]!.shadowed, []);
 });
 
-test("visibleFor takes one snapshot instead of one per published name", async () => {
-  const backing = createMemoryMap<Skill>();
+test("visibleFor reads only the requested scopes in one query instead of one per published name", async () => {
+  const backing = testMap<Skill>();
   let allCalls = 0;
   let getCalls = 0;
+  let selects: string[][] = [];
   const counted: DurableMap<Skill> = {
     ...backing,
     all: () => {
       allCalls += 1;
       return backing.all();
     },
+    select: (query) => {
+      selects.push([...(query.where?.anyOfFold ?? [])]);
+      return backing.select(query);
+    },
     get: (id) => {
       getCalls += 1;
       return backing.get(id);
     },
   };
-  const store = createSkillStore({ signingSecret: "snapshot-test", backing: counted });
+  const store = createSkillStore({
+    advisoryLock: testAdvisoryLock(),
+    signingSecret: "snapshot-test",
+    backing: counted,
+  });
   const orgAlpha = await publishedSkill(store, ORG, "alpha-skill");
   for (const name of ["beta-skill", "gamma-skill"]) await publishedSkill(store, ORG, name);
   const own = await publishedSkill(store, ERIC, "alpha-skill");
@@ -136,9 +151,14 @@ test("visibleFor takes one snapshot instead of one per published name", async ()
 
   allCalls = 0;
   getCalls = 0;
+  selects = [];
   const rows = await store.visibleFor([ERIC, ORG], [{ id: granted.id, ownerScopeId: JOSH }]);
-  assert.equal(allCalls, 1);
+  assert.equal(allCalls, 0);
   assert.equal(getCalls, 0);
+  assert.deepEqual(
+    selects.map((scopes) => scopes.sort()),
+    [[ERIC, JOSH, ORG].map((scope) => scope.toLowerCase()).sort()],
+  );
 
   const byName = new Map(rows.map((r) => [r.skill!.manifest.name, r]));
   assert.deepEqual([...byName.keys()].sort(), ["alpha-skill", "beta-skill", "delta-skill", "gamma-skill"]);
@@ -151,7 +171,7 @@ test("visibleFor takes one snapshot instead of one per published name", async ()
 });
 
 test("a grant whose claimed owner scope does not match the skill's home is ignored", async () => {
-  const store = createSkillStore({ signingSecret: "forge-test" });
+  const store = createSkillStore({ advisoryLock: testAdvisoryLock(), backing: testMap(), signingSecret: "forge-test" });
   const victim = await publishedSkill(store, JOSH, "victim-skill");
 
   const forged = await store.visibleFor([ERIC, ORG], [{ id: victim.id, ownerScopeId: ERIC }]);

@@ -1,4 +1,5 @@
-import { actsAsScope, type Cron, type CronSchedule, type Destination } from "../types.ts";
+import { actsAsScope, type Destination } from "../types.ts";
+import type { Cron, CronSchedule } from "./types.ts";
 import { principalDestination } from "../reach/reach.ts";
 import { personKeys } from "../directory/person.ts";
 import { errMessage, reportFailure, reportFailureAs } from "../util/errors.ts";
@@ -103,7 +104,7 @@ export async function notifyOwnerOfCronEdit(
     const [kind, scopeRef] = String(cron.ownerScopeId).split(":", 2) as [string, string | undefined];
     const place =
       kind === "channel" && scopeRef && sink.channelName
-        ? await sink.channelName(scopeRef).catch(() => undefined)
+        ? await sink.channelName(scopeRef).catch(reportFailureAs("cron edit notice: channel name lookup", undefined))
         : undefined;
     await sink.enqueueDelivery({
       destination: principalDestination(cron.owner, args.editorId),

@@ -1,5 +1,5 @@
 import type { ErrorLog } from "../admin/error-log.ts";
-import type { Harness } from "../harness/harness.ts";
+import type { Agent } from "../agent/agent.ts";
 import type { SessionStateBus } from "../runs/session-state-bus.ts";
 import type { SessionStore } from "../sessions/session-store.ts";
 import type { ScopeId } from "../types.ts";
@@ -16,7 +16,7 @@ function fallbackSessionTitle(text: string): string | undefined {
 
 export function createSessionTitles(deps: {
   sessions: SessionStore;
-  harness: Harness;
+  agent: Agent;
   sessionStateBus?: SessionStateBus;
   errors?: ErrorLog;
 }) {
@@ -24,13 +24,13 @@ export function createSessionTitles(deps: {
     sessionId: string,
     scopeId: ScopeId,
     transcript: string,
-    principalId?: string,
-    fallbackText?: string,
+    opts: { principalId?: string; fallbackText?: string; descriptive?: boolean } = {},
   ): Promise<string | undefined> {
+    const { principalId, fallbackText, descriptive } = opts;
     if (!transcript.trim()) return undefined;
     let title: string | undefined;
     try {
-      title = await deps.harness.models.generateTitle?.(transcript);
+      title = await deps.agent.generateTitle?.(transcript, descriptive ? { descriptive } : undefined);
     } catch (e) {
       deps.errors?.record(
         {
@@ -64,20 +64,24 @@ export function createSessionTitles(deps: {
     session: { id: string; threadRef: string },
     scopeId: ScopeId,
     text: string,
-  ): Promise<void> | undefined {
+    descriptive = false,
+  ): { written: Promise<void>; generated: Promise<string | undefined> } | undefined {
     const fallback = fallbackSessionTitle(text);
     if (!fallback) return undefined;
-    const write = deps.sessions.updateTitle(session.id, fallback);
-    void write
+    const written = deps.sessions.updateTitle(session.id, fallback);
+    const generated = written
       .then(() => announce(session).catch(swallowAs("session title: sidebar refresh", undefined)))
       .then(async () => {
-        if (!deps.harness.models.generateTitle) return;
-        if (await generateAndStore(session.id, scopeId, `User:\n${stripTurnBoilerplate(text)}`))
-          await announce(session);
+        if (!deps.agent.generateTitle) return undefined;
+        const title = await generateAndStore(session.id, scopeId, `User:\n${stripTurnBoilerplate(text)}`, {
+          descriptive,
+        });
+        if (title) await announce(session);
+        return title;
       })
       .finally(() => deps.errors?.flush())
       .catch(swallowAs("session title", undefined));
-    return write;
+    return { written, generated };
   }
 
   return { generateAndStore, titleFromFirstMessage };

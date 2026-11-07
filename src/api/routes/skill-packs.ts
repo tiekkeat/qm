@@ -1,5 +1,5 @@
 import { sendJson } from "../http.ts";
-import type { ApiCtx, Route } from "./route.ts";
+import { withAdmin, type ApiCtx, type Route } from "./route.ts";
 import { audit, authorizeAdmin, orgScope } from "./shared.ts";
 import type { NewSkillPack, SkillPack } from "../../skills/skill-pack-store.ts";
 import type { PackConfig } from "../../skills/normalize.ts";
@@ -181,12 +181,12 @@ async function removePack(ctx: ApiCtx): Promise<void> {
   sendJson(ctx.res, 200, result);
 }
 
-export const skillPackRoutes: ReadonlyArray<Route<ApiCtx>> = [
-  { method: "POST", path: "/v1/admin/skill-packs", auth: "either", handle: registerPack },
-  { method: "GET", path: "/v1/admin/skill-packs", auth: "either", handle: listPacks },
-  { method: "GET", path: "/v1/admin/skill-packs/:id/catalog", auth: "either", handle: packCatalog },
-  { method: "POST", path: "/v1/admin/skill-packs/:id/import", auth: "either", handle: importPack },
-  { method: "POST", path: "/v1/admin/skill-packs/:id/sync", auth: "either", handle: syncPack },
-  { method: "PATCH", path: "/v1/admin/skill-packs/:id", auth: "either", handle: patchPack },
-  { method: "DELETE", path: "/v1/admin/skill-packs/:id", auth: "either", handle: removePack },
-];
+export const skillPackRoutes: ReadonlyArray<Route<ApiCtx>> = withAdmin([
+  { method: "POST", path: "/v1/admin/skill-packs", browser: "self", auth: "either", handle: registerPack },
+  { method: "GET", path: "/v1/admin/skill-packs", browser: "self", auth: "either", handle: listPacks },
+  { method: "GET", path: "/v1/admin/skill-packs/:id/catalog", browser: "self", auth: "either", handle: packCatalog },
+  { method: "POST", path: "/v1/admin/skill-packs/:id/import", browser: "self", auth: "either", handle: importPack },
+  { method: "POST", path: "/v1/admin/skill-packs/:id/sync", browser: "self", auth: "either", handle: syncPack },
+  { method: "PATCH", path: "/v1/admin/skill-packs/:id", browser: "self", auth: "either", handle: patchPack },
+  { method: "DELETE", path: "/v1/admin/skill-packs/:id", browser: "self", auth: "either", handle: removePack },
+]);

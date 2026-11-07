@@ -17,7 +17,7 @@ import {
 } from "../src/connectors/oauth.ts";
 import { createEnvSecretSource } from "../src/credentials/secret-source.ts";
 import { createOAuthFlowStore } from "../src/connectors/oauth-flow-store.ts";
-import { createMemoryMap } from "../src/persistence/durable-map.ts";
+import { testMap } from "./support/test-database.ts";
 
 const env = {
   GOOGLE_OAUTH_CLIENT_ID: "gid",
@@ -507,8 +507,50 @@ test("X refresh captures the ROTATED refresh token (single-use) — the connecti
   assert.equal(fresh.expiresAt, 5_000 + 7200_000);
 });
 
+test("token failures keep the provider's error detail", async () => {
+  const failing =
+    (status: number, json: () => Promise<unknown>): FetchLike =>
+    async () => ({ ok: false, status, json });
+  await assert.rejects(
+    exchangeCode("google", "code", "https://app/cb", {
+      client: await googleClient(),
+      fetchImpl: failing(400, async () => ({ error: "invalid_grant", error_description: "Code expired" })),
+      now: 1_000,
+    }),
+    /token exchange failed \(400\): invalid_grant: Code expired$/,
+  );
+  await assert.rejects(
+    makeRefresh({
+      resolveClient: resolve,
+      fetchImpl: failing(401, async () => ({ reason: "Invalid client_id or client_secret", error: "invalid_client" })),
+      now: () => 1_000,
+    })("api.x.com", { accessToken: "old", refreshToken: "rt", expiresAt: 0 }),
+    /x token refresh failed \(401\): invalid_client: Invalid client_id or client_secret$/,
+  );
+  await assert.rejects(
+    exchangeCode("google", "code", "https://app/cb", {
+      client: await googleClient(),
+      fetchImpl: failing(401, async () => ({
+        error: { code: "refresh_token_reused", message: "Refresh token already used" },
+      })),
+      now: 1_000,
+    }),
+    /token exchange failed \(401\): refresh_token_reused: Refresh token already used$/,
+  );
+  await assert.rejects(
+    exchangeCode("google", "code", "https://app/cb", {
+      client: await googleClient(),
+      fetchImpl: failing(502, async () => {
+        throw new SyntaxError("Unexpected token <");
+      }),
+      now: 1_000,
+    }),
+    /token exchange failed \(502\)$/,
+  );
+});
+
 test("oauth flow store — a short opaque state resolves once, then expires", async () => {
-  const store = createOAuthFlowStore(createMemoryMap<OAuthState>(), { now: () => 1_000 });
+  const store = createOAuthFlowStore(testMap<OAuthState>(), { now: () => 1_000 });
   const flowId = await store.start({
     provider: "x",
     principalId: "person@example.com",
@@ -522,7 +564,7 @@ test("oauth flow store — a short opaque state resolves once, then expires", as
   assert.equal(opened?.nonce, flowId);
   assert.equal(await store.finish(flowId), null, "single use");
 
-  const stale = createOAuthFlowStore(createMemoryMap<OAuthState>(), { now: () => 1_000, ttlMs: 10 });
+  const stale = createOAuthFlowStore(testMap<OAuthState>(), { now: () => 1_000, ttlMs: 10 });
   const staleId = await stale.start({ provider: "x", principalId: "U1", redirectUri: "https://example.test/cb" }, 0);
   assert.equal(await stale.finish(staleId), null, "expired");
 });

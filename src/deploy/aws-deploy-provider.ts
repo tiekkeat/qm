@@ -5,11 +5,11 @@ import type { Deployment, DeploymentVersion } from "./deploy-store.ts";
 import type { DeployEndpoint, DeployProvider, DeployReconcileInput } from "./deploy-provider.ts";
 import { bytes, normalizeRelPath, posixJoin, readTree } from "./deploy-fs.ts";
 import { AwsApiError, createMicrovmApi, createMicrovmClient, type AwsMicrovmApi } from "../sandbox/aws-microvm-api.ts";
-import { createMemoryMap, type DurableMap } from "../persistence/durable-map.ts";
-import { createNoopAdvisoryLock, type AdvisoryLock } from "../persistence/advisory-lock.ts";
+import type { DurableMap } from "../persistence/durable-map.ts";
+import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
 import { createKeyedQueue, sleep } from "../util/async.ts";
 import { shq } from "../util/shell.ts";
-import { execFailure, swallow } from "../util/errors.ts";
+import { execFailure, swallow, swallowAs } from "../util/errors.ts";
 import {
   appEnv,
   appGone,
@@ -39,6 +39,7 @@ const DATA_CREDS_REFRESH_MS = 45 * 60_000;
 const DATA_CREDS_RETRY_MS = 60_000;
 const failureBackoffStamp = (): number => Date.now() - DATA_CREDS_REFRESH_MS + DATA_CREDS_RETRY_MS;
 const MAX_DATA_TAR_BYTES = 180 * 1024 * 1024;
+const MAX_APP_BYTES = 100 * 1024 * 1024;
 const READY_PATH = `${APP_DIR}/.qm-ready`;
 const APP_READY_WINDOW_SEC = 60;
 const APP_PORT_RELEASE_TICKS = 40;
@@ -87,8 +88,8 @@ export interface AwsDeployProviderOptions {
   dataPrefix?: string;
   snapshotIntervalMs?: number;
   dataRoleArn?: string;
-  store?: DurableMap<StoredDeployBody>;
-  advisoryLock?: AdvisoryLock;
+  store: DurableMap<StoredDeployBody>;
+  advisoryLock: AdvisoryLock;
   api?: AwsMicrovmApi;
   fetchImpl?: typeof fetch;
   s3?: Pick<S3Client, "send">;
@@ -105,9 +106,9 @@ export function createAwsDeployProvider(opts: AwsDeployProviderOptions): DeployP
       ...(opts.profile ? { profile: opts.profile } : {}),
       ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
     });
-  const store = opts.store ?? createMemoryMap<StoredDeployBody>();
+  const store = opts.store;
   const launchQueue = createKeyedQueue<string>();
-  const advisoryLock = opts.advisoryLock ?? createNoopAdvisoryLock();
+  const advisoryLock = opts.advisoryLock;
   const resolveCache = new Map<string, { endpoint: DeployEndpoint; checkedMs: number; usedMs: number }>();
   const inflightResolves = new Map<string, Promise<DeployEndpoint | null>>();
   const resolveGens = new Map<string, number>();
@@ -117,12 +118,7 @@ export function createAwsDeployProvider(opts: AwsDeployProviderOptions): DeployP
     inflightResolves.delete(id);
   };
   const detached = async (d: Deployment, fn: () => Promise<void>): Promise<void> => {
-    const run = (): Promise<void> => launchQueue(d.id, fn);
-    if (advisoryLock.tryWithLock) {
-      await advisoryLock.tryWithLock(`deploy:${d.id}`, run);
-      return;
-    }
-    await advisoryLock.withLock(`deploy:${d.id}`, run);
+    await advisoryLock.tryWithLock(`deploy:${d.id}`, () => launchQueue(d.id, fn));
   };
 
   const ingress = opts.ingressConnectorArns?.length ? opts.ingressConnectorArns : [DEFAULT_INGRESS(region)];
@@ -287,7 +283,9 @@ export function createAwsDeployProvider(opts: AwsDeployProviderOptions): DeployP
     }
     if (made.code !== 0) throw new Error(`data snapshot tar failed (code ${made.code}): ${made.stderr.slice(0, 200)}`);
     const tar = await readAbsBytes(id, endpoint, tarPath);
-    await execRaw(id, endpoint, `rm -f ${shq(tarPath)}`, 30).catch(() => {});
+    await execRaw(id, endpoint, `rm -f ${shq(tarPath)}`, 30).catch(
+      swallowAs("aws-deploy: remove data snapshot tar", undefined),
+    );
     if (!tar?.length) throw new Error("data snapshot read-back empty");
     await s3.send(new PutObjectCommand({ Bucket: dataBucket, Key: dataKeyFor(deploymentId), Body: tar }));
     return true;
@@ -379,7 +377,9 @@ export function createAwsDeployProvider(opts: AwsDeployProviderOptions): DeployP
           next = await launchBody(d.id, d.alwaysOn);
           const replacement = next;
           await store.put(d.id, { ...stored, replacementMicrovmId: replacement.id });
-          await ensureRunning(stored.microvmId, stored.endpoint, desc).catch(() => {});
+          await ensureRunning(stored.microvmId, stored.endpoint, desc).catch(
+            swallowAs("aws-deploy: keep old body running during replacement", undefined),
+          );
           const defer = async (
             label: string,
             e: unknown,
@@ -514,7 +514,7 @@ export function createAwsDeployProvider(opts: AwsDeployProviderOptions): DeployP
           if (r.code === 24) {
             if (fresh) binariesMissingUntilMs = Date.now() + 10 * 60_000;
             msg =
-              "litestream/aws binaries missing from the MicroVM image — roll AWS_DEPLOY_IMAGE (aws/microvm-agent) before setting AWS_DEPLOY_DATA_ROLE_ARN";
+              "litestream/aws binaries missing from the MicroVM image — roll AWS_DEPLOY_IMAGE (cli/templates/aws/microvm-agent) before setting AWS_DEPLOY_DATA_ROLE_ARN";
           }
           if (fresh) {
             await store.delete(d.id).catch((e) => swallow("aws-deploy: litestream-fail clear pointer", e));
@@ -600,9 +600,7 @@ export function createAwsDeployProvider(opts: AwsDeployProviderOptions): DeployP
             await store.put(d.id, { ...cur, lastSnapshotMs: Date.now() });
             return cur;
           });
-        const cur = advisoryLock.tryWithLock
-          ? await advisoryLock.tryWithLock(`deploy:${d.id}`, claim)
-          : await advisoryLock.withLock(`deploy:${d.id}`, claim);
+        const cur = await advisoryLock.tryWithLock(`deploy:${d.id}`, claim);
         if (cur) await snapshotData(d.id, cur.microvmId, cur.endpoint);
       })().catch((e) => swallow("aws-deploy: periodic data snapshot", e));
     }
@@ -619,7 +617,9 @@ export function createAwsDeployProvider(opts: AwsDeployProviderOptions): DeployP
           await refreshLitestream(d.id, cur.microvmId, cur.endpoint);
           await store.put(d.id, { ...cur, dataCredsAtMs: Date.now() });
         } catch (e) {
-          await store.put(d.id, { ...cur, dataCredsAtMs: failureBackoffStamp() }).catch(() => {});
+          await store
+            .put(d.id, { ...cur, dataCredsAtMs: failureBackoffStamp() })
+            .catch(swallowAs("aws-deploy: stamp litestream creds backoff", undefined));
           throw e;
         }
       }).catch((e) => swallow("aws-deploy: litestream creds refresh", e));
@@ -644,7 +644,12 @@ export function createAwsDeployProvider(opts: AwsDeployProviderOptions): DeployP
   };
 
   return {
-    profile: { managedScaleToZero: true, inPlaceReconcile: true, ...(s3 ? { dataDir: DATA_DIR } : {}) },
+    profile: {
+      managedScaleToZero: true,
+      inPlaceReconcile: true,
+      maxAppBytes: MAX_APP_BYTES,
+      ...(s3 ? { dataDir: DATA_DIR } : {}),
+    },
 
     apply: (d, version) => place(d, version),
 

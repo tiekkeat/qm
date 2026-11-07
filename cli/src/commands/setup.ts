@@ -1,4 +1,3 @@
-import { generateKeyPairSync, randomBytes } from "node:crypto";
 import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface, type Interface } from "node:readline/promises";
@@ -9,8 +8,7 @@ import { HOSTING_PROVIDER_IDS, isTarget } from "../providers.ts";
 import {
   computedSecrets,
   emailSecretNames,
-  MINT_JWK,
-  MINT_LOCALLY,
+  mintLocalSecret,
   serviceSecretValue,
   type ComputedSecret,
 } from "../secrets.ts";
@@ -28,10 +26,6 @@ export function adminGrantEmails(adminGrants: string | undefined): string {
     })
     .filter((principal) => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(principal))
     .join(",");
-}
-
-export function mintSigningJwk(): string {
-  return JSON.stringify(generateKeyPairSync("ec", { namedCurve: "P-256" }).privateKey.export({ format: "jwk" }));
 }
 
 const PLAYBOOKS: Readonly<Record<string, readonly string[]>> = {
@@ -106,6 +100,10 @@ const PLAYBOOKS: Readonly<Record<string, readonly string[]>> = {
   PORTAL_EXPECTED_TEAM_ID: [
     "Copy the Slack workspace ID from the workspace About dialog or the team_id",
     "returned after installing the Slack sign-in app.",
+  ],
+  RENDER_API_KEY: [
+    "Create an API key at https://dashboard.render.com/u/settings#api-keys.",
+    "The key must have access to the configured Render workspace.",
   ],
   PUBLIC_API_URL: [
     "The public URL agent sandboxes use to reach core's self-API. For docker this",
@@ -263,14 +261,9 @@ export async function runSetup(opts: { dir: string }): Promise<void> {
       note(`  ${secret.description}`);
       for (const line of playbookFor(secret.name, config)) note(`  ${dim(line)}`);
 
-      if (secret.generate === MINT_LOCALLY) {
-        collected.set(secret.name, randomBytes(32).toString("hex"));
-        ok(`  generated locally\n`);
-        continue;
-      }
-
-      if (secret.generate === MINT_JWK) {
-        collected.set(secret.name, mintSigningJwk());
+      const minted = mintLocalSecret(secret);
+      if (minted) {
+        collected.set(secret.name, minted);
         ok(`  generated locally\n`);
         continue;
       }
@@ -320,7 +313,7 @@ export async function runSetup(opts: { dir: string }): Promise<void> {
     stepLine(n++, "qm check", "validate the config and sandbox layer");
     stepLine(n++, "qm doctor", "verify external prerequisites read-only");
     if (config.target === "aws")
-      stepLine(n++, "see AGENTS.md", "the AWS bootstrap order (Terraform, TLS, portal) before up");
+      stepLine(n++, "see AGENTS.md", "the AWS bootstrap order (Terraform, TLS, sign-in) before up");
     else stepLine(n++, "qm up", "bring the deployment up and print the URLs");
     if (skipped.length > 0 && remainingRequired.length === 0) note(dim(`  (optional skipped: ${skipped.join(", ")})`));
   } finally {

@@ -37,6 +37,7 @@ export function toEvent(raw: unknown): IngestEvent | null {
     ...(typeof raw.authorId === "string" ? { authorId: raw.authorId } : {}),
     ...(typeof raw.authorName === "string" ? { authorName: raw.authorName } : {}),
     ...(typeof raw.text === "string" ? { text: raw.text } : {}),
+    ...(isObj(raw.raw) ? { raw: raw.raw } : {}),
     ...(isObj(raw.mentions) ? { mentions: strMap(raw.mentions) } : {}),
     ...(raw.self === true ? { self: true } : {}),
     ...(raw.bot === true ? { bot: true } : {}),
@@ -104,7 +105,7 @@ async function setChannelPolicy(ctx: ApiCtx): Promise<void> {
 }
 
 export const surfaceCacheRoutes: ReadonlyArray<Route<ApiCtx>> = [
-  { method: "POST", path: "/v1/surface-cache/ingest", auth: "source", handle: ingestSurfaceEvents },
+  { method: "POST", path: "/v1/surface-cache/ingest", actor: "system", auth: "source", handle: ingestSurfaceEvents },
   { method: "GET", path: "/v1/surface-cache/policy", auth: "source", handle: getChannelPolicy },
-  { method: "POST", path: "/v1/surface-cache/policy", auth: "source", handle: setChannelPolicy },
+  { method: "POST", path: "/v1/surface-cache/policy", actor: "system", auth: "source", handle: setChannelPolicy },
 ];

@@ -2,16 +2,14 @@ import { spawnSync } from "node:child_process";
 import { appendFileSync, chmodSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { liveEnvPath } from "./pool.ts";
-import { bestEffort, readEnvFile, sha256Hex } from "./util.ts";
+import { readEnvFile } from "../../../cli/src/util.ts";
+import { bestEffort, sha256Hex } from "./util.ts";
 import { run } from "./proc.ts";
-import { codexAuthFileForEnv, readCodexOAuthAuthFile } from "../../../src/model/chatgpt-auth-file.ts";
 
 export interface AssembledEnv {
   env: Record<string, string>;
   anthropicKeySource: string;
   openaiKeySource: string;
-  codexAuthSource: string;
-  harness: "pi" | "mock" | "claude";
   liveEnvFile: string;
   warnings: string[];
 }
@@ -68,8 +66,8 @@ export function seedEnvFromMain(worktree: string, log: (msg: string) => void): v
   const existing = readEnvFile(wtEnvPath);
   const main = readEnvFile(mainEnv);
   const added: string[] = [];
-  for (const [k, v] of Object.entries(main)) {
-    if (k in existing) continue;
+  for (const [k, v] of main) {
+    if (existing.has(k)) continue;
     appendFileSync(wtEnvPath, `${k}=${v}\n`);
     added.push(k);
   }
@@ -92,17 +90,16 @@ async function anthropicKeyFromLoginShell(): Promise<string> {
 export async function assembleEnv(opts: {
   worktree: string;
   callerEnv: Record<string, string>;
-  allowMock: boolean;
   log: (msg: string) => void;
   probeLoginShell?: () => Promise<string>;
 }): Promise<AssembledEnv> {
   const warnings: string[] = [];
   const liveEnvFile = liveEnvPath();
   const env: Record<string, string> = { ...opts.callerEnv };
-  for (const [k, v] of Object.entries(readEnvFile(liveEnvFile))) {
+  for (const [k, v] of readEnvFile(liveEnvFile)) {
     if (!env[k]) env[k] = v;
   }
-  const wtEnv = readEnvFile(join(opts.worktree, ".env"));
+  const wtEnv = Object.fromEntries(readEnvFile(join(opts.worktree, ".env")));
 
   let anthropicKeySource = "";
   if (opts.callerEnv.ANTHROPIC_API_KEY) anthropicKeySource = "your shell export";
@@ -127,31 +124,12 @@ export async function assembleEnv(opts: {
     openaiKeySource = "the worktree .env";
   }
 
-  if (!env.CODEX_AUTH_FILE && wtEnv.CODEX_AUTH_FILE) env.CODEX_AUTH_FILE = wtEnv.CODEX_AUTH_FILE;
-  let codexAuthSource = "";
-  const codexAuthCandidate = codexAuthFileForEnv({ ...env, ...opts.callerEnv });
-  const codexOAuthConfigured = Boolean(codexAuthCandidate && readCodexOAuthAuthFile(codexAuthCandidate));
-  if (codexOAuthConfigured && codexAuthCandidate) {
-    env.CODEX_AUTH_FILE = codexAuthCandidate;
-    codexAuthSource = codexAuthCandidate;
-  }
-
-  let harness: "pi" | "mock" | "claude";
-  if (opts.callerEnv.HARNESS === "claude") {
-    harness = "claude";
-    env.HARNESS = harness;
-  } else if (env.ANTHROPIC_API_KEY || env.OPENAI_API_KEY || codexOAuthConfigured) {
-    harness = "pi";
-    env.HARNESS = harness;
+  if (env.ANTHROPIC_API_KEY || env.OPENAI_API_KEY) {
     if (!env.ANTHROPIC_API_KEY && env.OPENAI_API_KEY && !env.MODEL_PROVIDER) env.MODEL_PROVIDER = "openai";
     if (!env.PI_CAPTURE_REQUESTS) env.PI_CAPTURE_REQUESTS = "1";
-  } else if (opts.allowMock) {
-    harness = "mock";
-    env.HARNESS = "mock";
-    warnings.push("mock turns explicitly allowed by DEV_INSTANCE_ALLOW_MOCK=1 -- no anthropic key found");
   } else {
     throw new Error(
-      `ANTHROPIC_API_KEY, OPENAI_API_KEY, or a ChatGPT login (CODEX_AUTH_FILE) is required: dev instances exercise real LLM calls by default. Export a key, add one to ${liveEnvFile}, or set DEV_INSTANCE_ALLOW_MOCK=1 for a deliberate mock-only wiring check.`,
+      `ANTHROPIC_API_KEY or OPENAI_API_KEY is required: dev instances exercise real LLM calls by default. Export a key or add one to ${liveEnvFile}.`,
     );
   }
 
@@ -162,11 +140,11 @@ export async function assembleEnv(opts: {
     if (!env[k] && wtEnv[k]) env[k] = wtEnv[k];
   }
 
-  return { env, anthropicKeySource, openaiKeySource, codexAuthSource, harness, liveEnvFile, warnings };
+  return { env, anthropicKeySource, openaiKeySource, liveEnvFile, warnings };
 }
 
 export function envFileGet(path: string, key: string): string {
-  return readEnvFile(path)[key] ?? "";
+  return readEnvFile(path).get(key) ?? "";
 }
 
 export function callerEnvSnapshot(): Record<string, string> {

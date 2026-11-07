@@ -1,14 +1,8 @@
 import type { Readable } from "node:stream";
 import { basename } from "node:path";
 import { randomUUID } from "node:crypto";
-import type {
-  AttachmentMeta,
-  GrantedHandle,
-  IncomingAttachment,
-  OutgoingAttachment,
-  ScopeId,
-  SessionEntry,
-} from "../types.ts";
+import type { AttachmentMeta, IncomingAttachment, OutgoingAttachment, ScopeId } from "../types.ts";
+import { isUserItem, type Item } from "../sessions/items.ts";
 import { hasParentPathSegment, type Sandbox, type SandboxHandle } from "../sandbox/sandbox.ts";
 import {
   MAX_BLOB_BYTES,
@@ -18,6 +12,7 @@ import {
 } from "../persistence/blob-transfer.ts";
 import { fileArtifactId, type FileArtifactStore, type FileDirection } from "../files/file-artifact-store.ts";
 import { swallowAs } from "../util/errors.ts";
+import { MIME_BY_EXT, fileContentRequest } from "./documents.ts";
 import { hashId } from "../util/crypto.ts";
 import type { SecurityScreenVerdict } from "../security/security-posture.ts";
 import { downscaleVisionImage } from "./image-downscale.ts";
@@ -83,42 +78,6 @@ export function safeAttachmentName(name: string): string {
   return base;
 }
 
-const MIME_BY_EXT: Record<string, string> = {
-  txt: "text/plain",
-  md: "text/markdown",
-  csv: "text/csv",
-  json: "application/json",
-  html: "text/html",
-  xml: "application/xml",
-  yaml: "application/yaml",
-  yml: "application/yaml",
-  pdf: "application/pdf",
-  doc: "application/msword",
-  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-  xls: "application/vnd.ms-excel",
-  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-  ppt: "application/vnd.ms-powerpoint",
-  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-  odt: "application/vnd.oasis.opendocument.text",
-  ods: "application/vnd.oasis.opendocument.spreadsheet",
-  odp: "application/vnd.oasis.opendocument.presentation",
-  rtf: "application/rtf",
-  tsv: "text/tab-separated-values",
-  eml: "message/rfc822",
-  ics: "text/calendar",
-  vcf: "text/vcard",
-  js: "text/javascript",
-  ts: "text/typescript",
-  py: "text/x-python",
-  png: "image/png",
-  jpg: "image/jpeg",
-  jpeg: "image/jpeg",
-  gif: "image/gif",
-  webp: "image/webp",
-  svg: "image/svg+xml",
-  zip: "application/zip",
-};
-
 export function mimeFromName(name: string): string {
   const ext = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1).toLowerCase() : "";
   return MIME_BY_EXT[ext] ?? "application/octet-stream";
@@ -127,8 +86,6 @@ export function mimeFromName(name: string): string {
 export const MAX_OUTBOUND_FILES = 20;
 
 export const MAX_INBOUND_FILES = 10;
-
-export const MAX_SHARED_FILES_LISTED = 25;
 
 export interface ArtifactRegistration {
   store: FileArtifactStore;
@@ -186,12 +143,12 @@ function uniqueName(name: string, used: Set<string>): string {
 
 export function withoutAlreadyIngested(
   attachments: IncomingAttachment[],
-  contextEntries: readonly SessionEntry[],
+  contextItems: readonly Item[],
 ): IncomingAttachment[] {
   const seen = new Set<string>();
-  for (const entry of contextEntries) {
-    if (entry.type !== "user") continue;
-    const metas = (entry.payload as { attachments?: unknown } | null)?.attachments;
+  for (const item of contextItems) {
+    if (!isUserItem(item)) continue;
+    const metas = item.body.attachments;
     if (!Array.isArray(metas)) continue;
     for (const meta of metas as AttachmentMeta[]) {
       if (meta.direction === "in" && typeof meta.sourceId === "string" && shownToModel(meta)) seen.add(meta.sourceId);
@@ -205,41 +162,24 @@ function shownToModel(meta: AttachmentMeta): boolean {
   return isVisionAttachment(meta) && meta.sizeBytes > 0 && meta.sizeBytes <= MAX_VISION_IMAGE_BYTES;
 }
 
-export function inboundManifest(metas: AttachmentMeta[], inboxDir = INBOX_DIR, unstaged?: Set<string>): string {
-  if (!metas.length) return "";
-  const list = metas
-    .map(
-      (m) =>
-        `- ${inboxDir}/${m.name} (${m.mimetype}, ${m.sizeBytes} bytes)${m.author ? ` — shared by ${m.author}` : ""}${
-          unstaged?.has(m.name)
-            ? ` — saved as file ${m.artifactId}, not yet on a computer (no default sandbox); send it directly with {file_id: "${m.artifactId}"}; if you need it on disk, choose a sandbox_id for execute and download GET $AGENT_API_URL/v1/files/${m.artifactId}/content (header x-agent-capability: $AGENT_API_TOKEN) to a path you choose`
-            : ""
-        }`,
-    )
+export function inboundManifest(
+  metas: AttachmentMeta[],
+  inboxDir = INBOX_DIR,
+  unstaged?: Set<string>,
+  sharer?: string,
+): string {
+  return metas
+    .map((m) => {
+      const where = unstaged?.has(m.name)
+        ? `Files ID ${m.artifactId}, not yet on a computer: send it with {file_id: "${m.artifactId}"}, or choose a sandbox_id for execute and download ${fileContentRequest(m.artifactId!)}`
+        : `./${inboxDir}/${m.name}`;
+      return `${m.author ?? sharer ?? "The user"} shared ${m.name} (${where}).`;
+    })
     .join("\n");
-  const noun = metas.length === 1 ? "file" : "files";
-  const where = unstaged?.size ? `for ./${inboxDir}/` : `available in ./${inboxDir}/`;
-  const lead = metas.some((m) => m.author)
-    ? `${metas.length} ${noun} shared in this conversation, ${where}:`
-    : `The user shared ${metas.length} ${noun}, ${where}:`;
-  return `${lead}\n${list}`;
 }
 
-const FILE_EVENT_KIND = "file_event";
-
-export interface FileEventPayload {
-  kind: typeof FILE_EVENT_KIND;
-  direction: FileDirection;
-  issues: string[];
-  text: string;
-}
-
-export function fileEventPayload(direction: FileDirection, issues: string[]): FileEventPayload {
-  const lead =
-    direction === "in"
-      ? `Files received this turn that did not reach ./${INBOX_DIR}/`
-      : "Files the agent tried to send that did not go out";
-  return { kind: FILE_EVENT_KIND, direction, issues, text: `${lead}: ${issues.join("; ")}` };
+export function inboundIssuesNote(issues: readonly string[]): string {
+  return issues.length ? `Files received this turn that did not reach ./${INBOX_DIR}/: ${issues.join("; ")}` : "";
 }
 
 export function inboundIssueList(opts: {
@@ -262,41 +202,6 @@ export function inboundIssueList(opts: {
   }
   for (const n of opts.surfaceNotes ?? []) if (n.trim()) issues.push(n.trim());
   return issues;
-}
-
-export function sharedManifest(handles: readonly GrantedHandle[]): string {
-  const seen = new Set<string>();
-  const lines: string[] = [];
-  for (const h of handles) {
-    if (seen.has(h.handlePath)) continue;
-    seen.add(h.handlePath);
-    lines.push(`- ${h.handlePath}${h.permission === "write" ? " (writable)" : ""}`);
-  }
-  if (!lines.length) return "";
-  const total = lines.length;
-  const shown = lines.sort().slice(0, MAX_SHARED_FILES_LISTED);
-  const omitted = total - shown.length;
-  if (omitted > 0) {
-    shown.push(`…and ${omitted} more (read shared/<name> to fetch)`);
-  }
-  const noun = total === 1 ? "file" : "files";
-  return `${total} ${noun} shared with you — read a path below to fetch that file on demand:\n${shown.join("\n")}`;
-}
-
-export function sharedFilesSystemSection(handles: readonly GrantedHandle[]): string {
-  const body = sharedManifest(handles);
-  if (!body) return "";
-  return `## Files shared with you\n${body}`;
-}
-
-export function environmentNote(text: string): string {
-  if (!text.trim()) return "";
-  return `<environment>\n${text.trim()}\n</environment>`;
-}
-
-export function senderNote(name: string | undefined): string {
-  const n = name?.trim();
-  return n ? `This message is from @${n}.` : "";
 }
 
 export async function materializeInbound(
@@ -393,13 +298,13 @@ export async function materializeInbound(
 
 const DELIVERY_NOTE_PREFIX = "[files delivered to the conversation: ";
 
-export function deliveryNote(manifest: string): string {
-  return `${DELIVERY_NOTE_PREFIX}${manifest.replace(/\s+/g, " ").trim()}]`;
+export function isDeliveryNote(text: string): boolean {
+  const value = text.trim();
+  return value.startsWith(DELIVERY_NOTE_PREFIX) && value.endsWith("]") && !value.includes("\n");
 }
 
-export function isDeliveryNote(text: string): boolean {
-  const t = text.trim();
-  return t.startsWith(DELIVERY_NOTE_PREFIX) && t.endsWith("]") && !t.includes("\n");
+export function deliveryNote(manifest: string): string {
+  return `${DELIVERY_NOTE_PREFIX}${manifest.replace(/\s+/g, " ").trim()}]`;
 }
 
 export type OutboundFile = string | { file_id: string };

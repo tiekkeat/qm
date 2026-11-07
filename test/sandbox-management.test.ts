@@ -1,12 +1,13 @@
+import { testDatabaseUrl } from "./support/test-database.ts";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createProjectStore, projectGroupRef, projectScopeId } from "../src/projects/project-store.ts";
 import { createProjectScopeGuard } from "../src/projects/project-scope-guard.ts";
-import { createMemoryMap } from "../src/persistence/durable-map.ts";
-import { createMemoryAdvisoryLock } from "../src/persistence/advisory-lock.ts";
+import { testMap } from "./support/test-database.ts";
+import { testAdvisoryLock } from "./support/test-database.ts";
 import { createSandboxResources, type SandboxResource, type SandboxDefault } from "../src/sandbox/sandbox-resources.ts";
 import { createSandboxRouter } from "../src/sandbox/sandbox-routing.ts";
-import { createMemoryProcessRegistry } from "../src/processes/process-registry.ts";
+import { createPostgresProcessRegistry } from "../src/processes/process-registry.ts";
 import { createSandboxMethods } from "../src/api/app-sandboxes.ts";
 import type { AppDeps } from "../src/api/app-types.ts";
 import type { AppHelpers } from "../src/api/app-helpers.ts";
@@ -16,20 +17,20 @@ import { createCanReadScope, createCanWriteScope } from "../src/resolution/scope
 import type { MemoryService } from "../src/memory/memory-service.ts";
 
 async function fixture() {
-  const lock = createMemoryAdvisoryLock();
-  const projects = createProjectStore(undefined, { id: () => "p1", advisoryLock: lock });
+  const lock = testAdvisoryLock();
+  const projects = createProjectStore(testMap(), { id: () => "p1", advisoryLock: lock });
   await projects.create({ name: "Launch", ownerId: "owner" });
   await projects.addMember("p1", "owner", "member");
   const scope = projectScopeId("p1");
-  const records = createMemoryMap<SandboxResource>();
-  const defaults = createMemoryMap<SandboxDefault>();
-  const processes = createMemoryProcessRegistry();
+  const records = testMap<SandboxResource>();
+  const defaults = testMap<SandboxDefault>();
+  const processes = createPostgresProcessRegistry(testDatabaseUrl());
   const destroyed: string[] = [];
   let failDestroy = false;
   const backend: Sandbox = {
     profile: { backend: "local", processSessions: true, writablePersistence: "resident_disk" },
-    async provision(layers) {
-      return { id: layers[0]!.scopeId, rootDir: "/workspace" };
+    async provision(scope) {
+      return { id: scope, rootDir: "/workspace" };
     },
     async run() {
       return { stdout: "", stderr: "", code: 0, timedOut: false };
@@ -86,7 +87,7 @@ async function fixture() {
     scopeIsActive: guard.active,
   });
   const sandbox = createSandboxRouter({ backends: { local: backend }, defaultBackend: "local", resources });
-  const rawSkills = createSkillStore();
+  const rawSkills = createSkillStore({ backing: testMap(), advisoryLock: lock });
   const skills = guard.skills(rawSkills);
   const events: string[] = [];
   const apps = [{ id: "app1", ownerScopeId: scope, name: "published" }];

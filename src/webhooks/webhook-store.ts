@@ -1,13 +1,13 @@
-import type { RecipientConsent, Webhook } from "../types.ts";
-import { createMemoryMap, type DurableMap } from "../persistence/durable-map.ts";
+import type { Webhook } from "../triggers/types.ts";
+import type { DurableMap } from "../persistence/durable-map.ts";
 import {
   assertNoEscalation,
   buildTriggerBase,
   contentPart,
   createDeduped,
   setTriggerEnabled,
-  setTriggerRecipientConsent,
   type CreateTriggerInput,
+  ownedBy,
 } from "../triggers/trigger-store.ts";
 import { hashId } from "../util/crypto.ts";
 import { getVerifier } from "./verifiers.ts";
@@ -34,17 +34,13 @@ export interface WebhookStore {
   create(input: CreateWebhookInput): Promise<Webhook>;
   get(id: string): Promise<Webhook | null>;
   list(): Promise<Webhook[]>;
+  ownedBy(scopeId: string): Promise<Webhook[]>;
   setEnabled(id: string, enabled: boolean): Promise<void>;
   update(id: string, patch: { action: string }): Promise<Webhook | null>;
-  setRecipientConsent(id: string, recipientConsent: RecipientConsent): Promise<void>;
   recordFire(id: string, info: { at: number; deliveryId?: string; error?: string }): Promise<void>;
 }
 
-export function createWebhookStore(
-  backing: DurableMap<Webhook> = createMemoryMap<Webhook>(),
-  history: DurableMap<WebhookHistory> = createMemoryMap<WebhookHistory>(),
-): WebhookStore {
-  if (!history.update) throw new Error("webhook history requires atomic updates");
+export function createWebhookStore(backing: DurableMap<Webhook>, history: DurableMap<WebhookHistory>): WebhookStore {
   const updateHistory = history.update.bind(history);
   return {
     async recordEvent(id, event) {
@@ -100,14 +96,12 @@ export function createWebhookStore(
     },
     get: (id) => backing.get(id),
     list: () => backing.all(),
+    ownedBy: (scopeId) => ownedBy(backing, scopeId),
     setEnabled(id, enabled) {
       return setTriggerEnabled(backing, id, enabled);
     },
     update(id, patch) {
       return backing.merge(id, { action: patch.action });
-    },
-    setRecipientConsent(id, recipientConsent) {
-      return setTriggerRecipientConsent(backing, id, recipientConsent);
     },
     async recordFire(id, info) {
       await backing.merge(id, {

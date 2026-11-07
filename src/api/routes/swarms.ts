@@ -2,7 +2,7 @@ import { sendJson } from "../http.ts";
 import { errMessage } from "../../util/errors.ts";
 import type { SwarmCaller } from "../../swarms/swarm-service.ts";
 import { isObj } from "./shared.ts";
-import type { ApiCtx, Route } from "./route.ts";
+import { withActor, type ApiCtx, type Route } from "./route.ts";
 import { SPAWN_RUNTIME_FIELDS } from "../../swarms/swarm-runtime.ts";
 
 const ACTION_FIELDS: Record<string, string[]> = { context: ["context"], control: ["memberId", "state"] };
@@ -15,16 +15,11 @@ async function swarmRequest(ctx: ApiCtx): Promise<void> {
   else if (actor && params.id && !capability) {
     if (!(await app.getSessionForViewer(params.id, actor.p)))
       return sendJson(res, 403, { error: "session access denied" });
-    caller = {
-      kind: "human",
-      actorId: actor.p,
-      sessionId: params.id,
-      ...(isObj(body) && typeof body.runId === "string" ? { runId: body.runId } : {}),
-    };
+    caller = { kind: "human", actorId: actor.p, sessionId: params.id };
   } else return sendJson(res, 403, { error: "session-bound authentication required" });
   try {
     if (method === "GET") {
-      if (url.searchParams.get("read") === "1") {
+      if (caller.kind === "agent" && url.searchParams.get("read") === "1") {
         const messages = await app.swarms.read(caller, {
           after: Number(url.searchParams.get("after") ?? 0),
           waitMs: Number(url.searchParams.get("waitMs") ?? 0),
@@ -35,13 +30,14 @@ async function swarmRequest(ctx: ApiCtx): Promise<void> {
       return sendJson(res, 200, await app.swarms.inspect(caller));
     }
     if (!isObj(body)) throw new Error("expected an object");
+    if (caller.kind === "human" && body.action !== "control") throw new Error("only swarm controls are available here");
     const allowed = new Set([
       "action",
-      ...(caller.kind === "human" ? ["runId"] : []),
       ...(ACTION_FIELDS[String(body.action)] ?? ["requestId", "text"]),
       ...(body.action === "spawn" ? ["count", "context", "contexts", "forumSandboxId", ...SPAWN_RUNTIME_FIELDS] : []),
-      ...(body.action === "send" ? ["audience", "replyTo", "notify"] : []),
+      ...(body.action === "send" ? ["audience", "replyTo", "wake"] : []),
       ...(body.action === "spawn" ? ["settings", "backend"] : []),
+      ...(body.action === "spawn" || body.action === "send" ? ["goal"] : []),
     ]);
     if (Object.keys(body).some((key) => !allowed.has(key))) throw new Error("unsupported swarm request field");
     if (body.action === "context") {
@@ -72,6 +68,7 @@ async function swarmRequest(ctx: ApiCtx): Promise<void> {
         ...(typeof body.forumSandboxId === "string" ? { forumSandboxId: body.forumSandboxId } : {}),
         ...(isObj(body.settings) ? { settings: body.settings } : {}),
         ...(typeof body.backend === "string" ? { backend: body.backend } : {}),
+        ...("goal" in body ? { goal: body.goal } : {}),
         ...Object.fromEntries(
           SPAWN_RUNTIME_FIELDS.filter((field) => field in body).map((field) => [field, body[field]]),
         ),
@@ -81,7 +78,7 @@ async function swarmRequest(ctx: ApiCtx): Promise<void> {
     if (body.action === "send") {
       if (
         !(Array.isArray(body.audience) || body.audience === "all") ||
-        (body.notify !== undefined && typeof body.notify !== "boolean") ||
+        (body.wake !== undefined && typeof body.wake !== "boolean") ||
         (body.replyTo !== undefined && typeof body.replyTo !== "string")
       )
         throw new Error("invalid message parameters");
@@ -89,8 +86,9 @@ async function swarmRequest(ctx: ApiCtx): Promise<void> {
         requestId: body.requestId,
         text: body.text,
         audience: body.audience,
-        ...(typeof body.notify === "boolean" ? { notify: body.notify } : {}),
+        ...(typeof body.wake === "boolean" ? { wake: body.wake } : {}),
         ...(typeof body.replyTo === "string" ? { replyTo: body.replyTo } : {}),
+        ...("goal" in body ? { goal: body.goal } : {}),
       });
       return sendJson(res, 202, { message });
     }
@@ -103,6 +101,8 @@ async function swarmRequest(ctx: ApiCtx): Promise<void> {
 export const swarmRoutes: ReadonlyArray<Route<ApiCtx>> = [
   { method: "GET", path: "/v1/swarm", auth: "either", handle: swarmRequest },
   { method: "POST", path: "/v1/swarm", auth: "either", handle: swarmRequest },
-  { method: "GET", path: "/v1/sessions/:id/swarm", auth: "source", handle: swarmRequest },
-  { method: "POST", path: "/v1/sessions/:id/swarm", auth: "source", handle: swarmRequest },
+  ...withActor("person", [
+    { method: "GET", path: "/v1/sessions/:id/swarm", browser: true, auth: "source", handle: swarmRequest },
+    { method: "POST", path: "/v1/sessions/:id/swarm", browser: true, auth: "source", handle: swarmRequest },
+  ]),
 ];

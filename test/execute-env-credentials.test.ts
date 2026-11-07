@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { scopeId } from "../src/types.ts";
 import { installGlobalFakeSprites, type FakeSprites } from "./support/fake-sprites.ts";
 import { testConfig } from "./support/test-config.ts";
@@ -79,11 +79,6 @@ test("role broker vends only for explicitly selected scoped execution", async ()
   const run = (text: string) => built.app.turn({ surface: "slack", actor, conversation, text });
   assert.equal((await run('!run test -z "${AWS_ACCESS_KEY_ID-}" && echo absent')).reply, "absent");
   assert.equal(assumes, 0);
-  await assert.rejects(
-    run(`!execute ${JSON.stringify({ command: "true", credentials: ["broker_acmecli"], ownerAuth: true })}`),
-    /requires scope:scoped/,
-  );
-  assert.equal(assumes, 0);
   assert.equal(
     (
       await run(
@@ -95,6 +90,69 @@ test("role broker vends only for explicitly selected scoped execution", async ()
   assert.equal(assumes, 1);
   assert.equal((await run('!run test -z "${AWS_ACCESS_KEY_ID-}" && echo absent')).reply, "absent");
   assert.equal(assumes, 1);
+});
+
+test("role broker sessions in a shared conversation reach only the turn's scratch computer", async () => {
+  const built = buildApp(
+    testConfig({
+      dataDir: mkdtempSync(join(tmpdir(), "shared-broker-")),
+      signingSecret: "shared-broker-signing",
+      apiBaseUrl: "http://core.test",
+      deploymentLayerDir: acmecliBrokeredLayer(),
+      maxAttempts: 1,
+    }),
+    {
+      credentialBrokers: {
+        acmecli: createAwsRoleBroker({
+          roleArn: "arn:aws:iam::123456789012:role/acmecli-broker",
+          region: "us-west-2",
+          sessionActions: ["execute-api:Invoke"],
+          assumeRole: async () => ({
+            Credentials: {
+              AccessKeyId: "AKIA_SHARED_ROOM",
+              SecretAccessKey: "shared-room-secret",
+              SessionToken: "shared-room-session",
+              Expiration: new Date(Date.now() + 3600000),
+            },
+          }),
+        }),
+      },
+    },
+  );
+  const members = [actor, { externalId: "U_ENV_PEER" }];
+  await built.directory.replaceChannels(
+    [{ channelId: "C_BROKER", name: "broker-room", isPrivate: true }],
+    members.map(({ externalId }) => ({ channelId: "C_BROKER", principalId: externalId })),
+  );
+  await selectDefaultSandbox(built, actor.externalId, scopeId("channel", "C_BROKER"));
+  const scratchBoxes = new Set<string>();
+  const provision = built.sandbox.provision.bind(built.sandbox);
+  built.sandbox.provision = async (owner, opts) => {
+    const handle = await provision(owner, opts);
+    if (opts?.scratch) scratchBoxes.add(handle.id);
+    return handle;
+  };
+  const exposed: string[] = [];
+  const run = built.sandbox.run.bind(built.sandbox);
+  built.sandbox.run = async (handle, command, opts) => {
+    if (JSON.stringify(handle.env ?? {}).includes("shared-room-secret") && !scratchBoxes.has(handle.id))
+      exposed.push(handle.id);
+    return run(handle, command, opts);
+  };
+  const conversation = {
+    kind: "channel" as const,
+    channelRef: "C_BROKER",
+    threadRef: "C_BROKER:shared-broker",
+    audience: members,
+  };
+  const turn = (text: string) => built.app.turn({ surface: "slack", actor, conversation, text });
+  const result = await turn(
+    `!execute ${JSON.stringify({ command: 'test "$AWS_ACCESS_KEY_ID" = AKIA_SHARED_ROOM && test -n "${AGENT_API_TOKEN-}" && echo scratch', credentials: ["broker_acmecli"] })}`,
+  );
+  assert.equal(result.reply, "scratch", JSON.stringify(result));
+  assert.equal(scratchBoxes.size, 1);
+  assert.deepEqual(exposed, []);
+  assert.equal((await turn('!run test -z "${AWS_ACCESS_KEY_ID-}" && echo absent')).reply, "absent");
 });
 
 test("selected broker execute honors deployment approval rules before vending credentials", async () => {
@@ -162,7 +220,7 @@ test("selected broker execute honors deployment approval rules before vending cr
   assert.equal(unrelated.status, "ok", "subcommands without approval rules run without a grant");
   assert.equal(assumes, 1, "the broker's per-actor credential cache is reused within its TTL");
   assert.match(unrelated.reply ?? "", /<redacted:credential>/);
-  const durable = JSON.stringify(await built.sessions.getEntries(unrelated.sessionId!));
+  const durable = JSON.stringify(await built.sessions.getItems(unrelated.sessionId!));
   for (const value of ["AKIA_APPROVAL_GATE", "approval_gate_secret_value", "approval_gate_session_token"]) {
     assert.ok(!(unrelated.reply ?? "").includes(value));
     assert.ok(!durable.includes(value));

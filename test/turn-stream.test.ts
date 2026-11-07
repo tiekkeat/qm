@@ -6,7 +6,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createTurnStream, goalView } from "../src/runs/turn-stream.ts";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { testConfig } from "./support/test-config.ts";
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -159,9 +159,9 @@ test("a queued tool-using run surfaces its activity + timings via getRun()", asy
     assert.equal(finished.status, "done");
 
     const run = await built.app.getRun(ack.runId!);
-    const types = (run?.activity ?? []).map((a) => a.type);
-    assert.ok(types.includes("tool_call"), "the execute tool_call was mirrored to the run's activity");
-    assert.ok(types.includes("tool_result"), "the execute tool_result was mirrored too");
+    const kinds = (run?.activity ?? []).flatMap((a) => ("item" in a ? [a.item.kind] : []));
+    assert.ok(kinds.includes("ToolCall"), "the execute tool call was mirrored to the run's activity");
+    assert.ok(kinds.includes("ToolResult"), "the execute tool result was mirrored too");
     assert.equal(typeof run?.startedAt, "number", "getRun surfaces when the run started");
     assert.equal(typeof run?.finishedAt, "number", "getRun surfaces when the run finished");
   } finally {
@@ -445,4 +445,37 @@ test("monitor wakes persist engagement after the reply gate", async () => {
   } finally {
     await built.runtime.stop();
   }
+});
+
+test("reasoning streams per block beside the reply text, capped, and settles when persisted", () => {
+  const published: Array<{ step: string; index: number; text: string; offset: number }> = [];
+  const s = createTurnStream({
+    onReasoning: (_runId, block, text, offset) => published.push({ ...block, text, offset }),
+  });
+  s.publishReasoning("r1", "step-a", 0, "**Plan**");
+  s.publishReasoning("r1", "step-a", 0, " the fix");
+  s.publishReasoning("r1", "step-a", 2, "second block");
+  s.publish("r1", "Answer");
+  assert.equal(s.snapshot("r1"), "Answer", "reasoning never enters the reply text");
+  assert.deepEqual(s.reasoning("r1"), [
+    { step: "step-a", index: 0, text: "**Plan** the fix" },
+    { step: "step-a", index: 2, text: "second block" },
+  ]);
+  assert.deepEqual(
+    published.map(({ index, offset }) => [index, offset]),
+    [
+      [0, 0],
+      [0, 8],
+      [2, 0],
+    ],
+  );
+  s.settleReasoning("r1", "step-a", 0);
+  assert.deepEqual(s.reasoning("r1"), [{ step: "step-a", index: 2, text: "second block" }]);
+  s.publishReasoning("r1", "step-b", 0, "x".repeat(25_000));
+  s.publishReasoning("r1", "step-b", 0, "more");
+  assert.equal(s.reasoning("r1").find((b) => b.step === "step-b")?.text.length, 20_000);
+  assert.equal(published.at(-1)?.text.length, 20_000, "nothing is published past the cap");
+  s.end("r1");
+  s.begin("r1");
+  assert.deepEqual(s.reasoning("r1"), [], "a retried attempt never serves the previous attempt's blocks");
 });

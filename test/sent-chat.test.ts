@@ -5,10 +5,11 @@ import { buildGmailReplyMime } from "../src/loops/sources/gmail.ts";
 import { findRoute, run, type ApiCtx } from "../src/api/routes/route.ts";
 import { createLoopStore } from "../src/loops/loop-store.ts";
 import { createLoopItemLedger } from "../src/loops/item-ledger.ts";
+import { testMap } from "./support/test-database.ts";
 
 test("sent chats are durable, idempotent, and isolated to the signed-in owner", async () => {
-  const store = createLoopStore();
-  const items = createLoopItemLedger();
+  const store = createLoopStore(testMap());
+  const items = createLoopItemLedger(testMap());
   let previewEnabled = false;
   let status = 0;
   let response: { item: { id: string; loopId: string; state: string; thread: { text: string }[] } };
@@ -72,8 +73,8 @@ test("sent chats are durable, idempotent, and isolated to the signed-in owner", 
 });
 
 test("a sent email draft saves and sends into the original Gmail thread exactly once", async () => {
-  const store = createLoopStore();
-  const items = createLoopItemLedger();
+  const store = createLoopStore(testMap());
+  const items = createLoopItemLedger(testMap());
   let response: { item: { id: string; loopId: string; proposal?: { at: number; data: { body: string } } } };
   let status = 0;
   const ctx = {
@@ -156,8 +157,8 @@ test("a sent email draft saves and sends into the original Gmail thread exactly 
 });
 
 test("sent chat preserves long quoted recipient headers and rejects oversized input", async () => {
-  const store = createLoopStore();
-  const items = createLoopItemLedger();
+  const store = createLoopStore(testMap());
+  const items = createLoopItemLedger(testMap());
   let status = 0;
   let id = "";
   const to = [
@@ -183,8 +184,8 @@ test("sent chat preserves long quoted recipient headers and rejects oversized in
   await ensureSentChat(ctx);
   assert.equal(status, 200);
   const stored = (await items.get(id))!;
-  const mime = buildGmailReplyMime(stored, { body: "Hello" })!;
-  assert.ok(mime.startsWith(`To: ${to}\r\nCc: ${cc}\r\n`));
+  const mime = (await buildGmailReplyMime(stored, { body: "Hello" }))!.toString();
+  assert.ok(mime.replaceAll("\r\n ", " ").startsWith(`To: ${to}\r\nCc: ${cc}\r\n`));
   for (const invalid of [
     { to: "x".repeat(8001) },
     { cc: "x".repeat(8001) },

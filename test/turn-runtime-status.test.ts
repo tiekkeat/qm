@@ -1,24 +1,24 @@
 import "./support/auto-fake-sprites.ts";
 import { mock, test } from "node:test";
 import assert from "node:assert/strict";
-import * as mockHarness from "../src/harness/mock-harness.ts";
+import * as mockAgent from "./support/mock-agent.ts";
 import { testConfig } from "./support/test-config.ts";
 
 let started!: () => void;
 let release!: () => void;
 let handoffTo: string | undefined;
-mock.module("../src/harness/mock-harness.ts", {
+mock.module("./support/mock-agent.ts", {
   namedExports: {
-    ...mockHarness,
-    createMockHarness: () => {
-      const harness = mockHarness.createMockHarness();
-      harness.turns.runTurn = async () => {
+    ...mockAgent,
+    createMockAgent: () => {
+      const agent = mockAgent.createMockAgent();
+      agent.runTurn = async () => {
         if (handoffTo) {
           const modelId = handoffTo;
           handoffTo = undefined;
           return {
             reply: "",
-            runtimeHandoff: { choice: { harnessId: "mock", modelId }, lifetime: "task" as const },
+            runtimeHandoff: { choice: { modelId }, lifetime: "task" as const },
           };
         }
         started();
@@ -27,11 +27,11 @@ mock.module("../src/harness/mock-harness.ts", {
         });
         return { reply: "Done" };
       };
-      return harness;
+      return agent;
     },
   },
 });
-const { buildApp } = await import("../src/wiring.ts");
+const { buildApp } = await import("./support/build-app.ts");
 
 test("a run reports the runtime its turn runs on while working and after it finishes", async () => {
   const built = buildApp(testConfig({ workers: 1 }));
@@ -43,7 +43,7 @@ test("a run reports the runtime its turn runs on while working and after it fini
       });
       const queued = await built.app.turn({
         surface: "web",
-        liveActor: true,
+        origin: { kind: "human" },
         actor: { externalId: "U1" },
         conversation: { kind: "dm", threadRef: `runtime-${model ?? "default"}` },
         text: "hello",
@@ -75,7 +75,7 @@ test("a runtime the agent switches to mid-turn is reported as its switch", async
     handoffTo = "claude-haiku-5-5";
     const queued = await built.app.turn({
       surface: "web",
-      liveActor: true,
+      origin: { kind: "human" },
       actor: { externalId: "U1" },
       conversation: { kind: "dm", threadRef: "runtime-switch" },
       text: "switch me to haiku",

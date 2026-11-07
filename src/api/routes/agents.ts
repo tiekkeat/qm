@@ -2,7 +2,7 @@ import { AgentError } from "../../agents/agent-service.ts";
 import { agentAction, agentSelection } from "../../agents/agent-actions.ts";
 import { sendJson } from "../http.ts";
 import { isObj } from "./shared.ts";
-import type { ApiCtx, Route } from "./route.ts";
+import { withAdmin, type ApiCtx, type Route } from "./route.ts";
 async function handle(ctx: ApiCtx) {
   const s = ctx.app.customAgents;
   if (!s) return sendJson(ctx.res, 503, { error: "Agents unavailable" });
@@ -72,12 +72,22 @@ async function handle(ctx: ApiCtx) {
     throw error;
   }
 }
-export const agentRoutes: ReadonlyArray<Route<ApiCtx>> = [
-  { method: "GET", path: "/v1/agents/binding", auth: "either", handle },
-  { method: "POST", path: "/v1/agents/binding", auth: "either", handle },
-  { method: "GET", path: "/v1/agents", auth: "either", handle },
-  { method: "POST", path: "/v1/agents", auth: "either", handle, maxBodyBytes: 6_000_000 },
-  { method: "GET", path: "/v1/agents/:id", auth: "either", handle },
-  { method: "POST", path: "/v1/agents/:id", auth: "either", handle, maxBodyBytes: 6_000_000 },
-  { method: "DELETE", path: "/v1/agents/:id", auth: "either", handle },
-];
+export const agentRoutes: ReadonlyArray<Route<ApiCtx>> = (
+  [
+    { method: "GET", path: "/v1/agents/binding", auth: "either", handle },
+    { method: "POST", path: "/v1/agents/binding", auth: "either", handle },
+    { method: "GET", path: "/v1/agents", auth: "either", handle },
+    { method: "POST", path: "/v1/agents", auth: "either", handle, maxBodyBytes: 6_000_000 },
+    { method: "GET", path: "/v1/agents/:id", auth: "either", handle },
+    { method: "POST", path: "/v1/agents/:id", auth: "either", handle, maxBodyBytes: 6_000_000 },
+    { method: "DELETE", path: "/v1/agents/:id", auth: "either", handle },
+  ] as Route<ApiCtx>[]
+).map((route) => {
+  if (!("path" in route) || route.auth === "public") return route;
+  if (route.path.startsWith("/v1/admin/")) return { ...withAdmin([route])[0]!, browser: "self" as const };
+  return {
+    ...route,
+    actor: route.method === "GET" ? ("query.principalId" as const) : ("body.principalId" as const),
+    browser: true as const,
+  };
+});

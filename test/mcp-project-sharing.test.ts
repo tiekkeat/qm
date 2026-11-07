@@ -1,7 +1,8 @@
+import { createPostgresGrantStore } from "../src/acl/postgres-grant-store.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createMemoryMap } from "../src/persistence/durable-map.ts";
-import { createMemoryAdvisoryLock } from "../src/persistence/advisory-lock.ts";
+import { testMap } from "./support/test-database.ts";
+import { testAdvisoryLock } from "./support/test-database.ts";
 import { createAclStore } from "../src/acl/acl-store.ts";
 import { createProjectStore, projectScopeId } from "../src/projects/project-store.ts";
 import { createMcpConnectionService, McpAccessError } from "../src/mcp/mcp-connection-service.ts";
@@ -14,7 +15,8 @@ import {
   type McpEndpointPolicy,
 } from "../src/mcp/mcp-endpoint-policy.ts";
 import type { McpExecutionContext } from "../src/mcp/mcp-connection-service.ts";
-import { createAuditLog } from "../src/audit/audit-log.ts";
+import { createPostgresAuditLog } from "../src/admin/postgres-audit-log.ts";
+import { testDatabaseUrl } from "./support/test-database.ts";
 import { parseRef } from "../src/acl/resource-ref.ts";
 
 function fixture(
@@ -25,12 +27,12 @@ function fixture(
   },
 ) {
   const stores = {
-    connections: createMemoryMap<McpConnection>(),
-    accounts: createMemoryMap<McpAccount>(),
-    flows: createMemoryMap<McpOAuthFlow>(),
+    connections: testMap<McpConnection>(),
+    accounts: testMap<McpAccount>(),
+    flows: testMap<McpOAuthFlow>(),
   };
-  const projects = createProjectStore(undefined, { isActiveMember: () => true });
-  const acl = createAclStore();
+  const projects = createProjectStore(testMap(), { isActiveMember: () => true, advisoryLock: testAdvisoryLock() });
+  const acl = createAclStore(createPostgresGrantStore(testDatabaseUrl()));
   const active = new Set(["alice", "bob", "carol"]);
   const calls: Array<{ method: string; token: string; tool?: string }> = [];
   const events: unknown[] = [];
@@ -111,8 +113,8 @@ function fixture(
     acl,
     policy,
     ...(encryption ? { key: deriveConnectorKey("test-secret") } : {}),
-    lock: createMemoryAdvisoryLock(),
-    audit: createAuditLog(),
+    lock: testAdvisoryLock(),
+    audit: createPostgresAuditLog(testDatabaseUrl()),
     active: async (id) => active.has(id),
     callbackUrl: "https://qm.example/api/mcp-oauth/callback",
   });
@@ -155,7 +157,8 @@ test("personal connections and encrypted credentials are isolated", async () => 
   assert.equal(JSON.stringify(await f.stores.connections.all()).includes("alice-secret"), false);
   const turn = await f.service.forTurn(f.context("alice"));
   assert.equal(turn.toolDefs().length, 2);
-  assert.equal(turn.toolDefs().length, 2);
+  assert.equal(turn.toolDefs().find((tool) => tool.remoteName === "query")?.needsApproval, false);
+  assert.equal(turn.toolDefs().find((tool) => tool.remoteName === "update")?.needsApproval, true);
   assert.equal(await turn.call(`${id}_query`, {}), "Bearer alice-secret");
 });
 
@@ -296,7 +299,7 @@ test("network policy toggle defaults enabled, persists, and replaces legacy exce
   ];
   for (const address of privateAddresses) assert.equal(isPublicMcpAddress(address), false, address);
   assert.equal(isPublicMcpAddress("8.8.8.8"), true);
-  const store = createMemoryMap<McpEndpointPolicy>();
+  const store = testMap<McpEndpointPolicy>();
   const resolve = async () => [
     { address: "10.2.3.4", family: 4 },
     { address: "8.8.8.8", family: 4 },
@@ -367,7 +370,7 @@ test("disconnect removes saved-account delegation and reconnection does not rest
 
 test("legacy credentials migrate once into encryption while runtime reads stay compatible", async () => {
   const { createMcpServerStore } = await import("../src/mcp/mcp-server-store.ts");
-  const backing = createMemoryMap<import("../src/mcp/mcp-server-store.ts").McpServer>();
+  const backing = testMap<import("../src/mcp/mcp-server-store.ts").McpServer>();
   await backing.put("legacy", {
     id: "legacy",
     name: "Legacy",
@@ -406,7 +409,7 @@ test("guarded HTTP fetch streams SSE, rejects redirects and observes toggle upda
     server.close();
   });
   const port = (server.address() as { port: number }).port;
-  const policy = createMcpEndpointPolicy(createMemoryMap<McpEndpointPolicy>());
+  const policy = createMcpEndpointPolicy(testMap<McpEndpointPolicy>());
   const response = await policy.fetch(`http://127.0.0.1:${port}/mcp`);
   assert.match(await response.text(), /data: first[\s\S]*data: second/);
   await assert.rejects(policy.fetch(`http://127.0.0.1:${port}/redirect`));

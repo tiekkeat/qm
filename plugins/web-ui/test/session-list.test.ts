@@ -19,7 +19,10 @@ import {
   recencyGroup,
   rowIndicators,
   recentProjectSeeds,
-  reconcileSessions,
+  sidebarProjectSeeds,
+  mergeChildren,
+  mergeFirstPage,
+  upsertSessions,
   splitPinned,
   watchActivityLabel,
   withPendingSession,
@@ -107,45 +110,101 @@ test("re-adding the same threadRef dedupes rather than duplicating", () => {
   assert.equal(list.length, 2);
 });
 
-test("reconcile keeps saved sessions and re-adds unsent pending chats", () => {
-  const prev = [pending("web:u:a"), pending("web:u:b"), saved("1", "web:u:x")];
-  const server = [saved("1", "web:u:x")];
-  const out = reconcileSessions(server, prev);
-  assert.deepEqual(new Set(out.map((s) => s.threadRef)), new Set(["web:u:a", "web:u:b", "web:u:x"]));
-});
+function at(id: string, threadRef: string, lastActivityAt: number, extra: Partial<CoreSession> = {}): CoreSession {
+  return { ...saved(id, threadRef), lastActivityAt, ...extra };
+}
+const firstPage = { archived: false, floor: null };
 
-test("reconcile drops a pending chat once the server knows its threadRef", () => {
-  const prev = [pending("web:u:a")];
-  const server = [saved("9", "web:u:a", "Bubble waffle order")];
-  const out = reconcileSessions(server, prev);
-  assert.equal(out.length, 1);
-  assert.equal(out[0]!.id, "9");
-  assert.equal(out[0]!.title, "Bubble waffle order");
-});
-
-test("reconcile keeps the rows of conversations still on screen when the server omits them", () => {
-  const prev = [saved("1", "web:u:x"), saved("2", "web:u:y"), saved("3", "web:u:z")];
-  const server = [saved("3", "web:u:z")];
-  assert.deepEqual(
-    reconcileSessions(server, prev, ["1", "2"]).map((s) => s.id),
-    ["1", "2", "3"],
-    "every open pane keeps its row, not just one",
+test("a first page keeps unsent pending chats and replaces one once the server knows its thread", () => {
+  const prev = [pending("web:u:a"), pending("web:u:b"), at("1", "web:u:x", 5)];
+  const kept = mergeFirstPage(prev, { sessions: [at("1", "web:u:x", 5)] }, firstPage);
+  assert.deepEqual(new Set(kept.map((s) => s.threadRef)), new Set(["web:u:a", "web:u:b", "web:u:x"]));
+  const replaced = mergeFirstPage(
+    [pending("web:u:a")],
+    { sessions: [at("9", "web:u:a", 7, { title: "Bubble waffle order" })] },
+    firstPage,
   );
   assert.deepEqual(
-    reconcileSessions(server, prev).map((s) => s.id),
-    ["3"],
-    "a row nobody is reading still goes when the server drops it",
-  );
-  assert.deepEqual(
-    reconcileSessions([saved("9", "web:u:x")], prev, ["1"]).map((s) => s.id),
-    ["9"],
-    "a threadRef the server now answers for under a new id must not render twice",
+    replaced.map((s) => [s.id, s.title]),
+    [["9", "Bubble waffle order"]],
   );
 });
 
-test("reconcile against an empty prev is just the server list", () => {
-  const server = [saved("1", "web:u:x"), saved("2", "web:u:y")];
-  assert.deepEqual(reconcileSessions(server, []), server);
+test("a first page drops rows it covers but no longer returns, and keeps older loaded rows", () => {
+  const prev = [at("new", "web:u:new", 30), at("gone", "web:u:gone", 20), at("old", "web:u:old", 5)];
+  const page = { sessions: [at("new", "web:u:new", 30), at("mid", "web:u:mid", 10)] };
+  assert.deepEqual(
+    mergeFirstPage(prev, page, { ...firstPage, floor: 10 })
+      .map((s) => s.id)
+      .sort(),
+    ["mid", "new", "old"],
+    "a row older than the page floor was loaded by paging and stays",
+  );
+  assert.deepEqual(
+    mergeFirstPage(prev, page, firstPage)
+      .map((s) => s.id)
+      .sort(),
+    ["mid", "new"],
+    "a page that reached the end covers everything",
+  );
+});
+
+test("a first page keeps open conversations, children and archived rows it doesn't cover", () => {
+  const prev = [
+    at("open", "web:u:open", 20),
+    at("child", "subagent:root:1", 20, { parentSessionId: "open" }),
+    at("archived", "web:u:archived", 20, { archived: true }),
+    at("pinned", "web:u:pinned", 1, { pinned: true }),
+  ];
+  assert.deepEqual(
+    mergeFirstPage(prev, { sessions: [], pinned: [] }, firstPage, ["open"])
+      .map((s) => s.id)
+      .sort(),
+    ["archived", "child", "open"],
+    "a pinned row the pinned list no longer has is stale; the rest are outside the page",
+  );
+});
+
+test("a thread the server now answers for under a new id doesn't render twice", () => {
+  const prev = [at("1", "web:u:x", 5), at("2", "web:u:y", 5)];
+  assert.deepEqual(
+    mergeFirstPage(prev, { sessions: [at("9", "web:u:x", 6), at("2", "web:u:y", 5)] }, firstPage, ["1"])
+      .map((s) => s.id)
+      .sort(),
+    ["2", "9"],
+  );
+});
+
+test("children of a root are replaced by what the server returns", () => {
+  const prev = [
+    at("root", "web:u:root", 9),
+    at("a", "subagent:root:a", 1, { parentSessionId: "root" }),
+    at("a1", "subagent:a:1", 1, { parentSessionId: "a" }),
+    at("other", "subagent:other:1", 1, { parentSessionId: "elsewhere" }),
+  ];
+  const next = mergeChildren(prev, "root", [at("b", "subagent:root:b", 2, { parentSessionId: "root", working: true })]);
+  assert.deepEqual(next.map((s) => s.id).sort(), ["b", "other", "root"]);
+});
+
+test("a row's subagent indicators come from the server's counts, whatever children are cached", () => {
+  const row = at("root", "web:u:root", 9, { subagents: { running: 2, waiting: 1 } });
+  const cached = [row, at("c", "subagent:root:c", 1, { parentSessionId: "root" })];
+  assert.equal(rowIndicators(row, null).awaiting, true);
+  assert.equal(conversationBackground(cached, "root", null), null, "subagents alone light no background chip");
+  assert.equal(rowIndicators(at("idle", "web:u:idle", 9), null).background, null);
+});
+
+test("upsertSessions replaces rows by id and keeps the rest", () => {
+  const prev = [at("1", "web:u:x", 1), at("2", "web:u:y", 1)];
+  const next = upsertSessions(prev, [at("2", "web:u:y", 3, { title: "Renamed" })]);
+  assert.deepEqual(
+    next.map((s) => [s.id, s.title ?? null]),
+    [
+      ["1", null],
+      ["2", "Renamed"],
+    ],
+  );
+  assert.equal(upsertSessions(prev, []), prev);
 });
 
 test("bumpActivity stamps lastActivityAt on the matching row only", () => {
@@ -158,6 +217,15 @@ test("bumpActivity stamps lastActivityAt on the matching row only", () => {
 test("bumpActivity is a no-op when no row matches the threadRef", () => {
   const list = [saved("1", "web:u:x")];
   assert.deepEqual(bumpActivity(list, "web:u:missing", 999), list);
+});
+
+test("bumpActivity sets the sent text as the last message only on rows that carry previews", () => {
+  const list = [saved("1", "web:u:x"), { ...saved("2", "web:u:y"), lastUserPreview: null }];
+  const plain = bumpActivity(list, "web:u:x", 5, "hello");
+  assert.equal("lastUserPreview" in plain.find((s) => s.id === "1")!, false);
+  const flagged = bumpActivity(list, "web:u:y", 5, "hello there");
+  assert.equal(flagged.find((s) => s.id === "2")!.lastUserPreview, "hello there");
+  assert.equal(bumpActivity(list, "web:u:y", 5, "   ").find((s) => s.id === "2")!.lastUserPreview, null);
 });
 
 test("activityOf prefers lastActivityAt, falling back to createdAt", () => {
@@ -245,9 +313,9 @@ test("applySessionState: frames without `at` (and rows fresh from a snapshot) st
   assert.equal(out[0]!.working, true, "an unstamped frame applies unconditionally");
 });
 
-test("reconcile replaces a pushed working state with server truth", () => {
+test("a first page replaces a pushed working state with server truth", () => {
   const { list: prev } = applySessionState([saved("1", "web:u:x")], { threadRef: "web:u:x", state: "working" });
-  const out = reconcileSessions([saved("1", "web:u:x")], prev);
+  const out = mergeFirstPage(prev, { sessions: [saved("1", "web:u:x")] }, firstPage);
   assert.equal(out[0]!.working, undefined, "server row (no working flag) supersedes the pushed state");
 });
 
@@ -304,9 +372,9 @@ test("recencyGroup treats a future timestamp (optimistic bump) as Today", () => 
   assert.equal(recencyGroup(now + 60_000, now), "Today");
 });
 
-test("reconcile replaces an optimistic working stamp with server truth", () => {
+test("a first page replaces an optimistic working stamp with server truth", () => {
   const prev = markWorking([saved("1", "web:u:x")], "web:u:x");
-  const out = reconcileSessions([saved("1", "web:u:x")], prev);
+  const out = mergeFirstPage(prev, { sessions: [saved("1", "web:u:x")] }, firstPage);
   assert.equal(out[0]!.working, undefined, "server row (no working flag) supersedes the stamp");
 });
 
@@ -337,12 +405,61 @@ test("project metadata groups only its group scope while ordinary chats stay fla
   assert.equal(items[1]?.kind, "session");
 });
 
+test("grouping by activity lists scoped conversations flat, newest first, without empty project rows", () => {
+  const contexts = [
+    { scopeId: "channel:C1", kind: "channel" as const, name: "launch", sessionCount: 1, lastActivityAt: 30 },
+    { scopeId: "personal:alice", kind: "personal" as const, name: null, sessionCount: 1, lastActivityAt: 20 },
+    {
+      scopeId: "group:web-project-empty",
+      kind: "group" as const,
+      name: "Empty",
+      sessionCount: 0,
+      lastActivityAt: 10,
+      project: {
+        id: "empty",
+        name: "Empty",
+        ownerId: "alice",
+        memberIds: ["alice"],
+        scopeId: "group:web-project-empty",
+        members: [{ principalId: "alice", displayName: "Alice" }],
+      },
+    },
+  ];
+  const channel = { ...saved("1", "ch:C1:1.0"), type: "channel" as const, scopeId: "channel:C1", lastActivityAt: 30 };
+  const plain = { ...saved("2", "web:alice:plain"), scopeId: "personal:alice", lastActivityAt: 20 };
+  const byScope = groupProjectSessions([plain, channel], sidebarProjectSeeds(contexts, false));
+  assert.deepEqual(
+    byScope.map((item) => item.kind),
+    ["project", "project", "project"],
+  );
+  assert.deepEqual(groupProjectSessions([plain, channel], sidebarProjectSeeds(contexts, true)), [
+    { kind: "session", session: channel },
+    { kind: "session", session: plain },
+  ]);
+});
+
 test("empty projects appear in Recents", () => {
   const seeds = [{ scopeId: "group:web-project-empty", name: "Empty" }];
   const items = groupProjectSessions([], seeds);
   assert.deepEqual(items, [
     { kind: "project", scopeId: "group:web-project-empty", name: "Empty", groupKind: "project", sessions: [] },
   ]);
+});
+
+test("conversations with a persona you can use group under that persona instead of their home", () => {
+  const seeds = [
+    { scopeId: "personal:alice", name: "Personal", kind: "personal" as const },
+    { scopeId: "persona:ada", name: "Ada", kind: "persona" as const },
+    { scopeId: "persona:idle", name: "Idle", kind: "persona" as const },
+  ];
+  const withAda = { ...saved("1", "web:alice:ada"), scopeId: "personal:alice", personaId: "ada" };
+  const plain = { ...saved("2", "web:alice:plain"), scopeId: "personal:alice" };
+  const unknown = { ...saved("3", "web:alice:gone"), scopeId: "personal:alice", personaId: "deleted" };
+  const items = groupProjectSessions([withAda, plain, unknown], seeds);
+  const groups = Object.fromEntries(
+    items.flatMap((item) => (item.kind === "project" ? [[item.scopeId, item.sessions.map((s) => s.id)]] : [])),
+  );
+  assert.deepEqual(groups, { "persona:ada": ["1"], "personal:alice": ["2", "3"], "persona:idle": [] });
 });
 
 test("a pending (not-yet-sent) chat in a project scope nests under its project", () => {
@@ -394,7 +511,6 @@ test("backgroundLabel: jobs, watches and crons fold into one chip with a spoken 
     jobs: 1,
     watches: 0,
     crons: 0,
-    subagents: 0,
     goal: false,
     label: "1 background job running",
   });
@@ -402,7 +518,6 @@ test("backgroundLabel: jobs, watches and crons fold into one chip with a spoken 
     jobs: 2,
     watches: 1,
     crons: 0,
-    subagents: 0,
     goal: false,
     label: "2 background jobs running · 1 watch armed",
   });
@@ -410,7 +525,6 @@ test("backgroundLabel: jobs, watches and crons fold into one chip with a spoken 
     jobs: 0,
     watches: 2,
     crons: 0,
-    subagents: 0,
     goal: false,
     label: "2 watches armed",
   });
@@ -418,7 +532,6 @@ test("backgroundLabel: jobs, watches and crons fold into one chip with a spoken 
     jobs: 0,
     watches: 0,
     crons: 1,
-    subagents: 0,
     goal: false,
     label: "1 cron scheduled here",
   });
@@ -426,7 +539,6 @@ test("backgroundLabel: jobs, watches and crons fold into one chip with a spoken 
     jobs: 0,
     watches: 1,
     crons: 2,
-    subagents: 0,
     goal: false,
     label: "1 watch armed · 2 crons scheduled here",
   });
@@ -445,7 +557,6 @@ test("rowIndicators: background counts flow through backgroundLabel — zero cou
     jobs: 2,
     watches: 1,
     crons: 0,
-    subagents: 0,
     goal: false,
     label: "2 background jobs running · 1 watch armed",
   });
@@ -454,7 +565,6 @@ test("rowIndicators: background counts flow through backgroundLabel — zero cou
     jobs: 0,
     watches: 0,
     crons: 3,
-    subagents: 0,
     goal: false,
     label: "3 crons scheduled here",
   });
@@ -471,7 +581,6 @@ test("conversationBackground: resolves the mounted conversation by session id", 
     jobs: 2,
     watches: 1,
     crons: 0,
-    subagents: 0,
     goal: false,
     label: "2 background jobs running · 1 watch armed",
   });
@@ -483,7 +592,6 @@ test("conversationBackground: falls back to threadRef while the conversation is 
     jobs: 0,
     watches: 1,
     crons: 0,
-    subagents: 0,
     goal: false,
     label: "1 watch armed",
   });
@@ -594,6 +702,7 @@ test("sidebar excludes cron, webhook, and loop runs but keeps conversations", ()
 test("cronRowMeta shows the next fire and the last result of a session's cron", () => {
   const now = Date.now();
   assert.equal(cronRowMeta({ id: "c", nextFireAt: now + 10 * 60_000 + 1_000 }), "next fire in 10m");
+  assert.equal(cronRowMeta({ id: "c", nextFireAt: now + 62 * 60_000 + 1_000 }), "next fire in 1h 2m");
   assert.equal(
     cronRowMeta({
       id: "c",
@@ -610,12 +719,10 @@ test("a goal lights the background chip with time worked, then the floor", () =>
     0,
     0,
     0,
-    0,
-    0,
     { activeMs: 600_000, runningSince: 600_000, floor: { minMs: 1_200_000 } },
     720_000,
   );
   assert.equal(row?.goal, true);
   assert.equal(row?.label, "goal · 12m worked · 20m floor");
-  assert.equal(backgroundLabel(0, 0, 0, 0, 0, { activeMs: 60_000 }, 9_999_999)?.label, "goal · 1m worked");
+  assert.equal(backgroundLabel(0, 0, 0, { activeMs: 60_000 }, 9_999_999)?.label, "goal · 1m worked");
 });

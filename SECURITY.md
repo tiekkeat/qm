@@ -93,10 +93,12 @@ is limited to 100 recent sessions and 200 files, and binary files require explic
 before being copied into a different conversation's computer. Organization, personal, room, and source-room policy compose fail-closed, with
 Isolated winning. These reads are labelled and audited, but model output is not a disclosure
 control. In an Open shared conversation, the authenticated internal speaker can use their
-own keychain through isolated owner execution without creating a room grant. Credentials
-are supplied only to a separate disposable computer, which is destroyed at turn end, not
-the shared workspace. Each owner command rechecks composed sharing policy and current
-membership. Other people's credentials and automated or ambient turns still require grants.
+own keychain without creating a room grant. In any shared conversation, commands that name
+a credential other than a brokered org service run on the turn's scratch computer, which
+only that turn's commands use and which is destroyed at turn end, never on the shared
+workspace. A background job naming them runs on its own job-only computer that no command,
+file operation or input can reach, which the reaper destroys after the job ends. Each use of the
+speaker's own credential rechecks composed sharing policy and current membership. Other people's credentials and automated or ambient turns still require grants.
 The raw keychain-use endpoint remains personal-or-grant-only. Command approvals remain in
 force; code can still disclose secrets while using them, so this is not an output filter.
 Open does not change transcript audience filtering, writes or memory capture,
@@ -183,10 +185,17 @@ these, not through them.
   changes do not revoke individual link holders.
 - **The spend export token is bearer authorization for org-wide spend.** When
   `SPEND_EXPORT_TOKEN` is set, anyone holding it can read every scope's daily model-call
-  spend: per-person totals, channel and group names, and the model mix. It reads no
-  conversation content and changes nothing, and each export is audited, but the token is
+  spend: per-person totals, channel and group names, the model mix, and each billed
+  cron's title, owner, scope, schedule and state. It reads no conversation content or
+  cron task and changes nothing, and each export is audited, but the token is
   not bound to a caller. Rotating it means replacing the secret in core and in every
   consumer; core accepts only the current value after it restarts with the new one.
+- **Everyone sees the spend of the spaces they can see.** The My spend tab in Settings shows each
+  signed-in person their own model-call spend plus the spend of every channel, group DM
+  and project their Projects page lists, which for internal users includes every public
+  channel the bot is in. It splits that spend by the crons that ran there, naming only
+  crons their Crons page lists and showing the rest only by id. It shows no
+  conversation content.
 - **Portal sessions have residual risk.** A signed portal session defaults to eight
   hours and renews on use. Logout clears the browser cookie but cannot revoke an
   already copied session token before its expiration.

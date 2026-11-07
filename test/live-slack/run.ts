@@ -5,6 +5,7 @@ import { CoreClient } from "./core.ts";
 import {
   Ctx,
   isLiveStatusText,
+  judgeEndpoint,
   liveRunExitCode,
   releaseBlockers,
   slug,
@@ -55,8 +56,7 @@ async function buildEnv(): Promise<Env> {
     botUserId,
     qaUserId: qaAuth.userId,
     teamId: qaAuth.teamId,
-    anthropicApiKey: requireEnv("ANTHROPIC_API_KEY"),
-    judgeModel: process.env.LIVE_E2E_JUDGE_MODEL ?? "claude-haiku-5-5",
+    judge: judgeEndpoint(process.env, process.env.LIVE_E2E_JUDGE_MODEL ?? "claude-haiku-5-5"),
     ...(process.env.LIVE_E2E_TARGET_CHANNEL ? { targetChannel: process.env.LIVE_E2E_TARGET_CHANNEL } : {}),
     sandbox:
       process.env.LIVE_E2E_SANDBOX_AVAILABLE === "1" ||
@@ -262,7 +262,7 @@ async function dumpTranscript(env: Env, scenario: Scenario, ctx: Ctx): Promise<s
       const file = path.join(OUT_DIR, "transcripts", `${slug(scenario.name)}-${found.id}.json`);
       await writeFile(
         file,
-        JSON.stringify({ scenario: scenario.name, dm: ctx.dmChannelId, entries: found.entries, llm }, null, 2),
+        JSON.stringify({ scenario: scenario.name, dm: ctx.dmChannelId, items: found.items, llm }, null, 2),
       );
       sessionIds.push(found.id);
     }
@@ -277,7 +277,7 @@ async function dumpTranscript(env: Env, scenario: Scenario, ctx: Ctx): Promise<s
       const file = path.join(OUT_DIR, "transcripts", `${slug(scenario.name)}-${found.id}.json`);
       await writeFile(
         file,
-        JSON.stringify({ scenario: scenario.name, channel: ch.id, entries: found.entries, llm }, null, 2),
+        JSON.stringify({ scenario: scenario.name, channel: ch.id, items: found.items, llm }, null, 2),
       );
       sessionIds.push(found.id);
     }

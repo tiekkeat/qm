@@ -10,25 +10,28 @@ import { createInsecureTestServer } from "../src/api/server.ts";
 import { createDeployStore } from "../src/deploy/deploy-store.ts";
 import { createDeployService } from "../src/deploy/deploy-service.ts";
 import { createAclStore } from "../src/acl/acl-store.ts";
-import { createDirectoryStore } from "../src/directory/directory-store.ts";
 import { createIdentityService } from "../src/identity/identity-service.ts";
-import { createMemorySessionStore } from "../src/sessions/memory-session-store.ts";
 import { createCanReadScope, createCanWriteScope } from "../src/resolution/scope-membership.ts";
 import { createHmac } from "node:crypto";
 import { scopeId } from "../src/types.ts";
 
-import { createMemoryMap } from "../src/persistence/durable-map.ts";
 import { createFeatureFlagStore, type FeatureFlagRecord } from "../src/feature-flags.ts";
+import { singleProcessDeps } from "./support/single-process.ts";
+import { createPostgresDirectoryStore } from "../src/directory/postgres-directory-store.ts";
+import { createPostgresSessionStore } from "../src/sessions/postgres-session-store.ts";
+import { testDatabaseUrl, testMap, testDeployBackings } from "./support/test-database.ts";
+import { createPostgresGrantStore } from "../src/acl/postgres-grant-store.ts";
 
 const auditLog = { record() {}, events: async () => [], tail: async () => [] };
 const GATE_SECRET = "gate-secret";
 const PORTAL = "https://portal.example.com";
 
 function appServingUpstream(upstreamPort: number) {
-  const deployStore = createDeployStore();
-  const acl = createAclStore();
-  const directory = createDirectoryStore();
+  const deployStore = createDeployStore(testDeployBackings());
+  const acl = createAclStore(createPostgresGrantStore(testDatabaseUrl()));
+  const directory = createPostgresDirectoryStore(testDatabaseUrl());
   const deploy = createDeployService({
+    ...singleProcessDeps(),
     deployStore,
     provider: {
       profile: { managedScaleToZero: false },
@@ -45,8 +48,8 @@ function appServingUpstream(upstreamPort: number) {
     deploy,
     acl,
     directory,
-    sessions: createMemorySessionStore(),
-    identity: createIdentityService(),
+    sessions: createPostgresSessionStore(testDatabaseUrl()),
+    identity: createIdentityService(testMap(), { externalMembers: testMap() }),
     orgId: "acme",
   } as unknown as Parameters<typeof createApp>[0]);
   return { app, directory, acl };
@@ -89,7 +92,7 @@ async function widgetFixture(upstreamHandler?: Parameters<typeof createHttpServe
     createdInScope: scopeId("channel", "CBUILT"),
   });
   await app.shareDeployment(d.id, scopeId("personal", "U-viewer"), "read", { createdBy: "U1" });
-  const featureFlags = createFeatureFlagStore(createMemoryMap<FeatureFlagRecord>());
+  const featureFlags = createFeatureFlagStore(testMap<FeatureFlagRecord>());
   const server = createInsecureTestServer(app, {
     featureFlags,
     deployAppsDomain: "apps.example.com",
@@ -290,6 +293,32 @@ test("app shell: non-HTML responses stream through untouched even for the owner"
     assert.equal(r.status, 200);
     assert.equal(r.body, '{"data":true}', "JSON is byte-identical");
     assert.equal(r.headers["content-length"], "13", "content-length survives the proxy");
+  } finally {
+    await f.close();
+  }
+});
+
+test("app proxy: trace context never reaches a published app", async () => {
+  let seen: Record<string, unknown> = {};
+  const f = await widgetFixture((req, res) => {
+    seen = req.headers;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end("{}");
+  });
+  try {
+    const r = await httpGet(f.port, "/api/data", {
+      Host: HOST,
+      Cookie: `portal_session=${mintPortalSession("U1")}`,
+      "sentry-trace": "0123456789abcdef0123456789abcdef-0123456789abcdef-1",
+      baggage: "sentry-trace_id=0123456789abcdef0123456789abcdef",
+      traceparent: "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+      tracestate: "vendor=value",
+      "x-app-header": "kept",
+    });
+    assert.equal(r.status, 200);
+    assert.equal(seen["x-app-header"], "kept");
+    for (const name of ["sentry-trace", "baggage", "traceparent", "tracestate"])
+      assert.equal(seen[name], undefined, name);
   } finally {
     await f.close();
   }

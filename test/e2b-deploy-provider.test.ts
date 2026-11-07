@@ -1,16 +1,17 @@
 import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createE2bDeployProvider, type StoredE2bDeployBody } from "../src/deploy/e2b-deploy-provider.ts";
-import { createMemoryMap, type DurableMap } from "../src/persistence/durable-map.ts";
+import { type DurableMap } from "../src/persistence/durable-map.ts";
 import type { Deployment, DeploymentVersion } from "../src/deploy/deploy-store.ts";
 import type { DeployProvider } from "../src/deploy/deploy-provider.ts";
 import { scopeId } from "../src/types.ts";
 import { installFakeE2b, type FakeE2b } from "./support/fake-e2b.ts";
+import { singleProcessDeps } from "./support/single-process.ts";
+import { testMap } from "./support/test-database.ts";
 
 const SERVER = [
   "const fs = require('fs');",
@@ -19,14 +20,13 @@ const SERVER = [
   "  if (q.url === '/write') { fs.writeFileSync(process.env.DATA_DIR + '/note.txt', 'kept'); return s.end('ok'); }",
   "  if (q.url === '/data') return s.end(fs.readFileSync(process.env.DATA_DIR + '/note.txt', 'utf8'));",
   "  s.end('v' + process.env.APP_VERSION);",
-  "}).listen(process.env.PORT);",
+  "}).listen(process.env.PORT, '127.0.0.1');",
 ].join(" ");
 
 let fake: FakeE2b | undefined;
 let appPort = 0;
 
 afterEach(() => {
-  if (appPort) spawnSync("sh", ["-c", `lsof -ti tcp:${appPort} -sTCP:LISTEN | xargs kill 2>/dev/null; true`]);
   fake?.cleanup();
   fake = undefined;
 });
@@ -60,8 +60,9 @@ function version(appVersion: string, entrypoint = "node server.js"): DeploymentV
 async function make(): Promise<{ provider: DeployProvider; store: DurableMap<StoredE2bDeployBody>; fake: FakeE2b }> {
   appPort = await freePort();
   fake = installFakeE2b({ info: true });
-  const store = createMemoryMap<StoredE2bDeployBody>();
+  const store = testMap<StoredE2bDeployBody>();
   const provider = createE2bDeployProvider({
+    ...singleProcessDeps(),
     client: fake.client,
     namePrefix: "qmt",
     appPort,
@@ -90,7 +91,6 @@ test("e2b deploy runs each app in its own auto-pausing, auto-resuming private sa
   assert.deepEqual(fake.createOptions(name), {
     autoPause: true,
     autoResume: true,
-    privateTraffic: true,
     timeoutMs: 300_000,
   });
   assert.equal(fake.current(name)!.metadata["qm-deploy"], d.id);

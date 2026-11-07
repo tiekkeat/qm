@@ -5,6 +5,7 @@ import {
   AUTH_BROKER_ENV_KEYS,
   SERVICE_NAMES,
   VIRTUAL_SERVICE_NAMES,
+  serviceHost,
   isDeclaredService,
   isServiceName,
   pluginNameError,
@@ -15,12 +16,18 @@ import {
 } from "./services.ts";
 import {
   hostingProviderChoices,
+  isSandboxBackendId,
   isTarget,
+  type SandboxBackendId,
   type Target,
   SANDBOX_BACKEND_POLICY,
+  SANDBOX_BACKENDS,
   targetsAllowingSandboxBackend,
 } from "./providers.ts";
+import { githubRepoUrl, isGitBranchName } from "./render-source.ts";
 import { envNum, isEnvVarName, isMissingOrPlaceholder } from "./util.ts";
+
+export const FARGATE_MAX_STOP_TIMEOUT_S = 120;
 
 export const CONFIG_FILENAME = "qm.config.jsonc";
 
@@ -46,7 +53,7 @@ export interface PluginEntry {
 }
 
 export interface SandboxConfig {
-  backend?: "local" | "sprites" | "aws" | "agent37" | "superserve" | "e2b";
+  backend?: SandboxBackendId;
   app?: string;
   image?: string;
   baseImage?: string;
@@ -76,6 +83,18 @@ export interface AwsServiceConfig {
   publicPaths?: string[];
   logGroup?: string;
   stopTimeout?: number;
+}
+
+export interface RenderConfig {
+  source: { repo: string; branch: string };
+  storage: { plan: string; diskSizeGB: number };
+  workspaceId: string;
+  region: "oregon" | "ohio" | "virginia" | "frankfurt" | "singapore";
+  appRegion?: RenderConfig["region"];
+  corePlan: string;
+  servicePlan: string;
+  postgresPlan: string;
+  postgresDiskSizeGB: number;
 }
 
 export interface AwsConfig {
@@ -166,6 +185,7 @@ export interface QmConfig {
   imageFrom?: string;
   deployAppPrefix?: string;
   aws?: AwsConfig;
+  render?: RenderConfig;
 }
 
 export function securityScreenEnv(config: Pick<QmConfig, "securityScreen">): Record<string, string> {
@@ -285,7 +305,7 @@ function stripTrailingCommas(text: string): string {
   return out;
 }
 
-const parseConfigJson = (text: string): unknown => JSON.parse(stripTrailingCommas(stripJsonComments(text)));
+export const parseConfigJson = (text: string): unknown => JSON.parse(stripTrailingCommas(stripJsonComments(text)));
 
 const skipWs = (s: string, i: number): number => {
   while (i < s.length && /\s/.test(s[i]!)) i++;
@@ -347,10 +367,23 @@ function objectProps(s: string, objStart: number): { props: PropSpan[]; openBrac
   }
 }
 
+interface ConfigEdit {
+  start: number;
+  end: number;
+  text: string;
+}
+
+function applyEdits(raw: string, edits: ConfigEdit[]): string {
+  let out = raw;
+  for (const edit of edits.sort((a, b) => b.start - a.start))
+    out = out.slice(0, edit.start) + edit.text + out.slice(edit.end);
+  return out;
+}
+
 function updateConfigStringMap(raw: string, key: string, updates: Record<string, string>): string {
   const stripped = stripJsonComments(raw);
   const root = objectProps(stripped, 0);
-  const edits: Array<{ start: number; end: number; text: string }> = [];
+  const edits: ConfigEdit[] = [];
   const entry = ([k, v]: [string, string]): string => `${JSON.stringify(k)}: ${JSON.stringify(v)}`;
   const property = root.props.find((p) => p.key === key);
   if (property) {
@@ -371,10 +404,7 @@ function updateConfigStringMap(raw: string, key: string, updates: Record<string,
     const text = `${root.props.length ? "," : ""}\n  ${JSON.stringify(key)}: { ${body} }\n`;
     edits.push({ start: root.closeBrace, end: root.closeBrace, text });
   }
-  edits.sort((a, b) => b.start - a.start);
-  let out = raw;
-  for (const e of edits) out = out.slice(0, e.start) + e.text + out.slice(e.end);
-  return out;
+  return applyEdits(raw, edits);
 }
 
 export const updateConfigImageOverrides = (raw: string, updates: Record<string, string>): string =>
@@ -383,7 +413,7 @@ export const updateConfigImageOverrides = (raw: string, updates: Record<string, 
 export function updateConfigCoreEnv(raw: string, updates: Record<string, string>): string {
   const stripped = stripJsonComments(raw);
   const root = objectProps(stripped, 0);
-  const edits: Array<{ start: number; end: number; text: string }> = [];
+  const edits: ConfigEdit[] = [];
   const envProp = root.props.find((p) => p.key === "env");
   if (!envProp) throw new CliError('config has no top-level "env" object');
   const env = objectProps(stripped, envProp.valueStart);
@@ -404,10 +434,7 @@ export function updateConfigCoreEnv(raw: string, updates: Record<string, string>
       text: core.props.length ? ` ${body},` : ` ${body} `,
     });
   }
-  edits.sort((a, b) => b.start - a.start);
-  let out = raw;
-  for (const edit of edits) out = out.slice(0, edit.start) + edit.text + out.slice(edit.end);
-  return out;
+  return applyEdits(raw, edits);
 }
 
 export function loadConfigAt(path: string, overrides?: { target?: Target }): { config: QmConfig; path: string } {
@@ -525,6 +552,7 @@ const VALID_TOP_LEVEL_KEYS: ReadonlySet<string> = new Set([
   "imageFrom",
   "deployAppPrefix",
   "aws",
+  "render",
 ]);
 
 function validate(raw: unknown, path: string): QmConfig {
@@ -601,15 +629,7 @@ function validate(raw: unknown, path: string): QmConfig {
     if (!services.includes(s)) services.push(s);
   }
   if (!services.includes("core")) throw new CliError(`${path}: "services" must include "core"`);
-  if (services.includes("auth") && !services.includes("portal")) {
-    throw new CliError(
-      `${path}: the "auth" sign-in broker requires "portal" — the portal is the only service that publishes it`,
-    );
-  }
 
-  if (services.includes("admin") && !services.includes("portal") && target === "aws") {
-    throw new CliError(`${path}: admin requires the authenticated portal`);
-  }
   const plugins = validatePlugins(o["plugins"], path);
   const skills = validateStringArray(o["skills"], path, "skills");
   const env = validateServiceMap(o["env"], path, "env", (v, k) => validateStringMap(v, path, `env.${k}`));
@@ -660,32 +680,31 @@ function validate(raw: unknown, path: string): QmConfig {
   if (securityScreen?.classifier !== "proxy" && secretEnv.core?.SECURITY_SCREEN_PROXY_TOKEN !== undefined) {
     throw new CliError(`${path}: secretEnv.core.SECURITY_SCREEN_PROXY_TOKEN requires securityScreen classifier proxy`);
   }
-  for (const [service, values] of Object.entries(env)) {
-    if (!isServiceName(service)) continue;
-    const portEnv = serviceDef(service).docker.portEnv;
-    if (values?.[portEnv] !== undefined) {
-      throw new CliError(
-        `${path}: "env.${service}.${portEnv}" is managed by the deployment target and cannot be overridden`,
-      );
+  const managedPorts = (service: string): string[] => {
+    const host = serviceHost(service);
+    if (!isServiceName(host)) return [];
+    return [serviceDef(host).docker.portEnv, ...(host === "core" ? ["PUBLIC_PORT"] : [])];
+  };
+  for (const [field, map] of [
+    ["env", env],
+    ["secretEnv", secretEnv],
+  ] as const) {
+    for (const [service, values] of Object.entries(map)) {
+      const managed = managedPorts(service).find((name) => values?.[name] !== undefined);
+      if (managed)
+        throw new CliError(
+          `${path}: "${field}.${service}.${managed}" is managed by the deployment target and cannot be overridden`,
+        );
     }
   }
-  for (const [service, entries] of Object.entries(secretEnv)) {
-    if (!isServiceName(service)) continue;
-    const portEnv = serviceDef(service).docker.portEnv;
-    if (entries?.[portEnv] !== undefined) {
-      throw new CliError(
-        `${path}: "secretEnv.${service}.${portEnv}" is managed by the deployment target and cannot be overridden`,
-      );
-    }
-  }
-  const portalMountsAdmin = services.includes("portal") && services.includes("admin");
-  if (portalMountsAdmin && env.admin?.ADMIN_BASE_PATH !== undefined && env.admin.ADMIN_BASE_PATH !== "/admin") {
-    throw new CliError(`${path}: env.admin.ADMIN_BASE_PATH must be "/admin" when portal and admin are enabled`);
-  }
-  if (portalMountsAdmin && secretEnv.admin?.ADMIN_BASE_PATH !== undefined) {
-    throw new CliError(
-      `${path}: secretEnv.admin.ADMIN_BASE_PATH is managed by the deployment target and cannot be overridden`,
+  for (const service of VIRTUAL_SERVICE_NAMES) {
+    const conflict = Object.entries(env[service] ?? {}).find(
+      ([name, value]) => env.core?.[name] !== undefined && env.core[name] !== value,
     );
+    if (conflict)
+      throw new CliError(
+        `${path}: env.${service}.${conflict[0]} and env.core.${conflict[0]} set different values, but core receives both; keep one`,
+      );
   }
   for (const [i, plugin] of plugins.entries()) {
     if (plugin.env?.PORT !== undefined) {
@@ -776,6 +795,8 @@ function validate(raw: unknown, path: string): QmConfig {
     ];
     out.aws = validateAws(o["aws"], path, runnableServices(services), configuredSecretNames);
   }
+  if (o["render"] !== undefined) out.render = validateRender(o["render"], path);
+  if (target === "render" && !out.render) throw new CliError(`${path}: target "render" requires a "render" block`);
   if (target === "aws" && !out.aws) throw new CliError(`${path}: target "aws" requires an "aws" block`);
   validateModelProvider(out, path);
   validatePortalTrust(out, path);
@@ -867,21 +888,21 @@ const validEmailDomain = (value: string): boolean => {
 const DERIVED_AUTH_ENV_KEYS = ["AUTH_ISSUER", "AUTH_CLIENT_ID", "AUTH_REDIRECT_URI"] as const;
 
 function validateBrokerTrust(config: QmConfig, path: string, secrets?: ReadonlyMap<string, string>): void {
-  const portalEnv = config.env.portal ?? {};
+  const coreEnv = config.env.core ?? {};
   const authEnv = config.env.auth ?? {};
-  const overriddenPortal = AUTH_BROKER_ENV_KEYS.find((key) => portalEnv[key] !== undefined);
-  if (overriddenPortal) {
+  const overriddenCore = AUTH_BROKER_ENV_KEYS.find((key) => coreEnv[key] !== undefined);
+  if (overriddenCore) {
     throw new CliError(
-      `${path}: env.portal.${overriddenPortal} is derived from the built-in auth broker — remove it, or drop "auth" from "services" to use an external identity provider`,
+      `${path}: env.core.${overriddenCore} is derived from the built-in auth broker — remove it, or drop "auth" from "services" to use an external identity provider`,
     );
   }
   const overriddenAuth = DERIVED_AUTH_ENV_KEYS.find((key) => authEnv[key] !== undefined);
   if (overriddenAuth) {
     throw new CliError(`${path}: env.auth.${overriddenAuth} is derived from publicUrl and cannot be set`);
   }
-  if (portalEnv.PORTAL_EXPECTED_TEAM_ID !== undefined) {
+  if (coreEnv.PORTAL_EXPECTED_TEAM_ID !== undefined) {
     throw new CliError(
-      `${path}: env.portal.PORTAL_EXPECTED_TEAM_ID belongs to Slack sign-in and has no meaning with the built-in auth broker`,
+      `${path}: env.core.PORTAL_EXPECTED_TEAM_ID belongs to Slack sign-in and has no meaning with the built-in auth broker`,
     );
   }
   const transport = authEnv.AUTH_EMAIL_TRANSPORT?.trim();
@@ -924,27 +945,26 @@ function isSlackIssuer(issuer: string): boolean {
 }
 
 export function validatePortalTrust(config: QmConfig, path = "config", secrets?: ReadonlyMap<string, string>): void {
-  if (!config.services.includes("portal")) return;
   if (config.services.includes("auth")) return validateBrokerTrust(config, path, secrets);
-  const env = config.env.portal ?? {};
+  const env = config.env.core ?? {};
   const issuer = env.OIDC_ISSUER?.trim() || "https://slack.com";
   const jwksUri = env.OIDC_JWKS_URI?.trim();
   if (!isSlackIssuer(issuer) && isMissingOrPlaceholder(jwksUri)) {
-    throw new CliError(`${path}: portal requires env.portal.OIDC_JWKS_URI when using a non-Slack OIDC issuer`);
+    throw new CliError(`${path}: sign-in requires env.core.OIDC_JWKS_URI when using a non-Slack OIDC issuer`);
   }
   if (jwksUri !== undefined) {
     try {
       if (new URL(jwksUri).protocol !== "https:") throw new Error("protocol");
     } catch {
-      throw new CliError(`${path}: env.portal.OIDC_JWKS_URI must be a non-placeholder HTTPS URL`);
+      throw new CliError(`${path}: env.core.OIDC_JWKS_URI must be a non-placeholder HTTPS URL`);
     }
   }
   if (env.OIDC_CLIENT_ID !== undefined && isMissingOrPlaceholder(env.OIDC_CLIENT_ID)) {
-    throw new CliError(`${path}: env.portal.OIDC_CLIENT_ID may not be a placeholder when configured`);
+    throw new CliError(`${path}: env.core.OIDC_CLIENT_ID may not be a placeholder when configured`);
   }
   if (secrets && isMissingOrPlaceholder(env.OIDC_CLIENT_ID ?? secrets.get("OIDC_CLIENT_ID"))) {
     throw new CliError(
-      `${path}: portal requires a non-placeholder OIDC_CLIENT_ID in env.portal or the target secret store`,
+      `${path}: sign-in requires a non-placeholder OIDC_CLIENT_ID in env.core or the target secret store`,
     );
   }
   const domain = env.OIDC_ALLOWED_EMAIL_DOMAIN?.trim();
@@ -955,20 +975,20 @@ export function validatePortalTrust(config: QmConfig, path = "config", secrets?:
   const configuredTeam = env.PORTAL_EXPECTED_TEAM_ID?.trim();
   if (domain !== undefined && (isMissingOrPlaceholder(domain) || !validEmailDomain(domain))) {
     throw new CliError(
-      `${path}: env.portal.OIDC_ALLOWED_EMAIL_DOMAIN must be a valid, non-placeholder email domain when set`,
+      `${path}: env.core.OIDC_ALLOWED_EMAIL_DOMAIN must be a valid, non-placeholder email domain when set`,
     );
   }
   if (allowedEmails.some((email) => isMissingOrPlaceholder(email) || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email))) {
-    throw new CliError(`${path}: env.portal.OIDC_ALLOWED_EMAILS must contain valid, non-placeholder email addresses`);
+    throw new CliError(`${path}: env.core.OIDC_ALLOWED_EMAILS must contain valid, non-placeholder email addresses`);
   }
   if ((domain || allowedEmails.length) && (env.OIDC_PRINCIPAL_CLAIM ?? "email") !== "email") {
     throw new CliError(
-      `${path}: portal requires env.portal.OIDC_PRINCIPAL_CLAIM=email when using an email trust boundary`,
+      `${path}: sign-in requires env.core.OIDC_PRINCIPAL_CLAIM=email when using an email trust boundary`,
     );
   }
   if (env.PORTAL_EXPECTED_TEAM_ID !== undefined && isMissingOrPlaceholder(configuredTeam)) {
     throw new CliError(
-      `${path}: env.portal.PORTAL_EXPECTED_TEAM_ID is optional, but may not be a placeholder when configured`,
+      `${path}: env.core.PORTAL_EXPECTED_TEAM_ID is optional, but may not be a placeholder when configured`,
     );
   }
   if (
@@ -978,7 +998,7 @@ export function validatePortalTrust(config: QmConfig, path = "config", secrets?:
     isMissingOrPlaceholder(configuredTeam ?? secrets.get("PORTAL_EXPECTED_TEAM_ID"))
   ) {
     throw new CliError(
-      `${path}: portal requires OIDC_ALLOWED_EMAILS, OIDC_ALLOWED_EMAIL_DOMAIN, or a non-placeholder PORTAL_EXPECTED_TEAM_ID in env.portal or the target secret store`,
+      `${path}: sign-in requires OIDC_ALLOWED_EMAILS, OIDC_ALLOWED_EMAIL_DOMAIN, or a non-placeholder PORTAL_EXPECTED_TEAM_ID in env.core or the target secret store`,
     );
   }
 }
@@ -991,8 +1011,6 @@ export function requiresAwsMicrovmImage(config: QmConfig): boolean {
 }
 
 function validateAwsFrontDoor(config: QmConfig, path: string): void {
-  const hasPortal = config.services.includes("portal");
-  const hasWebUi = config.services.includes("web-ui");
   const publicUrl = new URL(config.publicUrl);
   const protocol = publicUrl.protocol;
   if (publicUrl.pathname !== "/" || publicUrl.search || publicUrl.hash || publicUrl.username || publicUrl.password) {
@@ -1010,24 +1028,9 @@ function validateAwsFrontDoor(config: QmConfig, path: string): void {
       `${path}: AWS requires env.core.AWS_DEPLOY_IMAGE to name a non-placeholder, stack-owned Lambda MicroVM image`,
     );
   }
-  if (hasWebUi && !hasPortal) {
+  if (protocol !== "https:") {
     throw new CliError(
-      `${path}: AWS web-ui requires the authenticated portal; a portal-free ALB must never expose the Web UI`,
-    );
-  }
-  if (config.services.includes("admin") && !hasPortal) {
-    throw new CliError(`${path}: AWS admin requires the authenticated portal`);
-  }
-  if (hasPortal && !hasWebUi) {
-    throw new CliError(`${path}: AWS portal requires web-ui`);
-  }
-  if (hasPortal && protocol !== "https:") {
-    throw new CliError(`${path}: AWS portal requires an HTTPS publicUrl and ACM certificate`);
-  }
-  const harness = config.env.core?.HARNESS?.trim() || "mock";
-  if (protocol !== "https:" && harness !== "mock") {
-    throw new CliError(
-      `${path}: AWS HARNESS=${harness} requires an HTTPS publicUrl so sandbox capabilities never cross the Internet in cleartext`,
+      `${path}: AWS requires an HTTPS publicUrl so sandbox capabilities never cross the Internet in cleartext`,
     );
   }
 }
@@ -1412,9 +1415,14 @@ function validateAws(
     }
     if (value["stopTimeout"] !== undefined) {
       const stopTimeout = value["stopTimeout"];
-      if (typeof stopTimeout !== "number" || !Number.isInteger(stopTimeout) || stopTimeout < 2 || stopTimeout > 120) {
+      if (
+        typeof stopTimeout !== "number" ||
+        !Number.isInteger(stopTimeout) ||
+        stopTimeout < 2 ||
+        stopTimeout > FARGATE_MAX_STOP_TIMEOUT_S
+      ) {
         throw new CliError(
-          `${path}: "aws.services.${name}.stopTimeout" must be an integer between 2 and 120 seconds (the Fargate limit)`,
+          `${path}: "aws.services.${name}.stopTimeout" must be an integer between 2 and ${FARGATE_MAX_STOP_TIMEOUT_S} seconds (the Fargate limit)`,
         );
       }
       service.stopTimeout = stopTimeout;
@@ -1494,6 +1502,113 @@ function validateAws(
   return out;
 }
 
+export function renderSource(raw: unknown, path: string): NonNullable<RenderConfig["source"]> {
+  if (!isPlainObject(raw) || Object.keys(raw).some((key) => !["repo", "branch"].includes(key)))
+    throw new CliError(`${path}: render.source must contain repo and branch`);
+  const repo = typeof raw.repo === "string" ? githubRepoUrl(raw.repo) : undefined;
+  if (!repo)
+    throw new CliError(`${path}: render.source.repo must be an HTTPS GitHub repository URL without credentials`);
+  const branch = typeof raw.branch === "string" ? raw.branch.trim() : "";
+  if (!isGitBranchName(branch)) throw new CliError(`${path}: render.source.branch must be a Git branch name`);
+  return { repo, branch };
+}
+
+const retiredRenderPlans: Record<string, string> = {
+  starter: "0.5c-512mb",
+  standard: "1c-2g",
+  pro: "2c-4g",
+  pro_plus: "4c-8g",
+  pro_max: "4c-16g",
+  pro_ultra: "8c-32g",
+};
+
+export function renderPlanId(plan: string): string {
+  return retiredRenderPlans[plan] ?? plan;
+}
+
+function validateRender(raw: unknown, path: string): RenderConfig {
+  if (!isPlainObject(raw)) throw new CliError(`${path}: "render" must be an object`);
+  const allowed = new Set([
+    "workspaceId",
+    "region",
+    "appRegion",
+    "corePlan",
+    "servicePlan",
+    "postgresPlan",
+    "postgresDiskSizeGB",
+    "storage",
+    "source",
+  ]);
+  for (const key of Object.keys(raw)) {
+    if (!allowed.has(key)) throw new CliError(`${path}: unknown render.${key}`);
+  }
+  const storageRaw = raw.storage ?? {};
+  if (!isPlainObject(storageRaw)) throw new CliError(`${path}: render.storage must be an object`);
+  for (const key of Object.keys(storageRaw)) {
+    if (!["plan", "diskSizeGB"].includes(key)) throw new CliError(`${path}: unknown render.storage.${key}`);
+  }
+  const plan = (key: string, value: unknown, compute = true): string => {
+    if (compute && typeof value === "string" && retiredRenderPlans[value])
+      throw new CliError(
+        `${path}: render.${key} ${value} is a retired Render plan name; use ${retiredRenderPlans[value]}`,
+      );
+    if (typeof value !== "string" || !/^[a-z0-9][a-z0-9._-]*$/.test(value) || value === "free")
+      throw new CliError(`${path}: render.${key} must name a paid Render plan`);
+    return value;
+  };
+  const storagePlan = plan("storage.plan", storageRaw.plan ?? "0.5c-512mb");
+  const diskSizeGB = storageRaw.diskSizeGB ?? 10;
+  if (typeof diskSizeGB !== "number" || !Number.isInteger(diskSizeGB) || diskSizeGB < 1)
+    throw new CliError(`${path}: render.storage.diskSizeGB must be a positive integer`);
+  const storage: RenderConfig["storage"] = { plan: storagePlan, diskSizeGB };
+  const workspaceId = raw.workspaceId;
+  if (typeof workspaceId !== "string" || !/^(tea|usr)-[a-z0-9]+$/.test(workspaceId)) {
+    throw new CliError(`${path}: render.workspaceId must be a Render workspace ID (tea-... or usr-...)`);
+  }
+  const region = raw.region ?? "oregon";
+  const regions = ["oregon", "ohio", "virginia", "frankfurt", "singapore"];
+  if (typeof region !== "string" || !regions.includes(region)) {
+    throw new CliError(`${path}: render.region must be a Render region`);
+  }
+  const appRegion = raw.appRegion;
+  if (appRegion !== undefined && (typeof appRegion !== "string" || !regions.includes(appRegion)))
+    throw new CliError(`${path}: render.appRegion must be a Render region`);
+  const postgresDiskSizeGB = raw.postgresDiskSizeGB ?? 10;
+  if (typeof postgresDiskSizeGB !== "number" || !Number.isInteger(postgresDiskSizeGB) || postgresDiskSizeGB < 1) {
+    throw new CliError(`${path}: render.postgresDiskSizeGB must be a positive integer`);
+  }
+  if (postgresDiskSizeGB !== 1 && postgresDiskSizeGB % 5 !== 0) {
+    throw new CliError(`${path}: render.postgresDiskSizeGB must be 1 or a multiple of 5`);
+  }
+  return {
+    source: renderSource(raw.source, path),
+    storage,
+    workspaceId,
+    region: region as RenderConfig["region"],
+    ...(appRegion === undefined ? {} : { appRegion: appRegion as RenderConfig["region"] }),
+    corePlan: plan("corePlan", raw.corePlan ?? "2c-4g"),
+    servicePlan: plan("servicePlan", raw.servicePlan ?? "0.5c-512mb"),
+    postgresPlan: plan("postgresPlan", raw.postgresPlan ?? "0.5c-1g", false),
+    postgresDiskSizeGB,
+  };
+}
+
+export function updateConfigUrls(raw: string, updates: { publicUrl: string; apiUrl: string }): string {
+  const root = objectProps(stripJsonComments(raw), 0);
+  const edits: ConfigEdit[] = [];
+  for (const [key, value] of Object.entries(updates)) {
+    const property = root.props.find((entry) => entry.key === key);
+    if (property) edits.push({ start: property.valueStart, end: property.valueEnd, text: JSON.stringify(value) });
+    else
+      edits.push({
+        start: root.openBrace + 1,
+        end: root.openBrace + 1,
+        text: `\n  ${JSON.stringify(key)}: ${JSON.stringify(value)},`,
+      });
+  }
+  return applyEdits(raw, edits);
+}
+
 function validateSandbox(raw: unknown, path: string, target: Target): SandboxConfig | undefined {
   if (raw === undefined) return undefined;
   if (!isPlainObject(raw)) {
@@ -1505,19 +1620,11 @@ function validateSandbox(raw: unknown, path: string, target: Target): SandboxCon
       throw new CliError(`${path}: ${field} ${JSON.stringify(name)} is not a valid env var name`);
     }
   };
-  const out: SandboxConfig = {};
+  const out: SandboxConfig = target === "render" ? { backend: "render" } : {};
   if (o["backend"] !== undefined) {
-    if (
-      o["backend"] !== "local" &&
-      o["backend"] !== "sprites" &&
-      o["backend"] !== "aws" &&
-      o["backend"] !== "agent37" &&
-      o["backend"] !== "superserve" &&
-      o["backend"] !== "e2b"
-    ) {
-      throw new CliError(
-        `${path}: "sandbox.backend" must be "local" (Docker containers on the deployment host), "sprites" (Fly Sprites), "aws" (Lambda MicroVM sandboxes), "agent37", "superserve" (Superserve sandboxes), or "e2b" (E2B sandboxes)`,
-      );
+    if (!isSandboxBackendId(o["backend"])) {
+      const choices = Object.entries(SANDBOX_BACKENDS).map(([id, label]) => (label ? `"${id}" (${label})` : `"${id}"`));
+      throw new CliError(`${path}: "sandbox.backend" must be ${choices.slice(0, -1).join(", ")}, or ${choices.at(-1)}`);
     }
     out.backend = o["backend"];
   }

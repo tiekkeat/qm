@@ -4,7 +4,6 @@ import { parseScopeId, type ScopeId } from "../types.ts";
 import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
 import type { MemoryService } from "../memory/memory-service.ts";
 import type { SkillStore } from "../skills/skill-store.ts";
-import type { WorkspaceStore } from "../workspace/workspace-store.ts";
 import type { FileArtifactStore } from "../files/file-artifact-store.ts";
 
 export function createProjectScopeGuard(projects: ProjectStore, lock: AdvisoryLock) {
@@ -82,11 +81,6 @@ export function createProjectScopeGuard(projects: ProjectStore, lock: AdvisoryLo
       },
     };
   };
-  const workspace = (store: WorkspaceStore): WorkspaceStore => ({
-    ...store,
-    write: (scope, ...args) => write([scope], () => store.write(scope, ...args)),
-    remove: (scope, ...args) => write([scope], () => store.remove(scope, ...args)),
-  });
   const files = (store: FileArtifactStore): FileArtifactStore => {
     const change = async <T>(id: string, action: () => Promise<T>): Promise<T> => {
       const file = await store.get(id, { includeDisabled: true });
@@ -104,5 +98,5 @@ export function createProjectScopeGuard(projects: ProjectStore, lock: AdvisoryLo
       delete: (id) => change(id, () => store.delete(id)),
     };
   };
-  return { active, write, memory, skills, workspace, files };
+  return { active, write, memory, skills,  files };
 }

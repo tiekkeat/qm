@@ -1,9 +1,10 @@
-import { test } from "node:test";
+import { mock, test } from "node:test";
 import assert from "node:assert/strict";
 import { brokerCredentialCall, type BrokerFetch } from "../src/api/credential-broker.ts";
 import type { CapabilityClaims } from "../src/auth/capability-token.ts";
 import type { DecryptedServiceCredential, ServiceCredentialReader } from "../src/credentials/keychain.ts";
-import { createCredentialUsageSink } from "../src/admin/credential-usage-sink.ts";
+import { createPostgresCredentialUsageSink } from "../src/admin/postgres-credential-usage-sink.ts";
+import { testDatabaseUrl } from "./support/test-database.ts";
 
 const SECRET = "super-secret-bearer";
 
@@ -56,7 +57,7 @@ const base = (over: Partial<Parameters<typeof brokerCredentialCall>[0]> = {}) =>
 
 test("happy path: injects the secret as Bearer, never exposes it in the result", async () => {
   const cap = captureFetch();
-  const usage = createCredentialUsageSink();
+  const usage = createPostgresCredentialUsageSink(testDatabaseUrl());
   const r = await brokerCredentialCall(base({ fetchImpl: cap.fetch, usage }));
   assert.equal(r.status, 200);
   assert.deepEqual(r.json, { status: 200, contentType: "application/json", body: '{"ok":true}' });
@@ -298,7 +299,7 @@ test("a custom injection header + scheme is honored", async () => {
 });
 
 test("an upstream fetch error is reported generically (never leaks the URL/headers) + recorded", async () => {
-  const usage = createCredentialUsageSink();
+  const usage = createPostgresCredentialUsageSink(testDatabaseUrl());
   const r = await brokerCredentialCall(
     base({
       usage,
@@ -326,7 +327,7 @@ test("actor attestation is opt-in and taken from capability claims", async () =>
     const cap = captureFetch();
     const result = await brokerCredentialCall(
       base({
-        claims: { ...claims(["x-firehose"]), actorId: "actor-42" },
+        claims: { ...claims(["x-firehose"]), actorId: "actor-42", scopeId: "personal:actor-42" },
         reader: reader({ slug: "x-firehose", injection: actor === undefined ? {} : { actor } }),
         fetchImpl: cap.fetch,
       }),
@@ -367,6 +368,9 @@ test("actor attestation fails closed for malformed identities and injection conf
     );
     assert.equal(result.status, 403);
     assert.equal(cap.calls.length, 0);
+    const denial = result.json as { error: string; message: string };
+    assert.equal(denial.error, "invalid_actor");
+    assert.match(denial.message, /1 to 256 visible ASCII characters with POST \/v1\/admin\/principal-links/);
   }
   for (const injection of [{ actor: "yes" }, { header: "X-QM-Actor" }, { scheme: "Bearer\n" }]) {
     const cap = captureFetch();
@@ -417,6 +421,86 @@ test("actor attestation rejects alternate ports before sending credentials", asy
   });
   assert.equal(result.status, 403);
   assert.equal(cap.calls.length, 0);
+});
+
+test("an actor-attested credential answers only to its person in their own private conversation", async () => {
+  const call = async (scopeId: string, extra: Partial<CapabilityClaims> = {}) => {
+    const cap = captureFetch();
+    const result = await brokerCredentialCall(
+      base({
+        claims: { ...claims(["x-firehose"]), scopeId, ...extra },
+        reader: reader({ slug: "x-firehose", injection: { actor: true } }),
+        fetchImpl: cap.fetch,
+      }),
+    );
+    return { result, calls: cap.calls };
+  };
+  const refused: Array<[string, Partial<CapabilityClaims>]> = [
+    ...["channel:C1", "group:G1", "team:T1", "org:default-org", "personal:U2"].map(
+      (scopeId): [string, Partial<CapabilityClaims>] => [scopeId, {}],
+    ),
+    ["personal:system:ambient:default-org", { actorId: "system:ambient:default-org" }],
+  ];
+  for (const [scopeId, extra] of refused) {
+    const { result, calls } = await call(scopeId, extra);
+    assert.equal(result.status, 403, scopeId);
+    assert.equal((result.json as { error: string }).error, "private_only");
+    assert.equal(calls.length, 0, "nothing reaches the upstream");
+  }
+  const own = await call("personal:U1");
+  assert.equal(own.result.status, 200);
+  assert.equal(own.calls[0]!.headers["x-qm-actor"], "U1");
+  const app = await call("personal:publisher", { actorId: "publisher", deployment: "dpl-1" });
+  assert.equal(app.result.status, 200);
+  assert.equal(app.calls[0]!.headers["x-qm-actor"], "publisher");
+  const unattested = captureFetch();
+  const plain = await brokerCredentialCall(
+    base({ claims: { ...claims(["x-firehose"]), scopeId: "channel:C1" }, fetchImpl: unattested.fetch }),
+  );
+  assert.equal(plain.status, 200);
+  assert.equal(unattested.calls[0]!.headers["x-qm-actor"], undefined);
+});
+
+test("an actor-attested credential set to any audience serves the person who asked in shared conversations", async () => {
+  const call = async (injection: object, extra: Partial<CapabilityClaims>) => {
+    const cap = captureFetch();
+    const result = await brokerCredentialCall(
+      base({
+        claims: { ...claims(["x-firehose"]), ...extra },
+        reader: reader({ slug: "x-firehose", injection }),
+        fetchImpl: cap.fetch,
+      }),
+    );
+    return {
+      status: result.status,
+      error: (result.json as { error?: string }).error,
+      actor: cap.calls[0]?.headers["x-qm-actor"],
+    };
+  };
+  const any = { actor: true, audience: "any" };
+  assert.deepEqual(await call(any, { scopeId: "channel:C1", actAsActor: true }), {
+    status: 200,
+    error: undefined,
+    actor: "U1",
+  });
+  assert.deepEqual(await call(any, { scopeId: "group:G1", actAsActor: true }), {
+    status: 200,
+    error: undefined,
+    actor: "U1",
+  });
+  for (const extra of [
+    { scopeId: "channel:C1" },
+    { scopeId: "channel:C1", actAsActor: false },
+    { scopeId: "channel:C1", actorId: "system:channel:C1", actAsActor: true },
+  ])
+    assert.deepEqual(await call(any, extra), { status: 403, error: "private_only", actor: undefined });
+  assert.deepEqual(await call({ actor: true }, { scopeId: "channel:C1", actAsActor: true }), {
+    status: 403,
+    error: "private_only",
+    actor: undefined,
+  });
+  for (const injection of [{ audience: "any" }, { actor: true, audience: "everywhere" }])
+    assert.equal((await call(injection, { scopeId: "channel:C1", actAsActor: true })).status, 503);
 });
 
 test("a deployment token is refused when the credential is switched off for published apps, and audited with the app id when it is on", async () => {
@@ -475,10 +559,11 @@ test("generic credential broker cannot bypass Composio identity binding", async 
   assert.equal(cap.calls.length, 0);
 });
 
-test("a daily cap admits that many outbound calls per UTC day, then refuses with 429 without calling out", async () => {
+test("a daily cap admits that many outbound calls per UTC day, then refuses with 429 without calling out", async (t) => {
   const cap = captureFetch();
-  let clock = Date.UTC(2026, 9, 16, 23, 0);
-  const usage = createCredentialUsageSink(() => clock);
+  mock.timers.enable({ apis: ["Date"], now: Date.UTC(2026, 9, 16, 23, 0) });
+  t.after(() => mock.timers.reset());
+  const usage = createPostgresCredentialUsageSink(testDatabaseUrl());
   const capped = base({
     fetchImpl: cap.fetch,
     usage,
@@ -495,7 +580,7 @@ test("a daily cap admits that many outbound calls per UTC day, then refuses with
   assert.equal((refused.json as { error: string }).error, "daily_cap_reached");
   assert.equal(cap.calls.length, 2);
 
-  clock = Date.UTC(2026, 9, 17, 0, 1);
+  mock.timers.setTime(Date.UTC(2026, 9, 17, 0, 1));
   assert.equal((await brokerCredentialCall(capped)).status, 200);
   assert.equal(cap.calls.length, 3);
 });

@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { testConfig } from "./support/test-config.ts";
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -58,12 +58,10 @@ test("exemplar (piratey X-link): the worker gets the standing order verbatim and
 
     const workerSession = await built.sessions.getByThread(`slack:${container}:ambient:${X_LINK_TS}`);
     assert.ok(workerSession, "the ambient worker ran as its own sub-conversation");
-    const entries = await built.sessions.getEntries(workerSession!.id);
-    const wake = entries.find(
-      (e: any) => e.type === "user" && String((e.payload as any)?.text ?? "").includes("<standing-orders"),
-    );
+    const items = await built.sessions.getItems(workerSession!.id);
+    const wake = items.find((e) => e.kind === "UserMessage" && (e.text ?? "").includes("<standing-orders"));
     assert.ok(wake, "the wake carries a standing-orders element");
-    const text = String((wake!.payload as any).text);
+    const text = wake.text ?? "";
     for (const line of ["DON'T: respond piratey to messages without an X link", "(per alice, updated 2026-07-01)"]) {
       assert.ok(text.includes(line), `standing order not verbatim in the wake: missing "${line}"`);
     }

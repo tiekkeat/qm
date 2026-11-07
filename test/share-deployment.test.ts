@@ -1,5 +1,4 @@
 import { authBrokerRoutes } from "../src/api/routes/auth-broker.ts";
-import { createDirectoryStore } from "../src/directory/directory-store.ts";
 import { createControlService } from "../src/api/control-service.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -28,6 +27,11 @@ import type { RecipientResolution } from "../src/directory/directory-store.ts";
 import type { Sandbox, SandboxHandle } from "../src/sandbox/sandbox.ts";
 import { scopeId } from "../src/types.ts";
 import type { FeatureFlagStore } from "../src/feature-flags.ts";
+import { singleProcessDeps } from "./support/single-process.ts";
+import { createPostgresDirectoryStore } from "../src/directory/postgres-directory-store.ts";
+import { testAdvisoryLock, testDatabaseUrl, testDeployBackings, testMap } from "./support/test-database.ts";
+import { createPostgresGrantStore } from "../src/acl/postgres-grant-store.ts";
+import { allGrants } from "./support/acl-grants.ts";
 
 const externalSharingOn = { enabled: async () => true } as unknown as FeatureFlagStore;
 
@@ -37,10 +41,12 @@ function makeDeploy(
   canManageEmail?: (email: string) => Promise<boolean>,
   externalSharing = true,
   publicLinksAvailable = true,
-): { deploy: DeployService; acl: AclStore } {
-  const acl: AclStore = createAclStore();
+): { deploy: DeployService; acl: AclStore; aclUrl: string } {
+  const aclUrl = testDatabaseUrl();
+  const acl: AclStore = createAclStore(createPostgresGrantStore(aclUrl));
   const deploy = createDeployService({
-    deployStore: createDeployStore(),
+    ...singleProcessDeps(),
+    deployStore: createDeployStore(testDeployBackings()),
     provider: {
       profile: { managedScaleToZero: false },
       apply: async () => ({ host: "127.0.0.1", port: 20200 }),
@@ -53,14 +59,15 @@ function makeDeploy(
     publicLinksAvailable,
     deployDir: mkdtempSync(join(tmpdir(), "share-api-")),
   });
-  return { deploy, acl };
+  return { deploy, acl, aclUrl };
 }
 
 function apiHarness(directory?: Dir) {
   const { deploy, acl } = makeDeploy();
   const app = createApp({
+    advisoryLock: testAdvisoryLock(),
     deploy,
-    identity: createIdentityService(),
+    identity: createIdentityService(testMap(), { externalMembers: testMap() }),
     ...(directory ? { directory } : {}),
   } as unknown as Parameters<typeof createApp>[0]);
   return { app, deploy, acl };
@@ -148,7 +155,7 @@ function callDetail(app: ReturnType<typeof createApp>, capability: CapabilityCla
   return getDeployment(ctx).then(() => out);
 }
 
-test("manage endpoints (rename/display-name/archive): agent capability is owner-scoped, source auth is trusted", async () => {
+test("manage endpoints (rename/display-name/archive): agent capability is owner-scoped, no principal is refused", async () => {
   const { app, deploy } = apiHarness();
   const d = await app.deploy({
     ownerScopeId: scopeId("personal", "U1"),
@@ -171,7 +178,8 @@ test("manage endpoints (rename/display-name/archive): agent capability is owner-
   );
   assert.equal((await callManage(renameDeployment, app, cap("U1"), d.id, { name: "renamed" })).status, 200);
 
-  assert.equal((await callManage(archiveDeployment, app, null, d.id, {})).status, 200);
+  assert.equal((await callManage(archiveDeployment, app, null, d.id, {})).status, 403);
+  assert.equal((await callManage(archiveDeployment, app, cap("U1"), d.id, {})).status, 200);
   assert.equal((await deploy.reachDeployment("renamed", "U1")).status, "not_found");
 });
 
@@ -307,12 +315,18 @@ test("share endpoint: only the owner can share (non-owner capability → 403)", 
   });
   const r = await callShare(app, cap("U2"), "owned", { scope: "org" });
   assert.equal(r.status, 403);
+  assert.equal(r.body.error, "forbidden");
   assert.match(r.body.message, /only the owner/);
 });
 
 test("share endpoint: unknown app → 404; no capability → 403; bad/ambiguous/missing args → 400", async () => {
   const { app } = apiHarness();
-  assert.equal((await callShare(app, cap("U1"), "ghost", { scope: "org" })).status, 404);
+  const ghost = await callShare(app, cap("U1"), "ghost", { scope: "org" });
+  assert.equal(ghost.status, 404);
+  assert.equal(ghost.body.error, "not_found");
+  const ghostPublic = await callShare(app, cap("U1"), "ghost", { public: true });
+  assert.equal(ghostPublic.status, 404);
+  assert.equal(ghostPublic.body.error, "not_found");
   assert.equal((await callShare(app, null, "ghost", { scope: "org" })).status, 403);
   await app.deploy({ ownerScopeId: scopeId("personal", "U1"), createdBy: "U1", entrypoint: "x", files: [], name: "a" });
   assert.equal(
@@ -414,14 +428,11 @@ function toolCtx(deploy: DeployService): ToolContext {
   return createToolContext({
     sandbox: appSandbox(),
     provision: async () => ({}) as SandboxHandle,
-    layers: [
-      { scopeId: scopeId("personal", "U1"), mountPath: "", mode: "rw" },
-      { scopeId: scopeId("org", "default-org"), mountPath: "global", mode: "ro" },
-    ],
+    writableScopeId: scopeId("personal", "U1"),
+    readOnlyScopeIds: [scopeId("org", "default-org")],
     commandPolicy: () => ({}) as never,
     authorizeCommand: () => false,
     grantedHandles: [],
-    workspace: {} as never,
     deploy,
     acl: {} as never,
     createdBy: "U1",
@@ -524,7 +535,7 @@ test("transferDeploymentOwner is home authority — a write ('manage') grantee c
 });
 
 test("transferDeploymentOwner to the current home is a no-op", async () => {
-  const { deploy, acl } = makeDeploy();
+  const { deploy, aclUrl } = makeDeploy();
   const d = await deploy.deploy({
     ownerScopeId: scopeId("personal", "U1"),
     createdBy: "U1",
@@ -535,7 +546,7 @@ test("transferDeploymentOwner to the current home is a no-op", async () => {
   await deploy.transferDeploymentOwner("same", scopeId("personal", "U1"), { callerId: "U1" });
   const after = (await deploy.listDeployments()).find((x) => x.id === d.id)!;
   assert.equal(after.ownerScopeId, scopeId("personal", "U1"));
-  assert.equal((await acl.list()).length, 0, "no self-grant sprayed by a no-op transfer");
+  assert.deepEqual(await allGrants(aclUrl), [], "no self-grant sprayed by a no-op transfer");
 });
 
 test("deployment public access is explicit, owner-only, and reversible", async () => {
@@ -554,6 +565,7 @@ test("deployment public access is explicit, owner-only, and reversible", async (
 
   const denied = await callShare(app, cap("U2"), "public-toggle", { public: true });
   assert.equal(denied.status, 403, "only the owner may make an app public");
+  assert.equal(denied.body.error, "forbidden");
 
   const enabled = await callShare(app, cap("U1"), "public-toggle", { public: true });
   assert.equal(enabled.status, 200);
@@ -577,7 +589,11 @@ test("deployment public access is explicit, owner-only, and reversible", async (
 
 test("without an apps domain, a public link is refused on the share route and the agent's apps tool", async () => {
   const { deploy } = makeDeploy(undefined, true, false);
-  const app = createApp({ deploy, identity: createIdentityService() } as unknown as Parameters<typeof createApp>[0]);
+  const app = createApp({
+    advisoryLock: testAdvisoryLock(),
+    deploy,
+    identity: createIdentityService(testMap(), { externalMembers: testMap() }),
+  } as unknown as Parameters<typeof createApp>[0]);
   await app.deploy({
     ownerScopeId: scopeId("personal", "U1"),
     createdBy: "U1",
@@ -598,7 +614,11 @@ test("without an apps domain, a public link is refused on the share route and th
 
 test("with external app sharing off, public links and outside emails are refused while org sharing still works", async () => {
   const { deploy } = makeDeploy(async (email) => email.endsWith("@acme.test"), false);
-  const app = createApp({ deploy, identity: createIdentityService() } as unknown as Parameters<typeof createApp>[0]);
+  const app = createApp({
+    advisoryLock: testAdvisoryLock(),
+    deploy,
+    identity: createIdentityService(testMap(), { externalMembers: testMap() }),
+  } as unknown as Parameters<typeof createApp>[0]);
   const off = { enabled: async () => false } as unknown as FeatureFlagStore;
   await app.deploy({
     ownerScopeId: scopeId("personal", "U1"),
@@ -707,11 +727,16 @@ test("directory email recipients retain manage access", async () => {
 
 test("exact email read grants admit app-only login and guest reach without membership or source access", async () => {
   const { deploy, acl } = makeDeploy();
-  const identity = createIdentityService();
-  const directory = createDirectoryStore();
-  const app = createApp({ deploy, acl, identity, directory, auditLog: { record() {} } } as unknown as Parameters<
-    typeof createApp
-  >[0]);
+  const identity = createIdentityService(testMap(), { externalMembers: testMap() });
+  const directory = createPostgresDirectoryStore(testDatabaseUrl());
+  const app = createApp({
+    advisoryLock: testAdvisoryLock(),
+    deploy,
+    acl,
+    identity,
+    directory,
+    auditLog: { record() {} },
+  } as unknown as Parameters<typeof createApp>[0]);
   const d = await app.deploy({
     ownerScopeId: "personal:U1",
     createdBy: "U1",
@@ -785,10 +810,11 @@ test("exact email read grants admit app-only login and guest reach without membe
 test("uniform app share accepts exact emails and enforces view-only outside the directory", async () => {
   const { deploy, acl } = makeDeploy();
   const app = createApp({
+    advisoryLock: testAdvisoryLock(),
     deploy,
     acl,
-    identity: createIdentityService(),
-    directory: createDirectoryStore(),
+    identity: createIdentityService(testMap(), { externalMembers: testMap() }),
+    directory: createPostgresDirectoryStore(testDatabaseUrl()),
     auditLog: { record() {} },
   } as unknown as Parameters<typeof createApp>[0]);
   const d = await app.deploy({ ownerScopeId: "personal:U1", createdBy: "U1", entrypoint: "x", files: [] });
@@ -815,9 +841,10 @@ test("new email grants send an app-specific invitation once; re-adds and revocat
   const { deploy, acl } = makeDeploy();
   const sent: Array<{ to: string; subject: string; text: string; html: string }> = [];
   const app = createApp({
+    advisoryLock: testAdvisoryLock(),
     deploy,
     acl,
-    identity: createIdentityService(),
+    identity: createIdentityService(testMap(), { externalMembers: testMap() }),
     deployAppsDomain: "apps.example.com",
     inviteMailer: {
       async send(message: (typeof sent)[number]) {
@@ -869,9 +896,10 @@ test("failed invitation delivery leaves the grant and reports the failure and ma
   ]) {
     const { deploy, acl } = makeDeploy();
     const app = createApp({
+      advisoryLock: testAdvisoryLock(),
       deploy,
       acl,
-      identity: createIdentityService(),
+      identity: createIdentityService(testMap(), { externalMembers: testMap() }),
       deployAppsDomain: "apps.example.com",
       inviteMailer: mailer,
     } as unknown as Parameters<typeof createApp>[0]);
@@ -897,10 +925,11 @@ test("uniform app share uses the same invitation sender", async () => {
   const { deploy, acl } = makeDeploy();
   const sent: string[] = [];
   const app = createApp({
+    advisoryLock: testAdvisoryLock(),
     deploy,
     acl,
-    identity: createIdentityService(),
-    directory: createDirectoryStore(),
+    identity: createIdentityService(testMap(), { externalMembers: testMap() }),
+    directory: createPostgresDirectoryStore(testDatabaseUrl()),
     deployAppsDomain: "apps.example.com",
     inviteMailer: {
       async send(message: { to: string }) {

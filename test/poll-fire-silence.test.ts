@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { scopeId, type TurnRequest } from "../src/types.ts";
 import { testConfig } from "./support/test-config.ts";
 
@@ -22,14 +22,16 @@ function monitorFire(text: string, channel: string, root: string, fireKey: strin
     actor: { externalId: "U1" },
     conversation: { kind: "channel", threadRef: `ch:${channel}:${root}`, channelRef: channel },
     text,
-    triggered: true,
+    origin: {
+      kind: "automation",
+      destination: {
+        type: "slack",
+        target: `slack:${channel}:${root}`,
+        audienceScopeId: scopeId("channel", channel),
+      },
+    },
     surfaceTools: true,
     addressed: true,
-    triggerDestination: {
-      type: "slack",
-      target: `slack:${channel}:${root}`,
-      audienceScopeId: scopeId("channel", channel),
-    },
     idempotencyKey: fireKey,
     async: false,
   };
@@ -58,20 +60,16 @@ test("poll fire: narration before a tool call is NOT auto-posted as an ack when 
   }
 });
 
-test("poll fire: a closing reply whose final line is a silence marker is not direct-delivered", async () => {
+test("poll fire: a closing reply ending in a bracketed token is delivered, since only finish_silently silences", async () => {
   const built = freshApp();
   built.runtime.start();
   try {
-    const res = await built.app.turn(
-      monitorFire("!narrate-no-update Still queued behind the newer deploy.", "C-watch2", "801.1", "monitor:m1:f2"),
-    );
-    assert.equal(res.status, "silent", "a marker-terminated poll reply resolves to silent");
+    const res = await built.app.turn(monitorFire("Still queued.\n\n[no-update]", "C-watch2", "801.1", "monitor:m1:f2"));
+    assert.equal(res.status, "silent", "surfaceTools turn: delivery happens via the surface, result is silent");
     await sleep(300);
-    assert.deepEqual(
-      (await slackDeliveries(built.deliveries)).map((d) => d.text),
-      [],
-      "the narration + [no-update] reply must not be posted to Slack",
-    );
+    const texts = (await slackDeliveries(built.deliveries)).map((d) => d.text);
+    assert.equal(texts.length, 1, JSON.stringify(texts));
+    assert.match(texts[0]!, /You said: Still queued\.\n\n\[no-update\]/);
   } finally {
     await built.runtime.stop();
   }
@@ -110,7 +108,7 @@ test("interactive mention: the first-block ack still posts immediately (unchange
       },
       deliveryTarget: "slack:C-live:900.1",
       text: "!preamble On it — checking.",
-      liveActor: true,
+      origin: { kind: "human" },
       async: true,
     });
     const deadline = Date.now() + 5_000;

@@ -1,3 +1,7 @@
+import { singleProcessDeps } from "./support/single-process.ts";
+import { testDeployBackings } from "./support/test-database.ts";
+import { testDatabaseUrl } from "./support/test-database.ts";
+import { createPostgresGrantStore } from "../src/acl/postgres-grant-store.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
@@ -13,8 +17,8 @@ import {
 } from "../src/deploy/app-github.ts";
 import { createDeployStore } from "../src/deploy/deploy-store.ts";
 import { createDeployService } from "../src/deploy/deploy-service.ts";
-import { createMemoryMap } from "../src/persistence/durable-map.ts";
-import { createMemoryAdvisoryLock } from "../src/persistence/advisory-lock.ts";
+import { testMap } from "./support/test-database.ts";
+import { testAdvisoryLock } from "./support/test-database.ts";
 import { createAclStore } from "../src/acl/acl-store.ts";
 import type { ConnectorTokenStore } from "../src/credentials/keychain.ts";
 import type { GitHubFile, GitHubIdentity, GitHubPullRequest } from "../src/deploy/github-client.ts";
@@ -207,11 +211,12 @@ function fakeGitHub() {
 async function fixture(t: import("node:test").TestContext) {
   const dir = await mkdtemp(join(tmpdir(), "qm-collaboration-"));
   t.after(() => rm(dir, { recursive: true, force: true }));
-  const store = createDeployStore({ git: { repoRoot: join(dir, "git") } });
-  const lock = createMemoryAdvisoryLock();
+  const store = createDeployStore(testDeployBackings({ git: { repoRoot: join(dir, "git") } }));
+  const lock = testAdvisoryLock();
   let failDeploy = false,
     contributorAccess = true;
   const deploy = createDeployService({
+    ...singleProcessDeps(),
     deployStore: store,
     provider: {
       profile: { managedScaleToZero: false },
@@ -223,7 +228,7 @@ async function fixture(t: import("node:test").TestContext) {
     },
     deployDir: join(dir, "snapshots"),
     advisoryLock: lock,
-    acl: createAclStore(),
+    acl: createAclStore(createPostgresGrantStore(testDatabaseUrl())),
     auditLog: { record() {}, events: async () => [], tail: async () => [] },
     canWriteScope: async (actor) => actor === "owner" || (actor === "contributor" && contributorAccess),
   });
@@ -244,15 +249,15 @@ async function fixture(t: import("node:test").TestContext) {
   });
   await deploy.shareDeployment(app.id, scopeId("personal", "contributor"), "write", { createdBy: "owner" });
   const gh = fakeGitHub();
-  const links = createMemoryMap<AppRepositoryLink>();
-  const operations = createMemoryMap<AppGitHubOperation>();
+  const links = testMap<AppRepositoryLink>();
+  const operations = testMap<AppGitHubOperation>();
   const deps = {
     store,
     deploy,
     lock,
     links,
     operations,
-    identities: createMemoryMap<GitHubIdentity & { verifiedAt: number }>(),
+    identities: testMap<GitHubIdentity & { verifiedAt: number }>(),
     tokens: {
       connectorDerivedAuth: async (_host: string, actor: string) => ({ accessToken: actor }),
     } as ConnectorTokenStore,

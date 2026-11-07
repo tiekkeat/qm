@@ -1,11 +1,15 @@
 import { PgBoss } from "pg-boss";
 import { createPgPool, type PgPool } from "../persistence/pg-pool.ts";
-import { errMessage } from "../util/errors.ts";
+import { errMessage, swallowAs } from "../util/errors.ts";
 
 export interface CronFireJob {
   cronId: string;
   scheduledAt: number;
   notBefore?: number;
+}
+
+export function fireJobStartsAt(job: CronFireJob): number {
+  return Math.max(job.scheduledAt, job.notBefore ?? 0);
 }
 
 interface CronQueueHandlers {
@@ -54,7 +58,7 @@ export function createPgBossCronQueue(
   return {
     async start(handlers) {
       if (started) return;
-      pg ??= createPgPool(databaseUrl, []);
+      pg ??= createPgPool(databaseUrl);
       try {
         if (!initialized) {
           await boss.start();
@@ -71,9 +75,13 @@ export function createPgBossCronQueue(
         );
       } catch (e) {
         if (initialized) {
-          await boss.offWork(FIRE_QUEUE, { wait: false }).catch(() => {});
+          await boss
+            .offWork(FIRE_QUEUE, { wait: false })
+            .catch(swallowAs("cron queue: stop worker after failed start", undefined));
         } else {
-          await boss.stop({ close: true, graceful: false }).catch(() => {});
+          await boss
+            .stop({ close: true, graceful: false })
+            .catch(swallowAs("cron queue: stop after failed start", undefined));
           await closePool();
         }
         throw e;
@@ -85,7 +93,7 @@ export function createPgBossCronQueue(
       if (!started) return;
       await boss
         .send(FIRE_QUEUE, job, {
-          startAfter: new Date(Math.max(job.scheduledAt, job.notBefore ?? 0)),
+          startAfter: new Date(fireJobStartsAt(job)),
           singletonKey: `${job.cronId}:${job.scheduledAt}`,
           retryLimit: 0,
         })

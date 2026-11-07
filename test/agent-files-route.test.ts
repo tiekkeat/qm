@@ -4,13 +4,16 @@ import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
-import { buildApp, type BuiltApp } from "../src/wiring.ts";
+import { type BuiltApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { createServer } from "../src/api/server.ts";
 import { contentTypeWithUtf8Charset } from "../src/api/http.ts";
 import { fileArtifactId } from "../src/files/file-artifact-store.ts";
 import { mintCapabilityToken, CAPABILITY_TTL_MS, CONTROL_PLANE_AUD } from "../src/auth/capability-token.ts";
 import { scopeId } from "../src/types.ts";
 import { testConfig } from "./support/test-config.ts";
+import { createPostgresReplayDedupe } from "../src/auth/replay-dedupe.ts";
+import { testDatabaseUrl } from "./support/test-database.ts";
 
 const SECRET = "agent-files-secret".repeat(3);
 
@@ -55,7 +58,10 @@ describe("agent files self-API", async () => {
 
   before(async () => {
     built = buildApp(testConfig({ signingSecret: SECRET }));
-    server = createServer(built.app, { signingSecret: SECRET });
+    server = createServer(built.app, {
+      replayDedupe: createPostgresReplayDedupe(testDatabaseUrl()),
+      signingSecret: SECRET,
+    });
     await new Promise<void>((resolve) => server.listen(0, resolve));
     base = `http://localhost:${(server.address() as AddressInfo).port}`;
     mineId = fileArtifactId("mine", "out", 0);
@@ -120,6 +126,16 @@ describe("agent files self-API", async () => {
     assert.deepEqual(page.shared, []);
   });
 
+  it("narrows the listing to names matching q", async () => {
+    const res = await get("/v1/files?q=binary", await capFor("U1"));
+    assert.equal(res.status, 200);
+    const page = (await res.json()) as { owned: Array<{ id: string }> };
+    assert.deepEqual(
+      page.owned.map((file) => file.id),
+      [binaryId],
+    );
+  });
+
   it("returns 404 for another principal's file content", async () => {
     const res = await get(`/v1/files/${theirsId}/content`, await capFor("U1"));
     assert.equal(res.status, 404);
@@ -132,7 +148,7 @@ describe("agent files self-API", async () => {
     const binary = await get(`/v1/files/${binaryId}/content`, token);
 
     assert.equal(text.headers.get("content-type"), "text/plain; charset=utf-8");
-    assert.equal(encoded.headers.get("content-type"), "application/json; charset=iso-8859-1");
+    assert.equal(encoded.headers.get("content-type"), "application/json;charset=iso-8859-1");
     assert.equal(binary.headers.get("content-type"), "image/png");
     await Promise.all([text.arrayBuffer(), encoded.arrayBuffer(), binary.arrayBuffer()]);
   });

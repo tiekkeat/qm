@@ -1,9 +1,8 @@
 import { validEmail } from "../identity/external-members.ts";
-import { createMemoryAdvisoryLock } from "../persistence/advisory-lock.ts";
 import { INVITE_EMAIL_NOT_CONFIGURED, renderInviteEmail } from "../admin/invite-email.ts";
 import { deploymentShareScope } from "../deploy/email-access.ts";
 import { errMessage } from "../util/errors.ts";
-import type { Reach } from "../deploy/deploy-service.ts";
+import { DeployAccessError, type Reach } from "../deploy/deploy-service.ts";
 import { mintDeployGitAccess } from "../deploy/access-token.ts";
 
 import type { App, AppDeps, ViewerDeployment } from "./app-types.ts";
@@ -34,6 +33,7 @@ export function createDeploymentMethods(
   | "setDeploymentAlwaysOn"
   | "setDeploymentEmbedAncestors"
   | "setDeploymentPublic"
+  | "setDeploymentConnectors"
   | "maintainDeployments"
   | "reachDeployment"
   | "deploymentLogsFor"
@@ -48,7 +48,7 @@ export function createDeploymentMethods(
   | "attachScope"
 > {
   const { effectiveDeploymentPermission, principalCanReadDeployment, principalGitPermission } = h;
-  const invitationLock = deps.advisoryLock ?? createMemoryAdvisoryLock();
+  const invitationLock = deps.advisoryLock;
   return {
     deploy(input) {
       return deps.deploy.deploy(input);
@@ -62,23 +62,26 @@ export function createDeploymentMethods(
     getDeployment(idOrName) {
       return deps.deploy.getDeployment(idOrName);
     },
-    shareDeployment(idOrName, grantee, permission, actor) {
-      return deps.deploy.shareDeployment(idOrName, grantee, permission, actor);
+    shareDeployment(idOrName, grantee, permission, actor, opts) {
+      return deps.deploy.shareDeployment(idOrName, grantee, permission, actor, opts);
     },
-    async inviteToDeployment(idOrName, rawEmail, actorId) {
+    async inviteToDeployment(idOrName, rawEmail, actorId, opts) {
       const email = rawEmail.trim().toLowerCase();
       if (!validEmail(email)) throw new Error("a valid email address is required");
       const grantee = await deploymentShareScope(`personal:${email}`, "read");
       const deployment = await deps.deploy.getDeployment(idOrName);
-      if (!deployment) throw new Error(`no such app: ${idOrName}`);
+      if (!deployment) throw new DeployAccessError("not_found", `no such app: ${idOrName}`);
       if (deployment.ownerScopeId !== `personal:${actorId}`)
-        throw new Error(`only the owner can change who can reach "${deployment.name ?? deployment.id}"`);
+        throw new DeployAccessError(
+          "forbidden",
+          `only the owner can change who can reach "${deployment.name ?? deployment.id}"`,
+        );
       return invitationLock.withLock(`deployment-invite:${deployment.id}:${email}`, async () => {
         const previous = await deps.deploy.deploymentGrantees(deployment.id);
         const alreadyShared = previous.some((g) => g.scope === grantee);
         const grantees = previous.some((g) => g.scope === grantee && g.permission === "read")
           ? previous
-          : await deps.deploy.shareDeployment(deployment.id, grantee, "read", { createdBy: actorId });
+          : await deps.deploy.shareDeployment(deployment.id, grantee, "read", { createdBy: actorId }, opts);
         const appUrl = deps.deployAppsDomain
           ? `https://${deployment.name ?? deployment.id}.${deps.deployAppsDomain}/`
           : undefined;
@@ -86,7 +89,8 @@ export function createDeploymentMethods(
           return { grantees, invitation: { emailSent: false, alreadyShared: true, ...(appUrl ? { appUrl } : {}) } };
         let emailSent = false;
         let emailProblem: string | undefined;
-        if (!deps.inviteMailer) emailProblem = INVITE_EMAIL_NOT_CONFIGURED;
+        if (opts?.notify === false) emailProblem = "notify was false";
+        else if (!deps.inviteMailer) emailProblem = INVITE_EMAIL_NOT_CONFIGURED;
         else if (!appUrl)
           emailProblem = "app URLs are not configured (set DEPLOY_APPS_DOMAIN); share the app link manually";
         else {
@@ -130,7 +134,7 @@ export function createDeploymentMethods(
       return effectiveDeploymentPermission(d, principalId);
     },
     async deploymentGitPermissionFor(idOrName, principalId) {
-      const deployment = (await deps.deploy.listDeployments()).find((d) => d.id === idOrName || d.name === idOrName);
+      const deployment = await deps.deploy.getDeployment(idOrName);
       return deployment ? principalGitPermission(deployment, principalId) : null;
     },
     rollbackDeployment(id, version, actorId, operationId) {
@@ -159,6 +163,9 @@ export function createDeploymentMethods(
     },
     setDeploymentPublic(idOrName, isPublic, actor) {
       return deps.deploy.setDeploymentPublic(idOrName, isPublic, actor);
+    },
+    setDeploymentConnectors(idOrName, connectors, actor) {
+      return deps.deploy.setDeploymentConnectors(idOrName, connectors, actor);
     },
     maintainDeployments() {
       return deps.deploy.maintainDeployments();
@@ -205,6 +212,8 @@ export function createDeploymentMethods(
     async authorizesDeploymentGitAccess(id, principalId, permission) {
       const d = await deps.deploy.getDeployment(id);
       if (!d) return false;
+      const external = await deps.deploymentGitPrincipals?.authorizes(d, principalId, permission);
+      if (external !== undefined) return external;
       const current = await principalGitPermission(d, principalId);
       return permission === "write" ? current === "write" : current !== null;
     },

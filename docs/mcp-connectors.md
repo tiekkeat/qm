@@ -1,7 +1,25 @@
 # MCP connector credentials
 
-Administrators register HTTP MCP servers through `PUT /v1/admin/mcp-servers/:id`.
-Registration controls the outbound destination and the tools available to agents.
+Administrators register HTTP MCP servers through `PUT /v1/admin/mcp-servers/:id`
+from an administrator session (`/api/admin/mcp-servers/:id` in the web UI behind the portal); agent tokens
+are refused, so an agent cannot change which tools it may call or which calls need
+approval. Registration controls the outbound destination and the tools available to agents.
+
+`approval` decides which calls pause for a person's approval, bound to the exact
+arguments and good for one call: `annotations` (the default; tools annotated
+`destructiveHint: true` and not `readOnlyHint: true`), `all`, or `none`. An update
+that omits `approval` keeps the current policy.
+
+`attestActor: true` (catalog servers with shared `bearer` or `client-credentials`
+auth only) sends the calling person's canonical id in the `x-qm-actor` header; see
+[principal-links.md](./principal-links.md#attested-actors). `attestAudience` sets where
+such a server may be used: `personal` (the default) only in the person's own private
+conversation with QM; `any` in every conversation, for the internal person the turn
+acts for: whoever asked QM or wrote the message it answers unprompted, the person who
+started a session or subagent, and the owner of scheduled work. It is refused for QM
+system actors, guests and bots.
+`any` requires `attestActor`; an update that omits `attestAudience` keeps it, and
+turning `attestActor` off resets it to `personal`.
 
 `credentialScope` selects the identity used for `tools/call`:
 
@@ -31,9 +49,20 @@ Connect the user's account using an existing QM OAuth connector, or have a trust
 integration save its token through the source-authenticated
 `POST /v1/connectors/token` endpoint with `host`, `principalId`, `accessToken`, and
 optional `expiresAt` (Unix milliseconds). Supported OAuth providers can also store
-and refresh a `refreshToken`. This change does not add OAuth provider discovery or
-an interactive MCP login flow. An unsupported provider must manage token renewal
+and refresh a `refreshToken`. An unsupported provider must manage token renewal
 in its integration; do not store a refresh token that QM cannot refresh.
+
+`auth: "oauth-user"` gives each person their own sign-in, and the URL is usually
+enough. A new registration that omits `auth` is probed: if the server publishes
+protected-resource metadata (RFC 9728, then RFC 8414), it becomes `oauth-user`;
+otherwise it is `none`. With no `clientId`, core registers a public PKCE client
+through the server's `registration_endpoint` (RFC 7591) for its own OAuth callback
+URLs. Pass `clientId` (and the authorize/token URLs if discovery fails) only for
+servers without dynamic registration. People sign in on first use through the
+`<id>_sign_in` tool.
+
+`readOnly: true` marks every tool on the server as safe for read-only turns. Without
+it, only tools annotated `readOnlyHint: true` are.
 
 Missing, expired, revoked, or unrefreshable user credentials fail the call with a
 connection-required message. Per-user MCP calls do not use operator environment
@@ -50,8 +79,11 @@ Do not put user-specific data into names, descriptions, or schemas.
 
 `credentialHost` explicitly authorizes sending that connector's user token to the
 registered server. Only register a trusted service permitted to receive those
-tokens. Per-user endpoints require HTTPS, except on loopback for local development.
-HTTP redirects are rejected for every MCP authentication mode. Updating an endpoint
+tokens. Per-user endpoints require HTTPS. Core refuses MCP server, OAuth discovery,
+and OAuth token endpoints that resolve to loopback, link-local, private, or
+unspecified addresses, checked on the address actually dialed. HTTP redirects are
+rejected for every MCP authentication mode, and OAuth token requests do not follow
+redirects. Updating an endpoint
 or credential host is an administrative trust decision. Tool call auditing records
 the initiating actor as before; authentication does not expand the audience allowed
 to receive the result.

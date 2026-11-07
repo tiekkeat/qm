@@ -1,4 +1,5 @@
-import type { Destination, Monitor, ScopeId } from "../types.ts";
+import type { Destination, ScopeId } from "../types.ts";
+import type { Monitor } from "../triggers/types.ts";
 import type { MonitorStore } from "./monitor-store.ts";
 import type { ProcessRegistry, ProcessStatus } from "../processes/process-registry.ts";
 
@@ -165,7 +166,7 @@ export function createMonitorBroker(deps: MonitorBrokerDeps): MonitorBroker {
       return { monitorId, removed: true };
     },
     async list() {
-      return (await deps.store.list()).filter((m) => m.ownerScopeId === deps.ownerScopeId);
+      return deps.store.ownedBy(deps.ownerScopeId);
     },
   };
 }

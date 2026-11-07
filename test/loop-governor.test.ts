@@ -4,7 +4,9 @@ import { createLoopStore } from "../src/loops/loop-store.ts";
 import { collectVitals, evaluateGovernor, healthWorsened, type LoopVitals } from "../src/loops/governor.ts";
 import { createLoopItemLedger } from "../src/loops/item-ledger.ts";
 import { createLoopOutputStore } from "../src/loops/output-store.ts";
-import { scopeId, type Loop, type LoopCaps, type LoopGovernorConfig } from "../src/types.ts";
+import { scopeId } from "../src/types.ts";
+import type { Loop, LoopCaps, LoopGovernorConfig } from "../src/loops/types.ts";
+import { testMap } from "./support/test-database.ts";
 
 const base = {
   owner: "U1",
@@ -24,7 +26,7 @@ const quiet: LoopVitals = {
 };
 
 async function loop(overrides: { caps?: LoopCaps; governor?: LoopGovernorConfig } = {}): Promise<Loop> {
-  return createLoopStore()
+  return createLoopStore(testMap())
     .create({ ...base, ...overrides })
     .then(({ loop }) => loop);
 }
@@ -50,6 +52,13 @@ test("consecutive failed fires quarantine by arithmetic alone", async () => {
   const verdict = evaluateGovernor(failing, quiet, Date.now());
   assert.equal(verdict.health, "quarantined");
   assert.deepEqual(typesOf(verdict.actions), ["quarantine"]);
+});
+
+test("a transient fire failure degrades the loop without quarantining it", async () => {
+  const verdict = evaluateGovernor(await loop(), { ...quiet, transientFailure: "provider rate limit" }, Date.now());
+  assert.equal(verdict.health, "degraded");
+  assert.deepEqual(verdict.actions, []);
+  assert.match(verdict.reason ?? "", /provider rate limit/);
 });
 
 test("two failed fires grade the loop failing without stopping it yet", async () => {
@@ -102,8 +111,8 @@ test("a queue outrunning the work stage asks to throttle", async () => {
 
 test("unconfirmed undeclared outputs quarantine the loop", async () => {
   const configured = await loop();
-  const items = createLoopItemLedger();
-  const outputs = createLoopOutputStore();
+  const items = createLoopItemLedger(testMap());
+  const outputs = createLoopOutputStore(testMap());
   const { item } = await items.enqueue({ loopId: configured.id, sourceKey: "pending" });
   const output = await outputs.capture({
     loopId: configured.id,

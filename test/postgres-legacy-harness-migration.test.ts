@@ -25,7 +25,7 @@ async function withPool(fn: (pool: Pool) => Promise<void>): Promise<void> {
 
 async function migrate(pool: Pool, run: number): Promise<void> {
   const migration = LEGACY_HARNESS_MIGRATION;
-  if (run === 1) await applyPgMigrations(pool, [definePgMigration(migration.id, migration.statements)]);
+  if (run === 1) await applyPgMigrations(pool, [definePgMigration({ id: migration.id, statements: migration.statements })]);
   else for (const statement of migration.statements) await pool.query(statement);
 }
 

@@ -1,3 +1,4 @@
+import { createPostgresGrantStore } from "../src/acl/postgres-grant-store.ts";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
@@ -8,11 +9,12 @@ import {
   type AgentBinding,
 } from "../src/agents/agent-service.ts";
 import { allowsAgentTool, exposesAgentTool, agentApiOperation } from "../src/agents/tool-policy.ts";
-import { createMemoryMap } from "../src/persistence/durable-map.ts";
-import { createMemoryAdvisoryLock } from "../src/persistence/advisory-lock.ts";
+import { testMap } from "./support/test-database.ts";
+import { testAdvisoryLock } from "./support/test-database.ts";
 import { createMemoryDurableByteStore } from "../src/files/durable-byte-store.ts";
 import { createAclStore } from "../src/acl/acl-store.ts";
-import { createAuditLog } from "../src/audit/audit-log.ts";
+import { createPostgresAuditLog } from "../src/admin/postgres-audit-log.ts";
+import { testDatabaseUrl } from "./support/test-database.ts";
 import { createProjectStore, projectScopeId } from "../src/projects/project-store.ts";
 const pkg: AgentPackage = {
   name: "Network engineer",
@@ -24,9 +26,9 @@ const pkg: AgentPackage = {
   examples: [{ task: "Check connectivity", expected: "Report evidence" }],
 };
 async function fixture(retire: (id: string) => Promise<unknown> = async () => {}) {
-  const agents = createMemoryMap<CustomAgent>();
-  const bindings = createMemoryMap<AgentBinding>();
-  const projects = createProjectStore();
+  const agents = testMap<CustomAgent>();
+  const bindings = testMap<AgentBinding>();
+  const projects = createProjectStore(testMap(), { advisoryLock: testAdvisoryLock() });
   const project = await projects.create({ name: "Infra", ownerId: "owner" });
   await projects.addMember(project.id, "owner", "member");
   const scope = projectScopeId(project.id);
@@ -38,9 +40,9 @@ async function fixture(retire: (id: string) => Promise<unknown> = async () => {}
     bindings,
     projects,
     bytes: createMemoryDurableByteStore(),
-    lock: createMemoryAdvisoryLock(),
-    acl: createAclStore(),
-    audit: createAuditLog(),
+    lock: testAdvisoryLock(),
+    acl: createAclStore(createPostgresGrantStore(testDatabaseUrl())),
+    audit: createPostgresAuditLog(testDatabaseUrl()),
     active: async (s: string) => !archived.has(s),
     write: async <T>(scopes: readonly string[], fn: () => Promise<T>) => {
       if (scopes.some((s) => archived.has(s))) throw new Error("Archived");

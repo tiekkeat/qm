@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { createInsecureTestServer } from "../src/api/server.ts";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { testConfig } from "./support/test-config.ts";
 
 function start(): { base: string; close: () => Promise<void> } {
@@ -43,6 +43,37 @@ test("unknown resources are 404, not silent 200 or 500", async () => {
     assert.equal((await fetch(`${s.base}/v1/sessions/nope?viewer=someone`)).status, 404);
     assert.equal((await fetch(`${s.base}/v1/sessions/nope`)).status, 400);
     assert.equal((await fetch(`${s.base}/v1/unknown-route`)).status, 404);
+  } finally {
+    await s.close();
+  }
+});
+
+test("webhook options are validated consistently on turns and steer requests", async () => {
+  const request = {
+    text: "hello",
+    surface: "web",
+    actor: { externalId: "alice@example.test" },
+    conversation: { kind: "dm", threadRef: "web:alice@example.test:conversation" },
+    deliveryTarget: "web:alice@example.test:conversation",
+    deliveryWebhook: { binding: "00000000-0000-4000-8000-000000000001", url: "https://receiver.example/qm" },
+  };
+  const s = start();
+  try {
+    for (const body of [
+      { ...request, deliveryWebhook: { binding: "bad", url: "https://receiver.example/qm" } },
+      { ...request, deliveryWebhook: { binding: request.deliveryWebhook.binding } },
+      { ...request, deliveryWebhook: { ...request.deliveryWebhook, url: "file:///etc/passwd" } },
+      { ...request, deliveryWebhook: { ...request.deliveryWebhook, url: "http://receiver.example/qm" } },
+      { ...request, deliveryTarget: "different" },
+      { ...request, surfaceTools: true },
+    ]) {
+      assert.equal((await post(s.base, "/v1/turns", JSON.stringify(body))).status, 400);
+      assert.equal(
+        (await post(s.base, "/v1/runs/missing/signal", JSON.stringify({ kind: "steer", text: "hello", request: body })))
+          .status,
+        400,
+      );
+    }
   } finally {
     await s.close();
   }

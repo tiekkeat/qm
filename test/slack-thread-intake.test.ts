@@ -1,7 +1,7 @@
 import "./support/auto-fake-sprites.ts";
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import type { TurnRequest } from "../src/types.ts";
 import { testConfig } from "./support/test-config.ts";
 
@@ -13,7 +13,7 @@ function message(threadTs?: string, text = "Continue", key = crypto.randomUUID()
     deliveryTarget: `D1${threadTs ? `:${threadTs}` : ""}`,
     text,
     async: true,
-    liveActor: true,
+    origin: { kind: "human" },
     redeliveryKey: key,
   };
 }

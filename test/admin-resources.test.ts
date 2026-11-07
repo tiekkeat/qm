@@ -7,7 +7,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { createInsecureTestServer } from "../src/api/server.ts";
-import { buildApp, type BuiltApp } from "../src/wiring.ts";
+import { type BuiltApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { testConfig } from "./support/test-config.ts";
 import { ADMIN_RESOURCES } from "../src/api/routes/admin-resources.ts";
 
@@ -30,7 +31,7 @@ function credentialLayer(): string {
   return dir;
 }
 
-function start(harnessId = "pi", withLayer = true): { base: string; built: BuiltApp; close: () => Promise<void> } {
+function start(withLayer = true): { base: string; built: BuiltApp; close: () => Promise<void> } {
   const built = buildApp(
     testConfig({
       dataDir: mkdtempSync(join(tmpdir(), "admin-res-")),
@@ -46,7 +47,6 @@ function start(harnessId = "pi", withLayer = true): { base: string; built: Built
     serviceCreds: built.serviceCreds,
     featureFlags: built.featureFlags,
     channelPolicy: built.channelPolicy,
-    harnessId,
   });
   server.listen(0);
   const base = `http://localhost:${(server.address() as AddressInfo).port}`;
@@ -78,6 +78,25 @@ test("security flags are visible to an org admin", async () => {
         },
       ],
     });
+  } finally {
+    await srv.close();
+  }
+});
+
+test("security flags include quarantines and survive a busy audit log (#868)", async () => {
+  const srv = start();
+  try {
+    const rec = (at: number, action: string) =>
+      srv.built.auditLog.record({ at, principalId: "U1", action, resource: "slack", scopeLabel: "channel:C1" });
+    rec(1, "security_posture.flagged");
+    rec(2, "security_posture.tool_result_quarantine");
+    for (let i = 0; i < 201; i++) rec(10 + i, "tool.call");
+    const r = await fetch(`${srv.base}/v1/admin/security/flags`, { headers: ADMIN });
+    const body = (await r.json()) as { flags: { at: number }[] };
+    assert.deepEqual(
+      body.flags.map((f) => f.at),
+      [2, 1],
+    );
   } finally {
     await srv.close();
   }
@@ -183,41 +202,21 @@ test("branding governance validates, round-trips through surface-config, clears,
   }
 });
 
-test("surface-config filters persisted model choices to the active native harness", async () => {
-  const srv = start("claude");
-  try {
-    srv.built.config.setBaseModel("org:default-org", "claude-opus-4-8");
-    srv.built.config.setWebuiModels("org:default-org", ["claude-opus-4-8", "gpt-5.6-sol"]);
-    const response = await fetch(`${srv.base}/v1/surface-config`);
-    const config = (await response.json()) as { harnessId: string; baseModel: string; webuiModels: string[] };
-    assert.equal(config.harnessId, "claude");
-    assert.equal(config.baseModel, "claude-opus-4-8");
-    assert.deepEqual(config.webuiModels, ["claude-opus-4-8"]);
-  } finally {
-    await srv.close();
-  }
-});
-
 test("runtime-config lets a person set, keep, and inherit an approved personal runtime", async () => {
-  const srv = start("pi");
+  const srv = start();
   try {
-    srv.built.config.setApprovedHarnesses(["pi", "claude"]);
-    srv.built.config.setWebuiModels("org:default-org", ["claude-sonnet-4-6", "claude-opus-4-8", "gpt-5.5"]);
-    srv.built.config.setRuntimeSelection("org:default-org", { harnessId: "pi", modelId: "claude-opus-4-8" });
-    await srv.built.config.flushScope("org:default-org");
+    await srv.built.config.setWebuiModels("org:default-org", ["claude-sonnet-4-6", "claude-opus-4-8", "gpt-5.5"]);
+    await srv.built.config.setRuntimeSelection("org:default-org", { modelId: "claude-opus-4-8" });
     const url = `${srv.base}/v1/runtime-config?principalId=alice&scopeId=personal:alice`;
 
     const initial = (await fetch(url).then((r) => r.json())) as {
-      effective: { harnessId: string };
+      effective: { modelId: string };
       scopeOverride: unknown;
-      modelsByHarness: Record<string, string[]>;
+      models: string[];
     };
-    assert.equal(initial.effective.harnessId, "pi");
+    assert.equal(initial.effective.modelId, "claude-opus-4-8");
     assert.equal(initial.scopeOverride, null);
-    assert.deepEqual(initial.modelsByHarness.claude, ["claude-sonnet-4-6", "claude-opus-4-8"]);
-    assert.deepEqual(initial.modelsByHarness.pi, ["claude-sonnet-4-6", "claude-opus-4-8", "gpt-5.5"]);
-    assert.equal(initial.modelsByHarness.codex, undefined);
-    assert.equal(initial.modelsByHarness.opencode, undefined);
+    assert.deepEqual(initial.models, ["claude-sonnet-4-6", "claude-opus-4-8", "gpt-5.5"]);
 
     const set = await fetch(`${srv.base}/v1/runtime-config`, {
       method: "PUT",
@@ -225,7 +224,6 @@ test("runtime-config lets a person set, keep, and inherit an approved personal r
       body: JSON.stringify({
         principalId: "alice",
         scopeId: "personal:alice",
-        harnessId: "pi",
         modelId: "gpt-5.5",
         effortLevel: "low",
         fastMode: true,
@@ -233,17 +231,15 @@ test("runtime-config lets a person set, keep, and inherit an approved personal r
     });
     assert.equal(set.status, 200);
     const selected = (await set.json()) as {
-      effective: { harnessId: string; effortLevel: string; fastMode: boolean };
+      effective: { modelId: string; effortLevel: string; fastMode: boolean };
     };
     assert.deepEqual(selected.effective, {
-      harnessId: "pi",
       modelId: "gpt-5.5",
       effortLevel: "low",
       fastMode: false,
     });
 
-    srv.built.config.setRuntimeSelection("org:default-org", { harnessId: "claude", modelId: "claude-opus-4-8" });
-    await srv.built.config.flushScope("org:default-org");
+    await srv.built.config.setRuntimeSelection("org:default-org", { modelId: "claude-sonnet-4-6" });
     assert.equal(((await fetch(url).then((r) => r.json())) as { upgradeAvailable: boolean }).upgradeAvailable, true);
 
     const keep = await fetch(`${srv.base}/v1/runtime-config`, {
@@ -258,12 +254,11 @@ test("runtime-config lets a person set, keep, and inherit an approved personal r
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ principalId: "alice", scopeId: "personal:alice", inherit: true }),
     });
-    const inherited = (await inherit.json()) as { effective: { harnessId: string }; scopeOverride: unknown };
-    assert.equal(inherited.effective.harnessId, "claude");
+    const inherited = (await inherit.json()) as { effective: { modelId: string }; scopeOverride: unknown };
+    assert.equal(inherited.effective.modelId, "claude-sonnet-4-6");
     assert.equal(inherited.scopeOverride, null);
 
-    srv.built.config.setBaseModel("personal:alice", "claude-sonnet-4-6");
-    await srv.built.config.flushScope("personal:alice");
+    await srv.built.config.setBaseModel("personal:alice", "claude-sonnet-4-6");
     assert.equal(((await fetch(url).then((r) => r.json())) as { upgradeAvailable: boolean }).upgradeAvailable, true);
     const keepLegacy = await fetch(`${srv.base}/v1/runtime-config`, {
       method: "PUT",
@@ -272,10 +267,10 @@ test("runtime-config lets a person set, keep, and inherit an approved personal r
     });
     const keptLegacy = (await keepLegacy.json()) as {
       upgradeAvailable: boolean;
-      scopeOverride: { harnessId: string; modelId: string };
+      scopeOverride: { modelId: string };
     };
     assert.equal(keptLegacy.upgradeAvailable, false);
-    assert.deepEqual(keptLegacy.scopeOverride, { harnessId: "pi", modelId: "claude-sonnet-4-6", orgRevision: 2 });
+    assert.deepEqual(keptLegacy.scopeOverride, { modelId: "claude-sonnet-4-6", orgRevision: 2 });
   } finally {
     await srv.close();
   }
@@ -342,8 +337,16 @@ test("feature flag table changes one scope live without restart", async () => {
     assert.equal(await srv.built.featureFlags.enabled("inbox_loops", "channel:C1"), true);
     assert.equal(await srv.built.featureFlags.enabled("inbox_loops", "channel:C2"), false);
     const read = await fetch(`${srv.base}/v1/admin/scopes/org:default-org`, { headers: ADMIN });
-    const flags = ((await read.json()) as { featureFlags: Array<{ enabledScopes: string[] }> }).featureFlags;
-    assert.deepEqual(flags[0]?.enabledScopes, ["channel:C1"]);
+    const flags = (
+      (await read.json()) as {
+        featureFlags: Array<{ featureName: string; label: string; personalOnly?: boolean; enabledScopes: string[] }>;
+      }
+    ).featureFlags;
+    assert.deepEqual(flags.find((flag) => flag.featureName === "inbox_loops")?.enabledScopes, ["channel:C1"]);
+    const swarms = flags.find((flag) => flag.featureName === "swarms");
+    assert.equal(swarms?.label, "Swarms");
+    assert.equal(swarms?.personalOnly, true);
+    assert.deepEqual(swarms?.enabledScopes, []);
   } finally {
     await srv.close();
   }
@@ -502,16 +505,13 @@ test("admin runtime saves reasoning level and fast mode with the default model",
   const srv = start();
   const url = `${srv.base}/v1/admin/scopes/org:default-org/runtime`;
   try {
-    srv.built.config.setApprovedHarnesses(["pi", "claude"]);
-    await srv.built.config.flushScope("org:default-org");
     const saved = await fetch(url, {
       method: "PUT",
       headers: ADMIN,
-      body: JSON.stringify({ harnessId: "pi", modelId: "claude-opus-5", effortLevel: "high", fastMode: true }),
+      body: JSON.stringify({ modelId: "claude-opus-5", effortLevel: "high", fastMode: true }),
     });
     assert.equal(saved.status, 200);
     assert.deepEqual(await srv.built.config.getRuntimeSelectionDurable("org:default-org"), {
-      harnessId: "pi",
       modelId: "claude-opus-5",
       effortLevel: "high",
       fastMode: true,
@@ -526,7 +526,6 @@ test("admin runtime saves reasoning level and fast mode with the default model",
     });
     assert.equal(changedModel.status, 200);
     assert.deepEqual(await srv.built.config.getRuntimeSelectionDurable("org:default-org"), {
-      harnessId: "pi",
       modelId: "claude-fable-5",
       effortLevel: "high",
       fastMode: false,
@@ -537,24 +536,14 @@ test("admin runtime saves reasoning level and fast mode with the default model",
     const unsupported = await fetch(url, {
       method: "PUT",
       headers: ADMIN,
-      body: JSON.stringify({ harnessId: "pi", modelId: "claude-fable-5", effortLevel: "low", fastMode: true }),
+      body: JSON.stringify({ modelId: "claude-fable-5", effortLevel: "low", fastMode: true }),
     });
     assert.equal(unsupported.status, 200);
     assert.equal((await srv.built.config.getRuntimeSelectionDurable("org:default-org"))?.fastMode, false);
 
-    const claude = await fetch(url, {
-      method: "PUT",
-      headers: ADMIN,
-      body: JSON.stringify({ harnessId: "claude", modelId: "claude-opus-5", effortLevel: "auto", fastMode: true }),
-    });
-    assert.equal(claude.status, 200);
-    assert.equal((await srv.built.config.getRuntimeSelectionDurable("org:default-org"))?.fastMode, true);
-
     for (const body of [
-      { harnessId: "pi", modelId: "claude-opus-5", effortLevel: "extreme", fastMode: true },
-      { harnessId: "codex", modelId: "gpt-5.5", effortLevel: "high", fastMode: false },
-      { harnessId: "opencode", modelId: "gpt-5.5", effortLevel: "high", fastMode: false },
-      { harnessId: "pi", modelId: "claude-opus-5", effortLevel: "high", fastMode: "yes" },
+      { modelId: "claude-opus-5", effortLevel: "extreme", fastMode: true },
+      { modelId: "claude-opus-5", effortLevel: "high", fastMode: "yes" },
     ]) {
       assert.equal((await fetch(url, { method: "PUT", headers: ADMIN, body: JSON.stringify(body) })).status, 400);
     }
@@ -698,61 +687,6 @@ test("webui-models is an org-wide string-list read back via admin GET and surfac
   }
 });
 
-test("internal-member-overrides is org-only, validates entries, audits, and round-trips", async () => {
-  const srv = start();
-  try {
-    const wrongScope = await fetch(`${srv.base}/v1/admin/scopes/personal:U1/internal-member-overrides`, {
-      method: "PUT",
-      headers: ADMIN,
-      body: JSON.stringify({ members: ["u1"] }),
-    });
-    assert.equal(wrongScope.status, 400);
-    assert.match(((await wrongScope.json()) as { message: string }).message, /org-wide/);
-
-    const notArray = await fetch(`${srv.base}/v1/admin/scopes/org:default-org/internal-member-overrides`, {
-      method: "PUT",
-      headers: ADMIN,
-      body: JSON.stringify({ members: "u1" }),
-    });
-    assert.equal(notArray.status, 400);
-    assert.match(((await notArray.json()) as { message: string }).message, /requires/);
-
-    const badEntry = await fetch(`${srv.base}/v1/admin/scopes/org:default-org/internal-member-overrides`, {
-      method: "PUT",
-      headers: ADMIN,
-      body: JSON.stringify({ members: ["ok@example.com", "  "] }),
-    });
-    assert.equal(badEntry.status, 400);
-    assert.match(((await badEntry.json()) as { message: string }).message, /non-empty string/);
-
-    const put = await fetch(`${srv.base}/v1/admin/scopes/org:default-org/internal-member-overrides`, {
-      method: "PUT",
-      headers: ADMIN,
-      body: JSON.stringify({ members: [" Contractor@EXAMPLE.com ", "U123ABC", "contractor@example.com"] }),
-    });
-    assert.equal(put.status, 200);
-    assert.deepEqual(srv.built.config.getInternalMemberOverrides(), ["contractor@example.com", "u123abc"]);
-    const adminGet = await fetch(`${srv.base}/v1/admin/scopes/org:default-org`, { headers: ADMIN });
-    assert.deepEqual(((await adminGet.json()) as { internalMemberOverrides: string[] }).internalMemberOverrides, [
-      "contractor@example.com",
-      "u123abc",
-    ]);
-    assert.ok(
-      (await srv.built.auditLog.events()).some((event) => event.action === "identity.internal-override.update"),
-    );
-
-    const clear = await fetch(`${srv.base}/v1/admin/scopes/org:default-org/internal-member-overrides`, {
-      method: "PUT",
-      headers: ADMIN,
-      body: JSON.stringify({ members: [] }),
-    });
-    assert.equal(clear.status, 200);
-    assert.deepEqual(srv.built.config.getInternalMemberOverrides(), []);
-  } finally {
-    await srv.close();
-  }
-});
-
 test("GET /v1/admin/slack-emoji surfaces 404 without a token, and serves the plugin-published catalog once one exists", async () => {
   const srv = start();
   try {
@@ -785,26 +719,23 @@ test("org purpose runtimes round-trip, validate, and clear independently", async
     assert.equal((await get()).subagentRuntime, null);
     for (const purpose of ["cron", "subagent", "fallback"] as const) {
       const resource = `${purpose}-runtime`;
-      const choice = { harnessId: "pi", modelId: "claude-opus-5", effortLevel: "low", fastMode: false };
+      const choice = { modelId: "claude-opus-5", effortLevel: "low", fastMode: false };
       assert.equal(
         (await put(resource, choice, "org:default-org", { ...ADMIN, "x-admin-actor": "nobody@default-org" })).status,
         403,
       );
       assert.equal((await put(resource, choice, "personal:alice")).status, 400);
       for (const bad of [
-        { ...choice, harnessId: "invalid" },
-        { ...choice, harnessId: "codex" },
         { ...choice, modelId: "invalid" },
         { ...choice, effortLevel: "invalid" },
         { ...choice, fastMode: "yes" },
         { ...choice, modelId: "claude-fable-5", fastMode: true },
-        { modelId: choice.modelId },
       ])
         assert.equal((await put(resource, bad)).status, 400);
       assert.equal((await put(resource, choice)).status, 200);
       assert.deepEqual((await get())[`${purpose}Runtime`], choice);
-      assert.equal((await put(resource, { harnessId: "pi", modelId: choice.modelId })).status, 200);
-      assert.deepEqual((await get())[`${purpose}Runtime`], { harnessId: "pi", modelId: choice.modelId });
+      assert.equal((await put(resource, { modelId: choice.modelId })).status, 200);
+      assert.deepEqual((await get())[`${purpose}Runtime`], { modelId: choice.modelId });
       assert.equal((await put(resource, { inherit: true })).status, 200);
       assert.equal((await get())[`${purpose}Runtime`], null);
       assert.equal((await put(resource, choice)).status, 200);

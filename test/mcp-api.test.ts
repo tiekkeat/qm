@@ -59,8 +59,8 @@ test("MCP core API requires portal identity, prevents impersonation, and returns
   const core = createServer(built.app, { ...serverDeps(config, built), requireSignedPortalIdentity: true });
   core.listen(0, "127.0.0.1");
   await once(core, "listening");
-  t.after(() => {
-    built.mcpToolService.close();
+  t.after(async () => {
+    await built.runtime.stop();
     core.closeAllConnections();
     core.close();
     remote.closeAllConnections();

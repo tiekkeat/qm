@@ -4,18 +4,19 @@ export interface RuntimeConfig {
   interactiveFastMode?: boolean;
   unavailableReason?: string;
   scopeId: string;
-  approvedHarnesses: string[];
-  modelsByHarness: Record<string, string[]>;
+  models: string[];
+  approvedHarnesses?: string[];
+  modelsByHarness?: Record<string, string[]>;
   modelCatalog: Record<string, ModelMetadata>;
-  orgDefault: { harnessId: string; modelId: string; effortLevel?: string; fastMode?: boolean; revision: number };
+  orgDefault: { harnessId?: string; modelId: string; effortLevel?: string; fastMode?: boolean; revision: number };
   scopeOverride: {
-    harnessId: string;
+    harnessId?: string;
     modelId: string;
     effortLevel?: string;
     fastMode?: boolean;
-    orgRevision: number;
+    orgRevision?: number;
   } | null;
-  effective: { harnessId: string; modelId: string; effortLevel?: string; fastMode?: boolean };
+  effective: { harnessId?: string; modelId: string; effortLevel?: string; fastMode?: boolean };
   upgradeAvailable: boolean;
   fastModeModelIds?: string[];
 }

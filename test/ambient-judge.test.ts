@@ -1,6 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { parseAmbientDecision, renderAmbientPrompt, type AmbientBatch } from "../src/surface-cache/ambient-judge.ts";
+import { createDeliveryStore } from "../src/delivery/delivery-store.ts";
+import { createSlackSurface } from "../src/surfaces/slack/adapter.ts";
+
+const readable = createSlackSurface({ deliveries: createDeliveryStore() }).readableText;
 
 const base = (over: Partial<AmbientBatch>): AmbientBatch => ({
   container: "C1",
@@ -46,6 +50,7 @@ test("backdrop marks messages the direct path owns (handled / self-mention)", ()
         },
       ],
     }),
+    readable,
   );
   const backdrop = prompt.slice(prompt.indexOf("EARLIER CONTEXT"), prompt.indexOf("NEW MESSAGES"));
   const marker = "[handled by the direct responder — do not re-engage]";
@@ -72,6 +77,7 @@ test("new messages carry their [id]; backdrop messages do not", () => {
         },
       ],
     }),
+    readable,
   );
   assert.ok(prompt.includes("[2.0] bob: qm can you check the deploy?"), "a new message is id-prefixed");
   assert.ok(!prompt.includes("[1.0]"), "a backdrop message carries no id");
@@ -106,7 +112,7 @@ test("ambient rendering resolves cached mention names without changing stored me
     backdrop: [{ ...message, ts: "1.0", handled: true }],
   });
   const original = structuredClone(batch);
-  const prompt = renderAmbientPrompt(batch);
+  const prompt = renderAmbientPrompt(batch, readable);
   assert.ok(
     prompt.includes(
       "Alice: @Bob ask @Carol and <@U9> about @already-named [handled by the direct responder — do not re-engage]",
@@ -116,4 +122,15 @@ test("ambient rendering resolves cached mention names without changing stored me
   assert.ok(prompt.includes(`[3.0] Alice: ${message.text}`));
   assert.ok(prompt.includes("mentioned as <@U00000002>"));
   assert.deepEqual(batch, original);
+});
+
+test("parseAmbientDecision reads the outermost object and stays linear-time on a brace flood", () => {
+  assert.deepEqual(parseAmbientDecision('Sure. {"act": true, "reason": "asked for a digest"} done'), {
+    act: true,
+    reason: "asked for a digest",
+  });
+  const started = performance.now();
+  assert.deepEqual(parseAmbientDecision("{".repeat(60_000)), { act: false });
+  const elapsed = performance.now() - started;
+  assert.ok(elapsed < 1_000, `brace flood took ${Math.round(elapsed)}ms`);
 });

@@ -3,8 +3,6 @@ import assert from "node:assert/strict";
 import { loadConfig } from "../src/config.ts";
 import { createSwarmService } from "../src/swarms/swarm-service.ts";
 import { resolveSwarmSettings, SWARM_DEFAULTS } from "../src/swarms/swarm-settings.ts";
-import { processRun } from "../src/runs/worker.ts";
-import type { Orchestrator } from "../src/core/orchestrator.ts";
 import { swarmFixture } from "./support/swarm-fixture.ts";
 
 test("backend defaults validate every setting and preserve unspecified defaults", () => {
@@ -23,6 +21,20 @@ test("backend defaults validate every setting and preserve unspecified defaults"
   assert.throws(() => resolveSwarmSettings({ turnMs: 2_147_483_648 }), /turnMs/);
   const large = { agents: 10_000, depth: 100, messages: 100_000, lifetimeMs: 30 * 86_400_000, turnMs: 2_147_483_647 };
   assert.deepEqual(resolveSwarmSettings(large), { ...SWARM_DEFAULTS, ...large });
+});
+
+test("budget settings are optional, off by default, and honored from SWARM_DEFAULTS", () => {
+  const caps = { messages: 128, notifications: 256, spawnRequests: 32, lifetimeMs: 28_800_000 };
+  assert.deepEqual(resolveSwarmSettings({}), SWARM_DEFAULTS);
+  for (const key of Object.keys(caps)) {
+    assert.equal(key in SWARM_DEFAULTS, false);
+    for (const value of [0, -1, 1.5, "1", null])
+      assert.throws(() => resolveSwarmSettings({ [key]: value }), new RegExp(key));
+  }
+  assert.deepEqual(resolveSwarmSettings(caps), { ...SWARM_DEFAULTS, ...caps });
+  const swarmDefaults = loadConfig({ SWARM_DEFAULTS: JSON.stringify(caps) }).swarmDefaults;
+  assert.deepEqual(swarmDefaults, { ...SWARM_DEFAULTS, ...caps });
+  assert.deepEqual(resolveSwarmSettings({ messages: 500 }, swarmDefaults), { ...swarmDefaults, messages: 500 });
 });
 
 test("resolved defaults, initial overrides, children, and restarted services share one immutable settings contract", async () => {
@@ -45,8 +57,8 @@ test("resolved defaults, initial overrides, children, and restarted services sha
   const restarted = createSwarmService({ ...f.serviceOptions, defaults: resolveSwarmSettings({ turnMs: 999 }) });
   assert.deepEqual((await restarted.inspect(caller)).settings, { ...defaults, turnMs: 777 });
   await assert.rejects(
-    restarted.spawn(caller, { requestId: "change", text: "work", settings: { turnMs: 999 } }),
-    /initial/,
+    restarted.spawn(caller, { requestId: "change", text: "work", settings: { depth: 5 } }),
+    /only the root/,
   );
   await assert.rejects(restarted.spawn(caller, { requestId: "child", text: "work" }), /depth/);
   await assert.rejects(restarted.context(caller, { long: "x".repeat(20) }), /context/);
@@ -57,8 +69,24 @@ test("resolved defaults, initial overrides, children, and restarted services sha
   const run = (await f.runs.list()).find((r) => r.request.swarm?.recipientId === sibling!.id)!;
   assert.equal(run.request.turnWallClockMs, 777);
   await assert.rejects(restarted.spawn(f.caller, { requestId: "excess", text: "work" }), /agent budget/);
+  await assert.rejects(
+    restarted.spawn(f.caller, { requestId: "turn", text: "work", settings: { agents: 4, turnMs: 999 } }),
+    /turnMs cannot change/,
+  );
+  const [extra] = await restarted.spawn(f.caller, {
+    requestId: "raise",
+    text: "work",
+    settings: { agents: 4, spawnRequests: 3 },
+  });
+  assert.ok(extra);
+  assert.deepEqual((await restarted.inspect(f.caller)).settings, {
+    ...defaults,
+    turnMs: 777,
+    agents: 4,
+    spawnRequests: 3,
+  });
   const swarm = (await f.store.get(f.root.id))!;
-  assert.equal(swarm.expiresAt - swarm.createdAt, 60_000);
+  assert.equal(swarm.expiresAt! - swarm.createdAt, 60_000);
 });
 
 test("canonical recipient sets deduplicate retries but reject changed sets", async () => {
@@ -98,37 +126,6 @@ test("unknown and unsupported providers reject before creating a swarm", async (
   assert.equal(await f.store.get(f.root.id), null);
 });
 
-test("worker cancellation honors the persisted override instead of the backend default", async (context) => {
-  const f = await swarmFixture();
-  await f.service.spawn(f.caller, { requestId: "pool", text: "work", settings: { turnMs: 250 } });
-  await f.service.sweep();
-  const pending = (await f.runs.list()).find((r) => r.request.swarm)!;
-  const run = (await f.runs.claimById(pending.id, "deadline-test", 60_000))!;
-  context.mock.timers.enable({ apis: ["setTimeout"] });
-  let cancelled = false;
-  const orchestrator = {
-    async handleTurn(input) {
-      await new Promise<void>((resolve) =>
-        input.cancel!.addEventListener(
-          "abort",
-          () => {
-            cancelled = true;
-            resolve();
-          },
-          { once: true },
-        ),
-      );
-      return { status: "silent" };
-    },
-  } as Orchestrator;
-  const work = processRun({ runs: f.runs, orchestrator, leaseTtlMs: 60_000 }, run);
-  context.mock.timers.tick(249);
-  assert.equal(cancelled, false);
-  context.mock.timers.tick(1);
-  await work;
-  assert.equal(cancelled, true);
-});
-
 test("failed initial persistence leaves no configuration and a complete pool can be retried", async () => {
   const f = await swarmFixture();
   const create = f.store.create.bind(f.store);
@@ -159,4 +156,25 @@ test("operators can disable swarms without changing other background work", () =
   assert.equal(disabled.swarmsEnabled, false);
   assert.equal(disabled.backgroundWorkEnabled, true);
   assert.throws(() => loadConfig({ SWARMS_ENABLED: "invalid" }), /SWARMS_ENABLED/);
+});
+
+test("concurrent root settings changes both apply", async () => {
+  const f = await swarmFixture();
+  await f.service.spawn(f.caller, { requestId: "pool", text: "work" });
+  await f.service.sweep();
+  const update = f.store.update.bind(f.store);
+  const ready = Promise.withResolvers<void>();
+  let arrivals = 0;
+  f.store.update = async (...args) => {
+    if (++arrivals === 2) ready.resolve();
+    await ready.promise;
+    return update(...args);
+  };
+  await Promise.all([
+    f.service.spawn(f.caller, { requestId: "agents", text: "work", settings: { agents: 64 } }),
+    f.service.spawn(f.caller, { requestId: "depth", text: "work", settings: { depth: 8 } }),
+  ]);
+  const { settings } = (await f.store.get(f.root.id))!;
+  assert.equal(settings.agents, 64);
+  assert.equal(settings.depth, 8);
 });

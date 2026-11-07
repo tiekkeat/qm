@@ -1,0 +1,10 @@
+diff --git a/dist/api/openai-responses.d.ts b/dist/api/openai-responses.d.ts
+--- a/dist/api/openai-responses.d.ts
++++ b/dist/api/openai-responses.d.ts
+@@ -1,5 +1,6 @@
+ import type { ResponseCreateParamsStreaming } from "openai/resources/responses/responses.js";
+ import type { SimpleStreamOptions, StreamFunction, StreamOptions } from "../types.ts";
++export declare function getServiceTierCostMultiplier(model: { id: string }, serviceTier?: string): number;
+ export interface OpenAIResponsesOptions extends StreamOptions {
+     reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+     reasoningSummary?: "auto" | "detailed" | "concise" | null;

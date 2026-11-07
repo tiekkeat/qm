@@ -36,23 +36,12 @@ Two habits that keep task-focused changes from scarring the rest of the repo:
   source-auth signer, signed core-client, node:http helpers, error helpers, CORE_*
   env), imported by relative path and never importing core. The bar cuts both ways:
   don't manufacture an abstraction for a pattern with one caller.
-- **Never merge to `main` without a fresh-context pass that tries to break the change.**
-  Not a blessing — hunt for the bug, the missed edge case, the unstated assumption, the
-  thing that regresses. Always dispatch `/code-review` or an independent review agent that
-  did not watch you write the change: the context that produced a diff already believes it
-  is correct, and that belief is the bias review exists to defeat. Never self-review in the
-  authoring context, however small the diff; a green CI run is not review either. What
-  scales with risk is how deep the reviewer goes — a change with a narrow blast radius
-  warrants modest effort scoped to the diff for each reviewer, while core control flow, auth
-  and credentials, data loss or migrations, concurrency and retry logic, spend, public API
-  contracts, the shared helpers above that every path flows through, or a diff too large to
-  hold in your head warrant high effort and several reviewers with distinct lenses. Judge
-  blast radius by checking callers, not by counting files — a one-line edit to a helper with
-  fifty importers is not a small change. The reviewer, not the author, has the last word on
-  depth: a modest pass that spots risk it wasn't scoped for escalates on its own initiative
-  rather than staying in its lane. Resolve what they find before merging.
-- **Run independent Wall of shame reviews in parallel for every PR.** First triage:
-  give one fast, cheap model (Haiku-class) the diff and every lens in the current
+- **Land PRs through the merge queue.** When a PR's checks and reviews pass,
+  `gh pr merge <number>` queues it rather than merging it. The queue runs CI on the
+  exact commit that will land, reusing the PR's run when `main` has not moved, and
+  `main`'s own CI then reuses the queue's run. Never bypass the queue with `--admin`.
+- **Run independent Wall of shame reviews in parallel for every PR.** First triage with
+  one fast, cheap model, the latest Haiku: give it the diff and every lens in the current
   [Wall of shame](./docs/SPEC.md#wall-of-shame), and have it mark each lens relevant or
   not, keeping any lens it is unsure about. Lenses marked _always reviewed_ in the spec
   skip triage and always get a reviewer. Then dispatch a separate fresh-context
@@ -71,23 +60,27 @@ Two habits that keep task-focused changes from scarring the rest of the repo:
   results or substitute the author's self-review. After edits, have independent
   reviewers reassess affected lenses and explicitly carry forward unaffected results.
   These reviews run alongside PR work; before merging, every relevant lens must have accepted
-  and all requested changes must be resolved. They supplement the correctness,
-  security, and regression review above. The `Wall of shame review` CI check fails
+  and all requested changes must be resolved. The `Wall of shame review` CI check fails
   until the description's report covers every lens for the PR head: relevant lenses with
   an Accept verdict, and the rest as `Not relevant` with the triage model as reviewer and
   its one-line reason as the assessment.
-- **Disclose config-matrix and database-schema changes in the PR description.** Name
-  added, removed, or changed settings, flags, modes, and providers, including changes to
-  defaults, precedence, and supported combinations. Name changed tables, columns,
-  indexes, and constraints, and describe migrations or backfills and any rollout or
-  compatibility implications. Explain why the changes are needed. If either area is
-  unchanged, say so explicitly; keep the disclosure proportional to the change.
+- **Disclose configuration changes in the PR description.** Name added, removed,
+  or changed settings, flags, modes, and providers, including defaults, precedence,
+  and supported combinations. Explain why; keep this proportional to the change.
+- **Keep humans in the loop on schema and data types.** Humans must see and review
+  changes to tables and persisted/API payload shapes. Surface them in chat and the
+  PR description as you make them: complete affected old and new shapes, including
+  keys, indexes, constraints, enum variants, and JSON fields, with representative
+  before/after rows. Label invented examples. Account for every field kept, moved,
+  transformed, or dropped; explain migration, backfill, rollout, and compatibility
+  effects. Distinguish approved design, implemented code, and live schema. A migration
+  diff alone is not enough. If configuration or schema is unchanged, say so explicitly.
 - **Verify locally with the affected tests, not the whole suite.** Run the tests covering
   what you changed plus typecheck and lint, then push and let CI be the full gate — CI
   shards the suite across parallel runners, and reproducing that serially costs several
   times the wall clock for the same signal. Judge "affected" by callers rather than by diff
-  size, for the same reason as above; run everything locally when you can't tell what a
-  change reaches.
+  size — a one-line edit to a helper with fifty importers reaches all fifty; run everything
+  locally when you can't tell what a change reaches.
 - **Test what a user or caller sees, never the source.** Run the code and assert on its
   output; don't assert on source text, CSS, or prompt wording. A bug fix's test must fail
   on the old code through the real path and assert the correct behavior, not the inverse

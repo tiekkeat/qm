@@ -9,7 +9,9 @@ import { join } from "node:path";
 import { Readable } from "node:stream";
 import type { AddressInfo } from "node:net";
 import { createInsecureTestServer, createServer } from "../src/api/server.ts";
-import { buildApp, type BuiltApp } from "../src/wiring.ts";
+import { type BuiltApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
+import { failedTurnError } from "./support/failed-turn.ts";
 import { type TurnRequest } from "../src/types.ts";
 import {
   mintCapabilityToken,
@@ -22,6 +24,9 @@ import type { BrokerFetch } from "../src/api/credential-broker.ts";
 import type { GitHttpFetch } from "../src/api/git-http-broker.ts";
 import { TEST_CAPABILITY_SECRET, testConfig } from "./support/test-config.ts";
 import type { AclStore } from "../src/acl/acl-store.ts";
+import { createPostgresReplayDedupe } from "../src/auth/replay-dedupe.ts";
+import { testDatabaseUrl } from "./support/test-database.ts";
+import { settle } from "./support/settle.ts";
 
 const SECRET = "svc-cred-route-secret".repeat(3);
 const ADMIN = { "content-type": "application/json", "x-admin-actor": "admin-alice@default-org" };
@@ -47,6 +52,7 @@ function startBroker(brokerFetch: BrokerFetch): { base: string; built: BuiltApp;
     testConfig({ dataDir: mkdtempSync(join(tmpdir(), "svc-cred-broker-")), signingSecret: SECRET }),
   );
   const server = createServer(built.app, {
+    replayDedupe: createPostgresReplayDedupe(testDatabaseUrl()),
     signingSecret: SECRET,
     config: built.config,
     serviceCreds: built.serviceCreds,
@@ -65,6 +71,7 @@ function startGitBroker(gitHttpFetch: GitHttpFetch): { base: string; built: Buil
     testConfig({ dataDir: mkdtempSync(join(tmpdir(), "svc-cred-git-broker-")), signingSecret: SECRET }),
   );
   const server = createServer(built.app, {
+    replayDedupe: createPostgresReplayDedupe(testDatabaseUrl()),
     signingSecret: SECRET,
     config: built.config,
     serviceCreds: built.serviceCreds,
@@ -101,7 +108,7 @@ const getCfg = async (base: string) =>
       enabled: boolean;
       grantees: string[];
       updatedAt: number;
-      injection?: { header?: string; scheme?: string; actor?: boolean };
+      injection?: { header?: string; scheme?: string; actor?: boolean; headers?: Record<string, string> };
       allowedMethods?: string[];
       allowedPathPrefixes?: string[];
     }>;
@@ -334,6 +341,20 @@ test("partial credential updates preserve capability lists while explicit empty 
     );
     loaded = (await getCfg(srv.base)).serviceCredentials[0]!;
     assert.equal(loaded.enabled, false, "omitting enabled preserves a disabled credential");
+  } finally {
+    await srv.close();
+  }
+});
+
+test("a credential whose injection only adds fixed headers keeps them", async () => {
+  const srv = start();
+  try {
+    const injection = { headers: { "x-api-version": "2025-11-01" } };
+    assert.equal(
+      (await putCred(srv.base, { slug: "k", name: "K", secret: "s", host: "h.example", injection })).status,
+      200,
+    );
+    assert.deepEqual((await getCfg(srv.base)).serviceCredentials[0]!.injection, injection);
   } finally {
     await srv.close();
   }
@@ -1010,9 +1031,9 @@ function buildWithCapture() {
   );
   let captured: Record<string, string> | undefined;
   const realProvision = built.sandbox.provision.bind(built.sandbox);
-  built.sandbox.provision = async (layers, opts) => {
+  built.sandbox.provision = async (owner, opts) => {
     captured = opts?.env;
-    return realProvision(layers, opts);
+    return realProvision(owner, opts);
   };
   let executed: Record<string, string> | undefined;
   const realRun = built.sandbox.run.bind(built.sandbox);
@@ -1056,7 +1077,7 @@ test("orchestrator vends a capability for only the requested org credential", as
   await built.app.turn(dm("!run echo hi"));
   assert.equal(executionEnv()?.AGENT_CREDENTIAL_TOKEN, undefined);
   const res = await built.app.turn(
-    dm(`!execute ${JSON.stringify({ command: "echo hi", credentials: ["service_x-firehose"] })}`),
+    dm(`!execute ${JSON.stringify({ command: "echo hi", credentials: ["x-firehose"] })}`),
   );
   assert.equal(res.status, "ok", res.reason);
   assert.equal(env()?.AGENT_CREDENTIAL_TOKEN, undefined);
@@ -1071,7 +1092,7 @@ test("orchestrator vends a capability for only the requested org credential", as
     surface: "slack",
     actor,
     botActor: true,
-    liveActor: true,
+    origin: { kind: "human" },
     conversation: {
       kind: "channel",
       threadRef: "ch:C1:bot",
@@ -1080,7 +1101,7 @@ test("orchestrator vends a capability for only the requested org credential", as
       audience: [actor],
       publishMembers: [actor],
     },
-    text: `!execute ${JSON.stringify({ command: "echo bot", credentials: ["service_x-firehose"] })}`,
+    text: `!execute ${JSON.stringify({ command: "echo bot", credentials: ["x-firehose"] })}`,
   });
   const botClaims = await verifyCapabilityToken(executionEnv()!.AGENT_CREDENTIAL_TOKEN!, TEST_CAPABILITY_SECRET);
   assert.equal(botClaims?.botActor, true);
@@ -1105,8 +1126,8 @@ test("orchestrator does NOT stamp a credential granted only to someone else", as
   });
   await selectDefaultSandbox(built, "U1", "personal:U1");
 
-  await assert.rejects(
-    built.app.turn(dm(`!execute ${JSON.stringify({ command: "echo hi", credentials: ["service_x-firehose"] })}`)),
+  assert.match(
+    await failedTurnError(built, dm(`!execute ${JSON.stringify({ command: "echo hi", credentials: ["x-firehose"] })}`)),
     /not available/,
   );
   const res = await built.app.turn(dm("!run echo hi"));
@@ -1148,7 +1169,7 @@ test("a channel grantee stamps the credential in that channel's conversations an
   assert.equal(executionEnv()?.AGENT_CREDENTIAL_TOKEN, undefined);
   let res = await built.app.turn({
     ...channelTurn("C1"),
-    text: `!execute ${JSON.stringify({ command: "echo hi", credentials: ["service_x-firehose"] })}`,
+    text: `!execute ${JSON.stringify({ command: "echo hi", credentials: ["x-firehose"] })}`,
   });
   assert.equal(res.status, "ok", res.reason);
   assert.equal(env()?.AGENT_CREDENTIAL_TOKEN, undefined);
@@ -1157,10 +1178,10 @@ test("a channel grantee stamps the credential in that channel's conversations an
   const claims = await verifyCapabilityToken(token!, TEST_CAPABILITY_SECRET);
   assert.deepEqual(claims?.credentials, ["x-firehose"]);
 
-  await assert.rejects(
-    built.app.turn({
+  assert.match(
+    await failedTurnError(built, {
       ...channelTurn("C2"),
-      text: `!execute ${JSON.stringify({ command: "echo hi", credentials: ["service_x-firehose"] })}`,
+      text: `!execute ${JSON.stringify({ command: "echo hi", credentials: ["x-firehose"] })}`,
     }),
     /not available/,
   );
@@ -1168,8 +1189,8 @@ test("a channel grantee stamps the credential in that channel's conversations an
   assert.equal(res.status, "ok", res.reason);
   assert.equal(env()?.AGENT_CREDENTIAL_TOKEN, undefined, "another channel must not get the credential");
 
-  await assert.rejects(
-    built.app.turn(dm(`!execute ${JSON.stringify({ command: "echo hi", credentials: ["service_x-firehose"] })}`)),
+  assert.match(
+    await failedTurnError(built, dm(`!execute ${JSON.stringify({ command: "echo hi", credentials: ["x-firehose"] })}`)),
     /not available/,
   );
   res = await built.app.turn(dm("!run echo hi"));
@@ -1206,7 +1227,7 @@ test("the system prompt advertises an entitled credential (host/methods/paths) s
   const res = await built.app.turn(dm("!sysprompt"));
   const reply = res.reply ?? "";
   assert.match(reply, /### Organization/);
-  assert.match(reply, /x-firehose.*X firehose.*api\.x\.com.*GET.*\/2\/tweets\/search\//s);
+  assert.match(reply, /`x-firehose` — X firehose; proxy api\.x\.com\n/);
   assert.match(reply, /use-shared-credential/);
   assert.doesNotMatch(reply, /curl -fsS -X POST.*credentials\/broker/);
 });
@@ -1285,7 +1306,7 @@ test("credential lists batch grants and finish without usage reads", async (t) =
       200,
     );
   }
-  const listGrants = t.mock.method(srv.built.acl, "list");
+  const listGrants = t.mock.method(srv.built.acl, "find");
   t.mock.method(srv.built.acl, "grantsFor", () => {
     throw new Error("per-credential grant read");
   });
@@ -1327,6 +1348,7 @@ test("usage summaries authorize before reads and include only the requested scop
     scopeLabel: "personal:U2",
     principalId: "U2",
   });
+  await settle(async () => (await srv.built.credentialUsage.list()).length >= 2);
   const read = t.mock.method(srv.built.serviceCreds, "listServiceCredentials");
   const summarize = t.mock.method(srv.built.credentialUsage, "summary");
   const path = `${srv.base}/v1/admin/scopes/org:default-org/credential-usage`;
@@ -1346,7 +1368,7 @@ test("usage summaries authorize before reads and include only the requested scop
   assert.doesNotMatch(JSON.stringify(body), /private|unlisted|U2/);
 });
 
-test("credential inventory and policy reordering do not resend unchanged credentials", async () => {
+test("credential inventory and policy reordering leave the system prompt byte-identical", async () => {
   const { built } = buildWithCapture();
   for (const slug of ["z-service", "a-service"]) {
     await built.serviceCreds.setServiceCredential("org:default-org", {
@@ -1367,8 +1389,8 @@ test("credential inventory and policy reordering do not resend unchanged credent
   }
   const first = await built.app.turn(dm("!sysprompt"));
   assert.equal(first.status, "ok");
-  assert.match(first.reply ?? "", /service_z-service/);
-  assert.match(first.reply ?? "", /service_a-service/);
+  assert.match(first.reply ?? "", /z-service/);
+  assert.match(first.reply ?? "", /a-service/);
   assert.match(first.reply ?? "", /### Organization/);
   const list = built.serviceCreds.listServiceCredentials.bind(built.serviceCreds);
   built.serviceCreds.listServiceCredentials = async (...args) =>
@@ -1379,8 +1401,8 @@ test("credential inventory and policy reordering do not resend unchanged credent
     }));
   const second = await built.app.turn(dm("!sysprompt"));
   assert.equal(second.status, "ok");
-  assert.match(second.reply ?? "", /<environment>/);
-  assert.doesNotMatch(second.reply ?? "", /## Credentials|No longer included: Credentials|service_[az]-service/);
+  const system = (reply?: string) => (reply ?? "").split("<environment>")[0];
+  assert.equal(system(second.reply), system(first.reply));
 });
 
 test("broker accepts no-expiry sandbox tokens but still enforces credential disablement", async () => {

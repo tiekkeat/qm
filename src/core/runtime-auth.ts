@@ -19,7 +19,7 @@ export function createRuntimeAuthLoader(
     modelAccount: ModelAccount;
     model?: string;
     harness?: string;
-    purposeDefault?: { modelId: string; harnessId: string };
+    purposeDefault?: { modelId: string; harnessId?: string };
   },
 ) {
   const { actorId, orgScopeId, scopeId, threadRef, external, modelAccount, model, harness, purposeDefault } = options;

@@ -8,8 +8,7 @@ import { createSemanticMemoryService } from "../src/memory/semantic-recall.ts";
 import { factHash, type MemoryFact } from "../src/memory/facts.ts";
 
 const url = process.env.DATABASE_URL;
-const requested = (facts: readonly MemoryFact[]) =>
-  facts.map((fact) => ({ id: fact.id, hash: factHash(fact.text), at: fact.createdAt }));
+const ids = (facts: readonly MemoryFact[]) => facts.map((fact) => fact.id);
 const write = (
   store: MemoryVectorStore,
   scope: string,
@@ -20,7 +19,7 @@ const write = (
   store.put(facts.map((fact) => ({ scope, model, factId: fact.id, hash: factHash(fact.text), vector: vector(fact) })));
 
 test(
-  "Postgres native cosine persists across instances and rejects edited/deleted snapshots",
+  "Postgres native cosine persists across instances and treats edited/deleted facts as unindexed/gone",
   { skip: !url },
   async (t) => {
     const scope = `personal:semantic-${randomUUID()}`;
@@ -30,7 +29,7 @@ test(
     await base.capture(scope, ["original browser preference"], Date.now());
     const facts = await base.facts!(scope);
     await write(index, scope, facts);
-    const search = () => index.search({ scope, model: "test-v1", vector: [1, 0], facts: requested(facts) });
+    const search = () => index.search({ scope, model: "test-v1", vector: [1, 0], ids: ids(facts), limit: 10 });
     assert.equal((await search())[0]!.factId, facts[0]!.id);
     const secondIndex = createPostgresVectorStore(url!);
     t.after(() => secondIndex.close());
@@ -49,14 +48,21 @@ test(
     assert.match((await memory.recall(scope, { query: "verify" }))[0]!.text, /original/);
     assert.deepEqual(calls, [["verify"]]);
     await base.edit!(scope, [{ id: facts[0]!.id, text: "revised browser preference" }]);
-    assert.deepEqual(await search(), []);
+    const stale = await search();
+    assert.deepEqual(
+      stale.map((row) => row.factId),
+      [facts[0]!.id],
+    );
+    assert.notEqual(stale[0]!.updatedAt, facts[0]!.updatedAt);
+    assert.ok(Math.abs(stale[0]!.score - 0.2) < 1e-9);
     assert.match((await memory.recall(scope, { query: "verify" }))[0]!.text, /revised/);
     const revised = await base.facts!(scope);
     const unindexed = await index.search({
       scope,
       model: "test-v1",
       vector: [1, 0],
-      facts: requested(revised),
+      ids: ids(revised),
+      limit: 10,
       minSimilarity: 0.9,
     });
     assert.deepEqual(
@@ -66,12 +72,12 @@ test(
     assert.ok(Math.abs(unindexed[0]!.score - 0.2) < 1e-9);
     await write(index, scope, revised);
     assert.equal(
-      (await index.search({ scope, model: "test-v1", vector: [1, 0], facts: requested(revised) }))[0]!.score,
+      (await index.search({ scope, model: "test-v1", vector: [1, 0], ids: ids(revised), limit: 10 }))[0]!.score,
       1,
     );
     await base.delete!(scope, [facts[0]!.id]);
     assert.deepEqual(await search(), []);
-    assert.deepEqual(await index.search({ scope, model: "test-v1", vector: [1, 0], facts: requested(revised) }), []);
+    assert.deepEqual(await index.search({ scope, model: "test-v1", vector: [1, 0], ids: ids(revised), limit: 10 }), []);
     assert.deepEqual(await memory.recall(scope, { query: "verify" }), []);
     assert.ok(!(await index.missing("test-v1", 256)).some((row) => row.factId === facts[0]!.id));
   },
@@ -87,10 +93,10 @@ test("native cosine returns one stable ranking and excludes other scopes/models"
   await write(index, scope, facts, "rank-model", () => [3, 4]);
   await write(index, scope, facts, "other-model", () => [1, 0]);
   await write(index, "personal:other", facts, "rank-model", () => [1, 0]);
-  const ranked = await index.search({ scope, model: "rank-model", vector: [2, 0], facts: requested(facts) });
+  const ranked = await index.search({ scope, model: "rank-model", vector: [2, 0], ids: ids(facts), limit: 10 });
   assert.ok(ranked.every((row) => Math.abs(row.score - 0.6) < 1e-6));
   assert.deepEqual(
-    await index.search({ scope, model: "rank-model", vector: [2, 0], facts: requested(facts), minSimilarity: 0.9 }),
+    await index.search({ scope, model: "rank-model", vector: [2, 0], ids: ids(facts), limit: 10, minSimilarity: 0.9 }),
     [],
   );
   assert.deepEqual(
@@ -109,7 +115,7 @@ test("model and dimension drift fall back until reindexed", { skip: !url }, asyn
   const wide = [1, 0, 0];
   await write(index, scope, facts, "wide-model", () => wide);
   const unindexedScore = async (model: string, vector: number[]) => {
-    const rows = await index.search({ scope, model, vector, facts: requested(facts) });
+    const rows = await index.search({ scope, model, vector, ids: ids(facts), limit: 10 });
     return rows.length === 1 && Math.abs(rows[0]!.score - 0.2) < 1e-9;
   };
   assert.ok(await unindexedScore("wide-model", [1, 0]));
@@ -124,7 +130,7 @@ test("model and dimension drift fall back until reindexed", { skip: !url }, asyn
   );
   await write(index, scope, facts, "wide-model", () => [1, 0]);
   assert.equal(
-    (await index.search({ scope, model: "wide-model", vector: [1, 0], facts: requested(facts) }))[0]!.score,
+    (await index.search({ scope, model: "wide-model", vector: [1, 0], ids: ids(facts), limit: 10 }))[0]!.score,
     1,
   );
   await assert.rejects(
@@ -220,5 +226,149 @@ test("prune deletes stale model, hash, deleted, and dimension rows in bounded ba
   assert.deepEqual(
     (await storedVectors(client, scope, model)).map((row) => row.fact_id),
     [keep!.id, wide!.id, unknown!.id],
+  );
+});
+
+test(
+  "stored fact hashes match factHash and the ranked search covers only the requested facts",
+  { skip: !url },
+  async (t) => {
+    const scope = `personal:hash-${randomUUID()}`;
+    const base = createPostgresMemoryService(url!);
+    const index = createPostgresVectorStore(url!);
+    const client = new pg.Client({ connectionString: url! });
+    await client.connect();
+    t.after(async () => {
+      await client.end();
+      await index.close();
+    });
+    await base.capture(scope, ["café ☃ naïve", "second", "third", "fourth"], 1000);
+    const facts = await base.facts!(scope);
+    await base.edit!(scope, [{ id: facts[1]!.id, text: "second — edited ✓" }]);
+    const edited = await base.facts!(scope);
+    const stored = await client.query("SELECT id, text_hash FROM memory_facts WHERE scope_id = $1 ORDER BY id", [
+      scope,
+    ]);
+    assert.deepEqual(
+      stored.rows.map((row) => [String(row.id), row.text_hash]),
+      edited.map((fact) => [fact.id, factHash(fact.text)]),
+    );
+    await write(index, scope, edited, "hash-model", (fact) => (fact.text.startsWith("third") ? [1, 0] : [1, 1]));
+    const search = (wanted: readonly MemoryFact[]) =>
+      index.search({ scope, model: "hash-model", vector: [1, 0], ids: ids(wanted), limit: 10 });
+    const ranked = await search(edited);
+    assert.equal(ranked[0]!.factId, edited[2]!.id);
+    assert.equal(ranked[0]!.updatedAt, edited[2]!.updatedAt);
+    assert.ok(Math.abs(ranked[0]!.score - 1) < 1e-9);
+    const subset = await search([edited[0]!, edited[1]!]);
+    assert.deepEqual(subset.map((row) => row.factId).sort(), [edited[0]!.id, edited[1]!.id].sort());
+    assert.deepEqual(await search([]), []);
+    assert.deepEqual(
+      (await index.missing("hash-model", 256)).filter((row) => row.scope === scope),
+      [],
+    );
+  },
+);
+
+test("search returns the nearest facts within the limit and follows re-embedded vectors", { skip: !url }, async (t) => {
+  const scope = `personal:sketch-${randomUUID()}`;
+  const base = createPostgresMemoryService(url!);
+  const index = createPostgresVectorStore(url!);
+  t.after(() => index.close());
+  await base.capture(
+    scope,
+    Array.from({ length: 12 }, (_, i) => `sketch fact ${i}`),
+    1000,
+  );
+  const facts = await base.facts!(scope);
+  const target = facts.at(-1)!;
+  await write(index, scope, facts, "sketch-model", () => [0.5, 1, 1]);
+  const search = () => index.search({ scope, model: "sketch-model", vector: [1, 0, 0], ids: ids(facts), limit: 2 });
+  const before = await search();
+  assert.equal(before.length, 2);
+  assert.ok(before.every((row) => Math.abs(row.score - 1 / 3) < 1e-6));
+  await write(index, scope, [target], "sketch-model", () => [1, -0.1, -0.1]);
+  const after = await search();
+  assert.equal(after.length, 2);
+  assert.equal(after[0]!.factId, target.id);
+  assert.ok(after[0]!.score > 0.98);
+  assert.ok(Math.abs(after[1]!.score - 1 / 3) < 1e-6);
+});
+
+test("unindexed facts never crowd indexed matches out of the candidate pool", { skip: !url }, async (t) => {
+  const scope = `personal:unindexed-${randomUUID()}`;
+  const base = createPostgresMemoryService(url!);
+  const index = createPostgresVectorStore(url!);
+  t.after(() => index.close());
+  await base.capture(
+    scope,
+    Array.from({ length: 11 }, (_, i) => `pending fact ${i}`),
+    1000,
+  );
+  await base.capture(scope, ["newest pending fact"], 2000);
+  const facts = await base.facts!(scope);
+  await write(index, scope, [facts[0]!], "pending-model", () => [1, 0, 0]);
+  await write(index, scope, [facts[1]!], "pending-model", () => [0.5, 1, 1]);
+  const search = (minSimilarity?: number) =>
+    index.search({ scope, model: "pending-model", vector: [1, 0, 0], ids: ids(facts), limit: 2, minSimilarity });
+  assert.deepEqual(
+    (await search()).map((row) => row.factId),
+    [facts[0]!.id, facts[1]!.id],
+  );
+  const strict = await search(0.9);
+  assert.deepEqual(
+    strict.map((row) => row.factId),
+    [facts[0]!.id, facts[11]!.id],
+  );
+  assert.ok(Math.abs(strict[1]!.score - 0.2) < 1e-9);
+});
+
+test("vectors stored before the sketch column are backfilled and ranked", { skip: !url }, async (t) => {
+  const admin = new pg.Client({ connectionString: url! });
+  await admin.connect();
+  const name = `memory_sketch_${randomUUID().replaceAll("-", "")}`;
+  await admin.query(`CREATE DATABASE ${name}`);
+  const fresh = new URL(url!);
+  fresh.pathname = `/${name}`;
+  const client = new pg.Client({ connectionString: fresh.toString() });
+  const index = createPostgresVectorStore(fresh.toString());
+  t.after(async () => {
+    await index.close();
+    await client.end();
+    await admin.query(`DROP DATABASE ${name} WITH (FORCE)`);
+    await admin.end();
+  });
+  const scope = "personal:legacy-vectors";
+  const base = createPostgresMemoryService(fresh.toString());
+  await base.capture(
+    scope,
+    Array.from({ length: 12 }, (_, i) => `legacy fact ${i}`),
+    1000,
+  );
+  const facts = await base.facts!(scope);
+  const target = facts.at(-1)!;
+  await client.connect();
+  await client.query("CREATE EXTENSION IF NOT EXISTS vector");
+  await client.query(`CREATE TABLE memory_fact_vectors (
+    scope_id TEXT NOT NULL,
+    model TEXT NOT NULL,
+    fact_id BIGINT NOT NULL,
+    fact_hash TEXT NOT NULL,
+    dimensions INTEGER NOT NULL CHECK (dimensions BETWEEN 1 AND 16000),
+    embedding vector NOT NULL,
+    PRIMARY KEY (scope_id, model, fact_id),
+    CHECK (vector_dims(embedding) = dimensions)
+  )`);
+  await client.query(
+    `INSERT INTO memory_fact_vectors(scope_id, model, fact_id, fact_hash, dimensions, embedding)
+     SELECT scope_id, 'legacy-model', id, text_hash, 3,
+       CASE WHEN id = $2 THEN '[1,-0.1,-0.1]' ELSE '[0.5,1,1]' END::vector
+     FROM memory_facts WHERE scope_id = $1`,
+    [scope, target.id],
+  );
+  const rows = await index.search({ scope, model: "legacy-model", vector: [1, 0, 0], ids: ids(facts), limit: 1 });
+  assert.deepEqual(
+    rows.map((row) => row.factId),
+    [target.id],
   );
 });

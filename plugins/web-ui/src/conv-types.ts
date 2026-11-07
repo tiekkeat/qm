@@ -10,7 +10,7 @@ import type {
   QueuedRun,
   TurnOptions,
   TurnRuntime,
-  entriesToMessages,
+  itemsToMessages,
 } from "./core-bridge";
 import type { EffortLevel, ModelOption } from "./model-options";
 import type { ComposerMenu } from "./composer";
@@ -59,7 +59,7 @@ interface ChatState {
   earlierCount: number;
   loadingEarlier: boolean;
   forkSession: CoreSession | null;
-  inheritedMessages: ReturnType<typeof entriesToMessages>;
+  inheritedMessages: ReturnType<typeof itemsToMessages>;
   inheritedExpanded: boolean;
   inheritedLoaded: boolean;
 }
@@ -83,18 +83,19 @@ export interface ChatSurface {
     threadRef: string,
     sessionId: string | null,
     scopeId: string | null,
-    messages: ReturnType<typeof entriesToMessages>,
+    messages: ReturnType<typeof itemsToMessages>,
     contextName?: string | null,
     session?: CoreSession,
-    inheritedMessages?: ReturnType<typeof entriesToMessages>,
+    inheritedMessages?: ReturnType<typeof itemsToMessages>,
   ): void;
   mountReadOnly(
     s: CoreSession,
-    messages: ReturnType<typeof entriesToMessages>,
+    messages: ReturnType<typeof itemsToMessages>,
     earlierCount?: number,
     anchorSeq?: number | null,
-    inheritedMessages?: ReturnType<typeof entriesToMessages>,
+    inheritedMessages?: ReturnType<typeof itemsToMessages>,
   ): void;
+  attachApprovalsWhenLoaded(sessionId: string, approvals: Promise<{ approvals: PendingApproval[] } | null>): void;
   mountLoadingPane(): () => boolean;
   mountLoadError(retry: () => void): void;
   scrollToBottom(): void;
@@ -112,6 +113,14 @@ export interface ChatSurface {
   notePendingSessionOnSend(): void;
   syncPaneState(): void;
   onDelivery(threadRef: string): void;
+  applyTranscript(
+    s: CoreSession,
+    page: import("./core-bridge").TranscriptPage,
+    approvals: Promise<{ approvals: PendingApproval[] } | null> | null,
+    mountedAnchor: number | null,
+  ): Promise<void>;
+  mountReadOnlyPage(s: CoreSession, page: import("./core-bridge").TranscriptPage): void;
+  transcriptAnchor(): number | null;
   resumeIfIdle(): void;
   redraw(): void;
   dispose(): void;
@@ -137,6 +146,7 @@ export interface ComposerSurface {
   state: ComposerState;
   composerForm(agent: Agent, header?: TemplateResult | typeof nothing): TemplateResult;
   queuedStrip(agent: Agent): TemplateResult | typeof import("lit").nothing;
+  waitingSteers(agent: Agent): QueuedRun[];
   queuedRunsFor(threadRef: string | null): QueuedRun[];
   setQueuedRuns(threadRef: string, runs: QueuedRun[]): void;
   resetComposer(): void;

@@ -28,9 +28,11 @@ export function preserveTranscriptScroll(root: HTMLElement): () => void {
 
 const CONDENSED_LINES = 2;
 const NEAR_TOP = 400;
+const AWAY_FROM_BOTTOM = 160;
 
 export function createTranscriptViewport(options: { pinPrompt?: () => boolean } = {}) {
   let scroller: HTMLElement | null = null;
+  let scrollIdle: ReturnType<typeof setTimeout> | undefined;
   let pins: HTMLElement | null = null;
   let prompt: HTMLElement | null = null;
   let stack: HTMLElement | null = null;
@@ -51,17 +53,31 @@ export function createTranscriptViewport(options: { pinPrompt?: () => boolean } 
   let collapseDistance = 0;
   let geometryDistance: number | null = null;
   let filledAtSize: number | null = null;
+  let heldStack: HTMLElement | null = null;
   const contentUpdates = new Set<Promise<void>>();
 
   function setFollowing(value: boolean): void {
     following = value;
     if (scroller) scroller.style.overflowAnchor = value ? "none" : "";
+    syncAway();
   }
 
   function cancelFollow(): void {
     setFollowing(false);
     if (frame !== null) cancelAnimationFrame(frame);
     frame = null;
+    releaseHeight();
+  }
+
+  function holdHeight(): void {
+    if (!following || !stack || heldStack) return;
+    heldStack = stack;
+    heldStack.style.minHeight = `${heldStack.getBoundingClientRect().height}px`;
+  }
+
+  function releaseHeight(): void {
+    heldStack?.style.removeProperty("min-height");
+    heldStack = null;
   }
 
   function clearPrompt(): void {
@@ -107,8 +123,15 @@ export function createTranscriptViewport(options: { pinPrompt?: () => boolean } 
     syncSticky();
   }
 
+  function syncAway(): void {
+    if (!scroller) return;
+    const away = !following && scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop > AWAY_FROM_BOTTOM;
+    scroller.toggleAttribute("data-away-from-bottom", away);
+  }
+
   function syncSticky(): void {
     if (!scroller) return;
+    syncAway();
     syncPrompt();
     const top = pins?.getBoundingClientRect().height ?? 0;
     scroller.style.setProperty("--chat-sticky-top", `${top}px`);
@@ -137,14 +160,28 @@ export function createTranscriptViewport(options: { pinPrompt?: () => boolean } 
     syncPrompt();
   }
 
+  // The block laid out just above the prompt. A steer sits inside the assistant turn behind a
+  // boxless wrapper, so climb out of boxless ancestors and look past boxless siblings.
+  function precedingBlock(): Element | null {
+    let node: Element | null = prompt;
+    while (node && node !== stack) {
+      let previous = node.previousElementSibling;
+      while (previous && getComputedStyle(previous).display === "contents")
+        previous = previous.lastElementChild ?? previous.previousElementSibling;
+      if (previous) return previous;
+      node = node.parentElement;
+    }
+    return null;
+  }
+
   function anchorEdge(): number {
-    const previous = prompt?.previousElementSibling;
+    const previous = precedingBlock();
     if (previous) return previous.getBoundingClientRect().bottom;
     return stack?.getBoundingClientRect().top ?? 0;
   }
 
   function restingGap(promptStyle: CSSStyleDeclaration): number {
-    const previous = prompt?.previousElementSibling;
+    const previous = precedingBlock();
     let before = 0;
     if (previous) before = parseFloat(getComputedStyle(previous).marginBottom) || 0;
     else if (stack) before = parseFloat(getComputedStyle(stack).paddingTop) || 0;
@@ -202,8 +239,26 @@ export function createTranscriptViewport(options: { pinPrompt?: () => boolean } 
     else prompt.style.removeProperty("--pin-content-max");
   }
 
+  function hideScrollbar(): void {
+    clearTimeout(scrollIdle);
+    scrollIdle = undefined;
+    scroller?.classList.remove("user-scrolling");
+  }
+
+  function showScrollbar(): void {
+    if (!scroller?.closest(".split-canvas:not(.single-pane)")) {
+      hideScrollbar();
+      return;
+    }
+    if (scroller.scrollHeight <= scroller.clientHeight) return;
+    scroller.classList.add("user-scrolling");
+    clearTimeout(scrollIdle);
+    scrollIdle = setTimeout(hideScrollbar, 700);
+  }
+
   function onScroll(): void {
     if (!scroller || contentUpdates.size > 0) return;
+    if (scroller.scrollTop !== lastTop) showScrollbar();
     const movingUp = scroller.scrollTop < lastTop;
     const atBottom = scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop <= 1;
     const resumeFollowing = atBottom && (following || !movingUp);
@@ -239,6 +294,7 @@ export function createTranscriptViewport(options: { pinPrompt?: () => boolean } 
   function beforeRender(): void {
     if (!scroller || contentUpdates.size > 0) return;
     if (scroller.scrollTop !== lastTop) onScroll();
+    holdHeight();
   }
 
   function onContentUpdating(event: Event): void {
@@ -268,10 +324,12 @@ export function createTranscriptViewport(options: { pinPrompt?: () => boolean } 
   function onKeyDown(event: KeyboardEvent): void {
     if (event.target !== scroller || event.key !== "End" || event.shiftKey || event.altKey) return;
     event.preventDefault();
+    showScrollbar();
     follow(true);
   }
 
   function dispose(): void {
+    hideScrollbar();
     if (frame !== null) cancelAnimationFrame(frame);
     frame = null;
     observer?.disconnect();
@@ -283,6 +341,8 @@ export function createTranscriptViewport(options: { pinPrompt?: () => boolean } 
     scroller?.removeEventListener("keydown", onKeyDown);
     scroller?.style.removeProperty("--chat-sticky-top");
     scroller?.style.removeProperty("overflow-anchor");
+    scroller?.removeAttribute("data-away-from-bottom");
+    releaseHeight();
     clearPrompt();
     scroller = pins = prompt = stack = content = null;
     lastTop = 0;
@@ -324,7 +384,9 @@ export function createTranscriptViewport(options: { pinPrompt?: () => boolean } 
       if (stack) observer?.observe(stack);
     }
     const nextPins = scroller?.querySelector<HTMLElement>(".pinned-strip") ?? null;
-    const prompts = stack?.querySelectorAll<HTMLElement>(":scope > .user-row");
+    // The latest prompt may be a steer, which renders inside the running assistant turn rather
+    // than as its own row in the stack; it still earns the sticky treatment.
+    const prompts = stack?.querySelectorAll<HTMLElement>(":scope > .user-row, .inline-steer > .user-row");
     const pinPrompt = options.pinPrompt?.() ?? true;
     const nextPrompt = pinPrompt ? (prompts?.item(prompts.length - 1) ?? null) : null;
     if (pins !== nextPins) {
@@ -369,6 +431,7 @@ export function createTranscriptViewport(options: { pinPrompt?: () => boolean } 
       if (element !== scroller || !element.isConnected || !following || contentUpdates.size > 0) return;
       if (element.scrollTop < priorTop && element.scrollHeight - element.clientHeight - element.scrollTop > 1)
         return cancelFollow();
+      releaseHeight();
       element.scrollTop = element.scrollHeight;
       lastTop = scroller?.scrollTop ?? 0;
       syncSticky();

@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { BuildError, Template, type BuildStep, type TemplateInfo } from "@superserve/sdk";
+import { swallowAs } from "../../src/util/errors.ts";
 import {
   REPO_ROOT,
   requireRelease,
@@ -18,8 +19,8 @@ const GH_VERSION = "2.93.0";
 const GH_SHA256_AMD64 = "02d1290eba130e0b896f3709ffff22e1c75a51475ddb70476a85abc6b5807af0";
 const AWSCLI_VERSION = "2.34.54";
 const AWSCLI_SHA256_X86_64 = "de278754dec97e0f6e9b4e8167d4bd1a27004c3e56e9c2da10002597f76ca35a";
-const NODE_VERSION = "24.18.0";
-const NODE_SHA256_X64 = "55aa7153f9d88f28d765fcdad5ae6945b5c0f98a36881703817e4c450fa76742";
+const NODE_VERSION = "24.22.1";
+const NODE_SHA256_X64 = "6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6";
 const AGENT_VENV = "/opt/agent-venv";
 const BASE_IMAGE = "ubuntu:24.04";
 
@@ -228,7 +229,10 @@ async function main(): Promise<void> {
         if (args.wait) console.log(`[qm-agent] ready: ${describe(await waitForBuild(existing))}`);
         return;
       }
-      if (existing.latestBuildId) await existing.cancelBuild(existing.latestBuildId).catch(() => undefined);
+      if (existing.latestBuildId)
+        await existing
+          .cancelBuild(existing.latestBuildId)
+          .catch(swallowAs("qm-agent: cancel in-flight build", undefined));
     }
     console.log(`[qm-agent] deleting existing template (${existing.status}${args.force ? ", --force" : ""})`);
     await existing.delete();

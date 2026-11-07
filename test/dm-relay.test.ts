@@ -5,15 +5,18 @@ import type { Server } from "node:http";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildApp, type BuiltApp } from "../src/wiring.ts";
+import { type BuiltApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { createServer } from "../src/api/server.ts";
 import { createApp, type AppDeps } from "../src/api/app.ts";
 import { createDeliveryStore } from "../src/delivery/delivery-store.ts";
-import { createDirectoryStore } from "../src/directory/directory-store.ts";
-import { createMemorySessionStore } from "../src/sessions/memory-session-store.ts";
 import { scopeId } from "../src/types.ts";
 import { mintCapabilityToken, CAPABILITY_TTL_MS } from "../src/auth/capability-token.ts";
 import { testConfig } from "./support/test-config.ts";
+import { createPostgresDirectoryStore } from "../src/directory/postgres-directory-store.ts";
+import { createPostgresSessionStore } from "../src/sessions/postgres-session-store.ts";
+import { testDatabaseUrl } from "./support/test-database.ts";
+import { createPostgresReplayDedupe } from "../src/auth/replay-dedupe.ts";
 
 const SECRET = "dm-relay-secret".repeat(3);
 
@@ -76,7 +79,10 @@ describe("agent → teammate DM: the cron recipient route (§10)", () => {
       { groupId: "G-jrs", principalId: "U-alice" },
       { groupId: "G-jrs", principalId: "U-sam1" },
     ]);
-    server = createServer(built.app, { signingSecret: SECRET });
+    server = createServer(built.app, {
+      replayDedupe: createPostgresReplayDedupe(testDatabaseUrl()),
+      signingSecret: SECRET,
+    });
     await new Promise<void>((resolve) => server.listen(0, resolve));
     base = `http://localhost:${(server.address() as AddressInfo).port}`;
   });
@@ -118,12 +124,16 @@ describe("agent → teammate DM: the cron recipient route (§10)", () => {
   it("accepts task/text aliases so user-facing cron creation doesn't expose internal modes", async () => {
     const taskRes = await post(
       "/v1/crons",
-      { schedule: { cron: "* * * * *" }, task: "check mail; reply [no-update] if nothing changed", recipient: "Alice" },
+      {
+        schedule: { cron: "* * * * *" },
+        task: "check mail; call finish_silently if nothing changed",
+        recipient: "Alice",
+      },
       { "x-agent-capability": await capDm("U-carol") },
     );
     assert.equal(taskRes.status, 200);
     const taskBody = (await taskRes.json()) as any;
-    assert.equal(taskBody.cron.action, "check mail; reply [no-update] if nothing changed");
+    assert.equal(taskBody.cron.action, "check mail; call finish_silently if nothing changed");
     assert.equal(taskBody.cron.message, undefined);
 
     const textRes = await post(
@@ -396,8 +406,8 @@ describe("agent → teammate DM: the cron recipient route (§10)", () => {
 describe("agent → teammate DM: delivery events in the recipient's session (anti-amnesia, §10)", () => {
   it("records a recipient delivery event without appending a normal assistant turn", async () => {
     const deliveries = createDeliveryStore();
-    const sessions = createMemorySessionStore();
-    const directory = createDirectoryStore();
+    const sessions = createPostgresSessionStore(testDatabaseUrl());
+    const directory = createPostgresDirectoryStore(testDatabaseUrl());
     await directory.replace([{ principalId: "U-carol", displayName: "Carol", type: "internal" }]);
     const app = createApp({ deliveries, sessions, directory } as unknown as AppDeps);
 
@@ -427,9 +437,9 @@ describe("agent → teammate DM: delivery events in the recipient's session (ant
     const session = await sessions.getByThread("dm:D-alice");
     assert.ok(session, "recipient DM session created");
     assert.equal(session!.surface, "slack");
-    const entries = await sessions.getEntries(session!.id);
+    const entries = await sessions.getItems(session!.id);
     assert.equal(
-      entries.some((e) => e.type === "assistant"),
+      entries.some((e) => e.kind === "AgentMessage"),
       false,
       "principal delivery is not fake chat history",
     );
@@ -445,8 +455,8 @@ describe("agent → teammate DM: delivery events in the recipient's session (ant
 
   it("is a no-op for a non-principal delivery", async () => {
     const deliveries = createDeliveryStore();
-    const sessions = createMemorySessionStore();
-    const directory = createDirectoryStore();
+    const sessions = createPostgresSessionStore(testDatabaseUrl());
+    const directory = createPostgresDirectoryStore(testDatabaseUrl());
     const app = createApp({ deliveries, sessions, directory } as unknown as AppDeps);
     const d = await deliveries.enqueue({
       destination: { type: "slack", target: "C1" },

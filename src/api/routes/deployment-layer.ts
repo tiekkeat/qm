@@ -56,7 +56,7 @@ async function putDeploymentLayer(ctx: ApiCtx): Promise<void> {
       ok: true,
       version: record.version,
       contentHash: record.contentHash,
-      durable: store.durable,
+      durable: true,
       resolved: record.resolved,
     });
   } catch (error) {
@@ -68,7 +68,7 @@ async function putDeploymentLayer(ctx: ApiCtx): Promise<void> {
         message: errMessage(error),
         version: record.version,
         contentHash: record.contentHash,
-        durable: store.durable,
+        durable: true,
         resolved: record.resolved,
       });
     }
@@ -81,5 +81,5 @@ async function putDeploymentLayer(ctx: ApiCtx): Promise<void> {
 
 export const deploymentLayerRoutes: ReadonlyArray<Route<ApiCtx>> = [
   { method: "GET", path: "/v1/deployment-layer", auth: "source", handle: getDeploymentLayer },
-  { method: "PUT", path: "/v1/deployment-layer", auth: "source", handle: putDeploymentLayer },
+  { method: "PUT", path: "/v1/deployment-layer", actor: "system", auth: "source", handle: putDeploymentLayer },
 ];

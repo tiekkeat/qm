@@ -24,7 +24,15 @@ import { envSha as computeEnvSha, errMessage, nowEpoch, sleep } from "../lib/uti
 import { discoverCanaryChannel } from "../lib/canary.ts";
 import { buildChildSpecs, type SpecInputs } from "./specs.ts";
 import { Child } from "./children.ts";
-import type { BootPhaseEvent, BootResult, BootSpec, ChildName, SlackHealth, StatusReport } from "../lib/types.ts";
+import type {
+  BootPhaseEvent,
+  BootResult,
+  BootSpec,
+  CanaryReply,
+  ChildName,
+  SlackHealth,
+  StatusReport,
+} from "../lib/types.ts";
 import { CHILD_ORDER, EXIT } from "../lib/types.ts";
 
 const HEALTH_INTERVAL_MS = 10_000;
@@ -74,8 +82,7 @@ let currentEnvSha = "";
 let currentGitSha = "";
 let handle = "";
 let sandbox: SandboxResolution | null = null;
-let durability = { sessionStore: "memory", runStore: "memory", databaseUrl: "" };
-let harness = "mock";
+let durability = { databaseUrl: "" };
 let watch = true;
 let bootId = "";
 let bootedAt: number | null = null;
@@ -157,17 +164,14 @@ async function fetchSlackHealth(): Promise<SlackHealth | null> {
   }
 }
 
-async function runCanary(
-  channel: string,
-  timeoutMs = 15_000,
-): Promise<{ ok: boolean; rttMs?: number; reason?: string }> {
+async function runCanary(channel: string, timeoutMs = 15_000): Promise<CanaryReply> {
   try {
     const res = await fetch(`http://127.0.0.1:${ports.slackHealth}/canary`, {
       method: "POST",
       body: JSON.stringify({ channel, timeoutMs }),
       signal: AbortSignal.timeout(timeoutMs + 5000),
     });
-    return (await res.json()) as { ok: boolean; rttMs?: number; reason?: string };
+    return (await res.json()) as CanaryReply;
   } catch (err) {
     return { ok: false, reason: `canary endpoint unreachable: ${errMessage(err)}` };
   }
@@ -267,13 +271,9 @@ function writeLegacyMeta(booting: boolean): void {
     worktree,
     branch,
     port: String(ports.core),
-    web_port: String(ports.web),
-    admin_port: String(ports.admin),
     portal_port: String(ports.portal),
     handle,
     supervisor_pid: String(process.pid),
-    session_store: durability.sessionStore,
-    run_store: durability.runStore,
     watch: watch ? "1" : "0",
     slack: slackOn(readBootSpec()) ? "1" : "0",
     web: readBootSpec().web === false ? "0" : "1",
@@ -301,7 +301,6 @@ function persistState(): void {
     envSha: currentEnvSha,
     gitSha: currentGitSha,
     sandbox: sandbox ? { backend: sandbox.backend, detail: sandbox.detail } : null,
-    harness,
   });
 }
 
@@ -311,17 +310,10 @@ async function assembleAndPrepare(spec: BootSpec): Promise<SpecInputs> {
   const assembled = await assembleEnv({
     worktree,
     callerEnv: spec.callerEnv,
-    allowMock: spec.callerEnv.DEV_INSTANCE_ALLOW_MOCK === "1",
     log,
   });
   for (const w of assembled.warnings) phase("env", "warn", w);
-  harness = assembled.harness;
-  let harnessDetail = `live ${assembled.harness} turns (anthropic key from ${assembled.anthropicKeySource})`;
-  if (assembled.harness === "mock") harnessDetail = "mock turns";
-  else if (assembled.harness === "claude") harnessDetail = "live claude turns (native CLI authentication)";
-  if (assembled.codexAuthSource && assembled.harness !== "mock")
-    harnessDetail += `; company ChatGPT subscription from ${assembled.codexAuthSource}`;
-  phase("env", "ok", harnessDetail);
+  phase("env", "ok", `live turns (anthropic key from ${assembled.anthropicKeySource})`);
 
   phase("deps", "start");
   await ensureDeps(
@@ -346,52 +338,39 @@ async function assembleAndPrepare(spec: BootSpec): Promise<SpecInputs> {
   phase("durability", "start");
   let databaseUrl = assembled.env.DATABASE_URL || envFileGet(join(worktree, ".env"), "DATABASE_URL");
   let adminGrantsSeed = assembled.env.ADMIN_GRANTS || envFileGet(join(worktree, ".env"), "ADMIN_GRANTS");
-  let sessionStore = "memory";
-  let runStore = "memory";
   let localPg = false;
-  let durableAdminPrincipal = "";
   if (!databaseUrl) {
     try {
       const pg = await ensureLocalPostgres(worktree, log);
       databaseUrl = pg.url;
       localPg = true;
     } catch (err) {
-      if (assembled.env.DEV_INSTANCE_ALLOW_MEMORY === "1") {
-        phase("durability", "warn", "memory stores explicitly allowed by DEV_INSTANCE_ALLOW_MEMORY=1");
-      } else {
-        throw new Error(
-          `DATABASE_URL is required and local Docker Postgres could not be started (${errMessage(err)}). Export DATABASE_URL, add it to ${assembled.liveEnvFile} or .env, or set DEV_INSTANCE_ALLOW_MEMORY=1 for a deliberate ephemeral wiring check.`,
-          { cause: err },
-        );
-      }
+      throw new Error(
+        `DATABASE_URL is required and local Docker Postgres could not be started (${errMessage(err)}). Export DATABASE_URL or add it to ${assembled.liveEnvFile} or .env.`,
+        { cause: err },
+      );
     }
   }
-  if (databaseUrl) {
-    sessionStore = "postgres";
-    runStore = "postgres";
-    await checkPostgres(worktree, databaseUrl).catch((err) => {
-      throw new Error(`could not connect to DATABASE_URL: ${errMessage(err)}`, { cause: err });
-    });
-    const grants = await adminGrantCount(worktree, databaseUrl);
-    if (grants === 0 && !adminGrantsSeed) {
-      if (localPg) {
-        const principal = assembled.env.DEV_INSTANCE_ADMIN_PRINCIPAL || assembled.env.USER || "dev-admin";
-        adminGrantsSeed = `${principal}:org_admin`;
-        log(`admin grants: local Postgres will seed ${principal}:org_admin if the store is empty`);
-      } else {
-        throw new Error(
-          "Postgres has no existing admin grants and ADMIN_GRANTS is unset. Set ADMIN_GRANTS=<principal>:org_admin for the first boot of this dev DB, or point DATABASE_URL at a DB that already has admin_grants.",
-        );
-      }
+  await checkPostgres(worktree, databaseUrl).catch((err) => {
+    throw new Error(`could not connect to DATABASE_URL: ${errMessage(err)}`, { cause: err });
+  });
+  const grants = await adminGrantCount(worktree, databaseUrl);
+  if (grants === 0 && !adminGrantsSeed) {
+    if (localPg) {
+      const principal = assembled.env.DEV_INSTANCE_ADMIN_PRINCIPAL || assembled.env.USER || "dev-admin";
+      adminGrantsSeed = `${principal}:org_admin`;
+      log(`admin grants: local Postgres will seed ${principal}:org_admin if the store is empty`);
+    } else {
+      throw new Error(
+        "Postgres has no existing admin grants and ADMIN_GRANTS is unset. Set ADMIN_GRANTS=<principal>:org_admin for the first boot of this dev DB, or point DATABASE_URL at a DB that already has admin_grants.",
+      );
     }
-    durableAdminPrincipal = await firstAdminPrincipal(worktree, databaseUrl).catch(() => "");
-    phase("durability", "ok", `SESSION_STORE=postgres RUN_STORE=postgres (${grants} durable grant(s))`);
-  } else {
-    phase("durability", "ok", "memory stores");
   }
-  durability = { sessionStore, runStore, databaseUrl };
+  const durableAdminPrincipal = await firstAdminPrincipal(worktree, databaseUrl).catch(() => "");
+  phase("durability", "ok", `Postgres (${grants} durable grant(s))`);
+  durability = { databaseUrl };
 
-  completeDevSecuritySecrets(assembled.env, databaseUrl || worktree);
+  completeDevSecuritySecrets(assembled.env, databaseUrl);
   const portalSessionSecret = assembled.env.PORTAL_SESSION_SECRET!;
   let portalDevPrincipal = assembled.env.DEV_INSTANCE_ADMIN_PRINCIPAL || "";
   if (!portalDevPrincipal && adminGrantsSeed) portalDevPrincipal = adminGrantsSeed.split(":")[0] ?? "";
@@ -413,8 +392,6 @@ async function assembleAndPrepare(spec: BootSpec): Promise<SpecInputs> {
     web: spec.web,
     webUiBasePath: spec.callerEnv.DEV_INSTANCE_WEB_UI_BASE || "/",
     ...(tokens ? { slack: { botToken: tokens.botToken, appToken: tokens.appToken } } : {}),
-    sessionStore,
-    runStore,
     databaseUrl,
     adminGrantsSeed,
     coreSigningSecret: assembled.env.CORE_SIGNING_SECRET || "",
@@ -662,7 +639,12 @@ function serveApi(): Server {
       if (req.method === "POST" && req.url === "/canary") {
         if (!canaryChannel) await resolveCanaryChannel(readBootSpec());
         const channel = String(body.channel || canaryChannel || "");
-        respond(200, channel ? await runCanary(channel) : { ok: false, reason: "no canary channel configured" });
+        respond(
+          200,
+          channel
+            ? await runCanary(channel)
+            : ({ ok: false, code: "unconfigured", reason: "no canary channel configured" } satisfies CanaryReply),
+        );
         return;
       }
       if (req.method === "POST" && req.url === "/shutdown") {
@@ -704,13 +686,11 @@ async function reload(body: Record<string, unknown>): Promise<Record<string, unk
     const assembled = await assembleEnv({
       worktree,
       callerEnv,
-      allowMock: callerEnv.DEV_INSTANCE_ALLOW_MOCK === "1",
       log,
     });
     const dryEnvSha = computeEnvSha(assembled.env);
     const allHealthy =
-      children.size === (spec.web === false ? 1 : CHILD_ORDER.length) &&
-      [...children.values()].every((c) => c.state === "healthy");
+      children.size === CHILD_ORDER.length && [...children.values()].every((c) => c.state === "healthy");
     return {
       ok: true,
       noop: dryEnvSha === currentEnvSha && allHealthy,
@@ -726,7 +706,7 @@ async function reload(body: Record<string, unknown>): Promise<Record<string, unk
   const newGitSha = gitHead(worktree);
   const noopEligible =
     newEnvSha === currentEnvSha &&
-    children.size === (spec.web === false ? 1 : CHILD_ORDER.length) &&
+    children.size === CHILD_ORDER.length &&
     [...children.values()].every((c) => c.state === "healthy");
   if (!force && noopEligible) {
     return {
@@ -798,15 +778,11 @@ async function statusReport(): Promise<StatusReport> {
     gitSha: currentGitSha,
     sandbox: sandbox ? { backend: sandbox.backend, detail: sandbox.detail } : { backend: "none", detail: "" },
     durability: {
-      sessionStore: durability.sessionStore,
-      runStore: durability.runStore,
       databaseUrl: Boolean(durability.databaseUrl),
     },
-    harness,
     slackEnabled,
     webEnabled: readBootSpec().web !== false,
     watch,
-    turnsLive: harness !== "mock",
     publicApiUrl: sandbox?.publicApiUrl ?? null,
     children: childStatuses,
   };

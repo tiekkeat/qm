@@ -1,9 +1,10 @@
 import { test, before } from "node:test";
 import assert from "node:assert/strict";
-import { createPostgresCronFireStore } from "../src/cron/fire-store.ts";
+import { createPostgresCronFireStore, FIRE_RETENTION_KEEP_PER_CRON } from "../src/cron/fire-store.ts";
 import { createPostgresMapFactory } from "../src/persistence/durable-map.ts";
 import { createCronStore } from "../src/cron/cron-store.ts";
-import { scopeId, type Cron } from "../src/types.ts";
+import { scopeId } from "../src/types.ts";
+import type { Cron } from "../src/triggers/types.ts";
 
 const URL = process.env.DATABASE_URL;
 const skip = URL ? false : "set DATABASE_URL (a Postgres) to run the cron fire table tests";
@@ -75,6 +76,17 @@ test("pg cron_fires: listByCron pages the latest N with the full total", { skip 
   );
 });
 
+test("pg cron_fires: without a limit listByCron returns the runs retention always keeps", { skip }, async () => {
+  const fires = createPostgresCronFireStore(URL!);
+  for (let i = 0; i <= FIRE_RETENTION_KEEP_PER_CRON; i++)
+    await fires.record("c-default", { fireKey: `k${i}`, threadRef: `t-${i}`, firedAt: i + 1, status: "ok" });
+  const { runs, total } = await fires.listByCron("c-default");
+  assert.deepEqual(
+    [runs.length, total, runs[0]?.fireKey, runs.at(-1)?.fireKey],
+    [FIRE_RETENTION_KEEP_PER_CRON, FIRE_RETENTION_KEEP_PER_CRON + 1, "k1", `k${FIRE_RETENTION_KEEP_PER_CRON}`],
+  );
+});
+
 test("pg cron_fires: thread-ref lookups hit the indexed columns across crons", { skip }, async () => {
   const fires = createPostgresCronFireStore(URL!);
   await fires.record("c-a", {
@@ -108,26 +120,6 @@ test("pg cron_fires: thread-ref lookups hit the indexed columns across crons", {
   assert.deepEqual(await fires.listByThreadRefs([]), []);
 });
 
-test(
-  "pg cron_fires: backfill is an idempotent guarded upsert that never regresses an ended row",
-  { skip },
-  async () => {
-    const fires = createPostgresCronFireStore(URL!);
-    const entries = [
-      { fireKey: "k1", threadRef: "t1", firedAt: 1_000, status: "running" as const },
-      { fireKey: "k2", threadRef: "t2", firedAt: 2_000, endedAt: 3_000, status: "ok" as const, reply: "two" },
-    ];
-    await fires.backfill("c-bf", entries);
-    await fires.backfill("c-bf", entries);
-    assert.equal((await fires.listByCron("c-bf")).total, 2);
-    await fires.record("c-bf", { fireKey: "k1", threadRef: "t1", firedAt: 1_000, endedAt: 9_000, status: "ok" });
-    await fires.backfill("c-bf", entries);
-    const { runs } = await fires.listByCron("c-bf");
-    assert.equal(runs.find((r) => r.fireKey === "k1")?.status, "ok", "the stale running snapshot must not win");
-    assert.equal(runs.find((r) => r.fireKey === "k1")?.endedAt, 9_000);
-  },
-);
-
 test("pg cron_fires: fire rows accept text a legacy jsonb blob would reject (NULs stripped)", { skip }, async () => {
   const fires = createPostgresCronFireStore(URL!);
   await fires.record("c-nul", {
@@ -148,24 +140,11 @@ test("pg cron_fires: the cron store writes the table only and reads back through
   const cron = await store.create({ ...base, schedule: { everyMs: 60_000 } });
   await store.beginFire(cron.id, { fireKey: "k1", threadRef: "t1", firedAt: 1_000, status: "running" });
   await store.recordFire(cron.id, { fireKey: "k1", threadRef: "t1", firedAt: 1_000, endedAt: 2_000, status: "ok" });
-  assert.equal((await store.get(cron.id))?.fireLog, undefined, "the legacy json fireLog is no longer written");
   const { runs, total } = await store.listFires(cron.id);
   assert.equal(total, 1);
   assert.equal(runs[0]!.status, "ok");
   await store.delete(cron.id);
   assert.equal((await store.listFires(cron.id)).total, 1, "fires outlive the deleted cron");
-});
-
-test("pg cron_fires: backfill never clobbers a newer retry of the same fireKey", { skip }, async () => {
-  const fires = createPostgresCronFireStore(URL!);
-  await fires.record("c-retry-slot", { fireKey: "slot-1", threadRef: "t1", firedAt: 3_000, status: "running" });
-  await fires.backfill("c-retry-slot", [
-    { fireKey: "slot-1", threadRef: "t1", firedAt: 1_000, endedAt: 2_000, status: "failed" },
-  ]);
-  const { runs } = await fires.listByCron("c-retry-slot");
-  assert.equal(runs.length, 1);
-  assert.equal(runs[0]!.firedAt, 3_000, "the older ended snapshot must not clobber the live retry");
-  assert.equal(runs[0]!.status, "running");
 });
 
 test(

@@ -73,7 +73,11 @@ export async function startSlackPlugin(
   const APP_TOKEN = cfg.appToken;
   const SLACK_API_URL = cfg.apiUrl ? normalizeSlackApiUrl(cfg.apiUrl) : undefined;
   const TRUSTED_FILE_HOST = SLACK_API_URL ? new URL(SLACK_API_URL).hostname : undefined;
-  const CLIENT_OPTIONS = { ...NO_RETRY, ...(SLACK_API_URL ? { slackApiUrl: SLACK_API_URL } : {}) } as const;
+  const CLIENT_OPTIONS = {
+    ...NO_RETRY,
+    attachOriginalToWebAPIRequestError: false,
+    ...(SLACK_API_URL ? { slackApiUrl: SLACK_API_URL } : {}),
+  } as const;
   const IDENTITY_TOKENS: Record<string, string | undefined> = {
     copilot: cfg.copilotBotToken,
   };
@@ -125,22 +129,6 @@ export async function startSlackPlugin(
         });
     }
     return ackOverrideCache.names;
-  }
-
-  const INTERNAL_OVERRIDES_CACHE_MS = 60_000;
-  let internalOverridesCache: { members: ReadonlySet<string>; fetchedAt: number } | undefined;
-  async function internalOverrides(): Promise<ReadonlySet<string>> {
-    if (internalOverridesCache && Date.now() - internalOverridesCache.fetchedAt < INTERNAL_OVERRIDES_CACHE_MS) {
-      return internalOverridesCache.members;
-    }
-    try {
-      const members = new Set(await core.internalMemberOverrides());
-      internalOverridesCache = { members, fetchedAt: Date.now() };
-      return members;
-    } catch (err) {
-      swallow("slack: internal-member-overrides read", err);
-      return internalOverridesCache?.members ?? new Set();
-    }
   }
 
   const EXTERNAL_PARTICIPANTS_CACHE_MS = 30_000;
@@ -231,7 +219,6 @@ export async function startSlackPlugin(
     core,
     ids,
     coreSingleton: CORE_SINGLETON && !cfg.externalAccess,
-    internalOverrides,
     ...(cfg.userSnapshotTtlMs ? { userSnapshotTtlMs: cfg.userSnapshotTtlMs } : {}),
     ...(cfg.channelMembersTtlMs ? { channelMembersTtlMs: cfg.channelMembersTtlMs } : {}),
     ...(cfg.maxPrivateChannels ? { maxPrivateChannels: cfg.maxPrivateChannels } : {}),
@@ -239,10 +226,12 @@ export async function startSlackPlugin(
   });
   const mirror = cfg.externalAccess
     ? { pushSurfaceEvents: async () => {}, mirrorMessageEvent: async () => {} }
-    : createMirror({ core, ids, directory, externalParticipantsEnabled });
+    : createMirror({ account: ACCOUNT_LABEL, core, ids, directory, externalParticipantsEnabled });
   const historyRateLimitOptions = {
     managed: Boolean(cfg.installationId && cfg.sharedServiceUrl?.trim()),
-    ...(cfg.webUiPublicUrl ? { setupUrl: `${cfg.webUiPublicUrl.replace(/\/$/, "")}/admin/?setup=slack` } : {}),
+    ...(cfg.webUiPublicUrl
+      ? { setupUrl: `${cfg.webUiPublicUrl.replace(/\/$/, "")}/settings/slack-settings?setup=slack` }
+      : {}),
   };
   const rateLimitNotice = createSlackRateLimitNotice({
     ...historyRateLimitOptions,
@@ -269,7 +258,6 @@ export async function startSlackPlugin(
     core,
     ids,
     historyClient,
-    source: cfg.contextSource ?? "live",
     ...historyRateLimitOptions,
   });
   const serializer = createConversationSerializer({
@@ -385,7 +373,7 @@ export async function startSlackPlugin(
       threadTs?: string;
       text?: string;
       senderSlackId?: string;
-      isDirectMessage?: boolean;
+      isDirectMessage: boolean;
     },
   ): void => {
     void (async () => {
@@ -394,19 +382,20 @@ export async function startSlackPlugin(
         try {
           const actor = await directory.classifyActor(client, msg.senderSlackId);
           if (actor.externalId.includes("@")) senderEmail = actor.externalId;
-        } catch {
+        } catch (e) {
+          swallow("slack: classify inbox message sender", e);
           senderEmail = undefined;
         }
       }
       await core.inboxSlackMessage({
         channel: msg.channel,
         ts: msg.ts,
-        ...(msg.isDirectMessage !== undefined ? { isDirectMessage: msg.isDirectMessage } : {}),
+        isDirectMessage: msg.isDirectMessage,
         ...(msg.threadTs ? { threadTs: msg.threadTs } : {}),
         ...(msg.text ? { text: msg.text } : {}),
         ...(senderEmail ? { senderEmail } : {}),
       });
-    })().catch(() => {});
+    })().catch((e) => swallow("slack: forward message to inbox", e));
   };
   registerSlackEvents(app, {
     handler,
@@ -418,9 +407,7 @@ export async function startSlackPlugin(
     ...(allowActor ? { allowActor } : {}),
     ...(denyResponder ? { denyResponder } : {}),
     ...(cfg.webUiPublicUrl ? { webUiPublicUrl: cfg.webUiPublicUrl } : {}),
-    ...((cfg.contextSource ?? "live") === "mirror"
-      ? { backfillHistory: (client: unknown, channel: string) => readHistory(client, channel) }
-      : {}),
+    backfillHistory: (client: unknown, channel: string) => readHistory(client, channel),
     ensureHeader,
   });
   const surfaceContext = createSurfaceContextFulfiller({

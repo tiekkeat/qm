@@ -11,7 +11,6 @@ import {
   localNetworkName,
   localVolumeName,
 } from "../src/sandbox/local-sandbox.ts";
-import { createLocalWorkspaceStore } from "../src/workspace/workspace-store.ts";
 import { supportsProcessSessions } from "../src/sandbox/sandbox.ts";
 import { sleep } from "../src/util/async.ts";
 import { scopeId } from "../src/types.ts";
@@ -34,7 +33,7 @@ async function freePort(): Promise<number> {
 
 before(async () => {
   daemonPort = await freePort();
-  daemon = spawn(process.execPath, [join(process.cwd(), "aws/microvm-agent/agent.mjs")], {
+  daemon = spawn(process.execPath, [join(process.cwd(), "cli/templates/aws/microvm-agent/agent.mjs")], {
     env: { ...process.env, AGENT_PORT: String(daemonPort), HOME: guestHome },
     stdio: "ignore",
   });
@@ -55,15 +54,13 @@ after(() => {
 });
 
 function makeSandbox(fake: FakeDocker, opts: Record<string, unknown> = {}) {
-  const dir = mkdtempSync(join(tmpdir(), "local-ws-"));
-  return createLocalSandbox(createLocalWorkspaceStore(dir), {
+  return createLocalSandbox({
     dockerExec: fake.dockerExec,
     homeDir: guestHome,
     repoRoot: tmp,
     ...opts,
   });
 }
-const rw = (scope: string) => [{ scopeId: scope, mountPath: "", mode: "rw" as const }];
 
 test("computer status reports missing, running, and parked containers without provisioning or waking them", async () => {
   const fake = installFakeDocker(daemonPort);
@@ -75,7 +72,7 @@ test("computer status reports missing, running, and parked containers without pr
     guestResponsive: false,
   });
   assert.equal(fake.runCount, 0);
-  const handle = await sb.provision(rw(scope));
+  const handle = await sb.provision(scope);
   assert.deepEqual(await sb.computerStatus!(scope), {
     machine: handle.id,
     provisioned: true,
@@ -96,7 +93,7 @@ test("computer status reports missing, running, and parked containers without pr
 test("computer status preserves daemon failures and Docker inspection failures", async () => {
   const fake = installFakeDocker(daemonPort);
   const scope = scopeId("personal", "status-failure");
-  await makeSandbox(fake).provision(rw(scope));
+  await makeSandbox(fake).provision(scope);
   const sb = makeSandbox(fake, {
     fetchImpl: async () => {
       throw new Error("daemon unreachable");
@@ -125,7 +122,7 @@ test("a stopped Docker daemon fails provision with the actionable message", asyn
   fake.daemonDown = true;
   const sb = makeSandbox(fake);
   await assert.rejects(
-    sb.provision(rw(scopeId("personal", "U0"))),
+    sb.provision(scopeId("personal", "U0")),
     /requires a running Docker daemon \(is Docker Desktop running\?\)/,
   );
 });
@@ -134,7 +131,7 @@ test("a label-inspection error does not misreport an existing image as missing",
   const fake = installFakeDocker(daemonPort);
   fake.labelInspectFails = true;
   const sb = makeSandbox(fake);
-  const handle = await sb.provision(rw(scopeId("personal", "attested-image")));
+  const handle = await sb.provision(scopeId("personal", "attested-image"));
   await sb.teardown(handle, { destroy: true });
 });
 
@@ -142,14 +139,14 @@ test("a missing sandbox image fails provision with the build hint", async () => 
   const fake = installFakeDocker(daemonPort);
   fake.imageMissing = true;
   const sb = makeSandbox(fake);
-  await assert.rejects(sb.provision(rw(scopeId("personal", "U0"))), /not found — run `npm run sandbox:local:build`/);
+  await assert.rejects(sb.provision(scopeId("personal", "U0")), /not found — run `npm run sandbox:local:build`/);
 });
 
 test("cold provision creates volume + container, run() execs over the daemon, bytes round-trip", async () => {
   const fake = installFakeDocker(daemonPort);
   const sb = makeSandbox(fake);
   const scope = scopeId("personal", "U1");
-  const h = await sb.provision(rw(scope));
+  const h = await sb.provision(scope);
   assert.equal(h.id, localContainerName(scope));
   assert.equal(h.rootDir, `${guestHome}/workspace`);
   assert.equal(h.homeDir, guestHome);
@@ -176,12 +173,12 @@ test("cold provision creates volume + container, run() execs over the daemon, by
 test("teardown parks the container and the next provision restarts it warm", async () => {
   const fake = installFakeDocker(daemonPort);
   const sb = makeSandbox(fake);
-  const layers = rw(scopeId("personal", "U2"));
-  const h1 = await sb.provision(layers);
+  const scope = scopeId("personal", "U2");
+  const h1 = await sb.provision(scope);
   await sb.teardown(h1);
   assert.equal(fake.containers.get(h1.id)!.running, false);
 
-  const h2 = await sb.provision(layers);
+  const h2 = await sb.provision(scope);
   assert.equal(h2.id, h1.id, "same container reused");
   assert.equal(h2.coldStart, false);
   assert.equal(fake.runCount, 1, "no new container run");
@@ -190,12 +187,12 @@ test("teardown parks the container and the next provision restarts it warm", asy
 
 test("a stale-image container is recreated while its home volume survives", async () => {
   const fake = installFakeDocker(daemonPort);
-  const layers = rw(scopeId("personal", "U3"));
-  const h1 = await makeSandbox(fake).provision(layers);
+  const scope = scopeId("personal", "U3");
+  const h1 = await makeSandbox(fake).provision(scope);
   const volume = fake.containers.get(h1.id)!.volume!;
 
   fake.imageId = "sha256:image-v2";
-  const h2 = await makeSandbox(fake).provision(layers);
+  const h2 = await makeSandbox(fake).provision(scope);
   assert.equal(h2.id, h1.id);
   assert.equal(fake.runCount, 2, "container recreated on the new image");
   assert.equal(fake.containers.get(h2.id)!.imageId, "sha256:image-v2");
@@ -206,7 +203,7 @@ test("a stale-image container is recreated while its home volume survives", asyn
 test("a scratch box has no volume and is removed on teardown", async () => {
   const fake = installFakeDocker(daemonPort);
   const sb = makeSandbox(fake);
-  const h = await sb.provision(rw(scopeId("personal", "U4")), { scratch: { key: "k1" } });
+  const h = await sb.provision(scopeId("personal", "U4"), { scratch: { key: "k1" } });
   assert.equal(h.scratch, true);
   assert.equal(h.coldStart, true);
   assert.equal(fake.containers.get(h.id)!.volume, undefined);
@@ -218,7 +215,7 @@ test("teardown destroy removes both the container and its volume", async () => {
   const fake = installFakeDocker(daemonPort);
   const sb = makeSandbox(fake);
   const scope = scopeId("personal", "U5");
-  const h = await sb.provision(rw(scope));
+  const h = await sb.provision(scope);
   await sb.teardown(h, { destroy: true });
   assert.equal(fake.containers.has(h.id), false);
   assert.equal(fake.volumes.has(localVolumeName(scope)), false);
@@ -227,8 +224,8 @@ test("teardown destroy removes both the container and its volume", async () => {
 test("concurrent provisions for one scope run a single container", async () => {
   const fake = installFakeDocker(daemonPort);
   const sb = makeSandbox(fake);
-  const layers = rw(scopeId("personal", "U6"));
-  const [a, b] = await Promise.all([sb.provision(layers), sb.provision(layers)]);
+  const scope = scopeId("personal", "U6");
+  const [a, b] = await Promise.all([sb.provision(scope), sb.provision(scope)]);
   assert.equal(a.id, b.id);
   assert.equal(fake.runCount, 1);
 });
@@ -236,8 +233,8 @@ test("concurrent provisions for one scope run a single container", async () => {
 test("refcounted teardown: the container parks only after the last concurrent user releases", async () => {
   const fake = installFakeDocker(daemonPort);
   const sb = makeSandbox(fake);
-  const layers = rw(scopeId("personal", "U7"));
-  const [a, b] = await Promise.all([sb.provision(layers), sb.provision(layers)]);
+  const scope = scopeId("personal", "U7");
+  const [a, b] = await Promise.all([sb.provision(scope), sb.provision(scope)]);
   await sb.teardown(a);
   assert.equal(fake.containers.get(a.id)!.running, true, "still held by the sibling");
   await sb.teardown(b);
@@ -248,7 +245,7 @@ test("process sessions: start, read output, signal to exit", async () => {
   const fake = installFakeDocker(daemonPort);
   const sb = makeSandbox(fake);
   assert.ok(supportsProcessSessions(sb));
-  const h = await sb.provision(rw(scopeId("personal", "U8")));
+  const h = await sb.provision(scopeId("personal", "U8"));
   const { processId } = await sb.startProcess!(h, "echo started; sleep 30");
   let out = "";
   const deadline = Date.now() + 10_000;
@@ -270,7 +267,7 @@ test("process sessions: start, read output, signal to exit", async () => {
 test("an aborted run returns control promptly", async () => {
   const fake = installFakeDocker(daemonPort);
   const sb = makeSandbox(fake);
-  const h = await sb.provision(rw(scopeId("personal", "U9")));
+  const h = await sb.provision(scopeId("personal", "U9"));
   const ctl = new AbortController();
   setTimeout(() => ctl.abort(), 150);
   const startedAt = Date.now();
@@ -278,27 +275,13 @@ test("an aborted run returns control promptly", async () => {
   assert.ok(Date.now() - startedAt < 5_000, "run returned promptly after abort");
 });
 
-test("read-only layers materialize into the workspace once per content fingerprint", async () => {
-  const fake = installFakeDocker(daemonPort);
-  const dir = mkdtempSync(join(tmpdir(), "local-ws-"));
-  const workspace = createLocalWorkspaceStore(dir);
-  const shared = scopeId("org", "default-org");
-  await workspace.write(shared, "guide.md", "shared doc");
-  const sb = createLocalSandbox(workspace, { dockerExec: fake.dockerExec, homeDir: guestHome, repoRoot: tmp });
-  const h = await sb.provision([
-    { scopeId: scopeId("personal", "U10"), mountPath: "", mode: "rw" as const },
-    { scopeId: shared, mountPath: "shared", mode: "ro" as const },
-  ]);
-  assert.equal(await sb.readFile(h, "shared/guide.md"), "shared doc");
-});
-
 test("each container runs on its own network; destroy removes it", async () => {
   const fake = installFakeDocker(daemonPort);
   const sb = makeSandbox(fake);
   const scopeA = scopeId("personal", "U20");
   const scopeB = scopeId("personal", "U21");
-  const ha = await sb.provision(rw(scopeA));
-  const hb = await sb.provision(rw(scopeB));
+  const ha = await sb.provision(scopeA);
+  const hb = await sb.provision(scopeB);
   const netA = localNetworkName(ha.id);
   const netB = localNetworkName(hb.id);
   assert.notEqual(netA, netB);
@@ -314,8 +297,8 @@ test("concurrent teardown and provision for one scope serialize (no stop of a fr
   const fake = installFakeDocker(daemonPort);
   const sb = makeSandbox(fake);
   const scope = scopeId("personal", "U22");
-  const h1 = await sb.provision(rw(scope));
-  const [, h2] = await Promise.all([sb.teardown(h1), sb.provision(rw(scope))]);
+  const h1 = await sb.provision(scope);
+  const [, h2] = await Promise.all([sb.teardown(h1), sb.provision(scope)]);
   assert.equal(fake.containers.get(h2.id)!.running, true);
   const r = await sb.run(h2, "echo alive");
   assert.equal(r.stdout.trim(), "alive");
@@ -331,12 +314,12 @@ test("a replacement core reattaches to an already-running sandbox", async () => 
     return Promise.resolve(new Response(JSON.stringify({ code: 0, stdout: "", stderr: "", timedOut: false })));
   };
   const sb = makeSandbox(fake, { coreContainer: "qm-test-core", fetchImpl });
-  const layers = rw(scopeId("personal", "U39"));
-  const first = await sb.provision(layers);
+  const scope = scopeId("personal", "U39");
+  const first = await sb.provision(scope);
   const connection = `${localNetworkName(first.id)}|qm-test-core`;
   assert.equal(fake.connections.has(connection), true);
   fake.connections.delete(connection);
-  const second = await sb.provision(layers);
+  const second = await sb.provision(scope);
   assert.equal(second.id, first.id);
   assert.equal(fake.connections.has(connection), true);
   await sb.teardown(first);
@@ -353,7 +336,7 @@ test("containerized core joins each sandbox network and reaches the daemon by co
     return Promise.resolve(new Response(JSON.stringify({ code: 0, stdout: "", stderr: "", timedOut: false })));
   };
   const sb = makeSandbox(fake, { coreContainer: "qm-test-core", fetchImpl });
-  const h = await sb.provision(rw(scopeId("personal", "U40")));
+  const h = await sb.provision(scopeId("personal", "U40"));
   const args = fake.containers.get(h.id)!.args;
   assert.equal(args.includes("-p"), false);
   assert.equal(fake.connections.has(`${localNetworkName(h.id)}|qm-test-core`), true);
@@ -361,4 +344,37 @@ test("containerized core joins each sandbox network and reaches the daemon by co
   assert.equal((await sb.computerStatus!(scopeId("personal", "U40"))).guestResponsive, true);
   await sb.teardown(h, { destroy: true });
   assert.equal(fake.connections.has(`${localNetworkName(h.id)}|qm-test-core`), false);
+});
+
+test("core attachment trusts the core's actual networks, not docker's connect error", async () => {
+  const fake = installFakeDocker(daemonPort);
+  const fetchImpl: typeof fetch = (input) => {
+    const url = typeof input === "string" ? input : input.toString();
+    if (url.endsWith("/health")) return Promise.resolve(new Response("", { status: 200 }));
+    return Promise.resolve(new Response(JSON.stringify({ code: 0, stdout: "", stderr: "", timedOut: false })));
+  };
+  const scope = scopeId("personal", "U42");
+  const sb = makeSandbox(fake, { coreContainer: "qm-test-core", fetchImpl });
+  const first = await sb.provision(scope);
+  const again = await sb.provision(scope);
+  assert.equal(again.id, first.id);
+  fake.connections.delete(`${localNetworkName(first.id)}|qm-test-core`);
+  const refusing = makeSandbox(fake, {
+    coreContainer: "qm-test-core",
+    fetchImpl,
+    dockerExec: async (args: string[]) =>
+      args[1] === "connect" ? { code: 1, stdout: "", stderr: "endpoint already exists" } : fake.dockerExec(args),
+  });
+  await assert.rejects(refusing.provision(scope), /network connect .* failed: endpoint already exists/);
+});
+
+test("a computer's memory size is the container's memory limit", async () => {
+  const fake = installFakeDocker(daemonPort);
+  const sb = makeSandbox(fake);
+  const sized = await sb.provision(scopeId("personal", "U41"), { memoryGb: 3 });
+  const args = fake.containers.get(sized.id)!.args;
+  assert.equal(args[args.indexOf("--memory") + 1], "3g");
+  const unsized = await sb.provision(scopeId("personal", "U42"));
+  assert.equal(fake.containers.get(unsized.id)!.args.includes("--memory"), false);
+  assert.equal(sb.profile.sizesMemory, true);
 });

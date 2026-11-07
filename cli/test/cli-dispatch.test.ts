@@ -77,7 +77,7 @@ test("layer sync exposes deployment-layer reconciliation", async () => {
     JSON.stringify({
       contract: 1,
       orgId: "acme",
-      publicUrl: "http://localhost:8080",
+      publicUrl: "http://localhost:8082",
       target: "docker",
       services: ["core"],
       sandbox: { app: "acme-sandboxes" },
@@ -99,7 +99,7 @@ test("check --json reports failures under a stable contract clause id", async ()
     JSON.stringify({
       contract: 2,
       orgId: "acme",
-      publicUrl: "http://localhost:8080",
+      publicUrl: "http://localhost:8082",
       target: "docker",
       services: ["core"],
     }),
@@ -135,7 +135,7 @@ test("check --json reserves exit 2 for an unsupported live invocation", async ()
     JSON.stringify({
       contract: 1,
       orgId: "acme",
-      publicUrl: "http://localhost:8080",
+      publicUrl: "http://localhost:8082",
       target: "docker",
       services: ["core"],
       sandbox: { app: "acme-sandboxes" },
@@ -158,7 +158,7 @@ test("check flag typos are invocation errors and never print a success first", a
     JSON.stringify({
       contract: 1,
       orgId: "acme",
-      publicUrl: "http://localhost:8080",
+      publicUrl: "http://localhost:8082",
       target: "docker",
       services: ["core"],
       sandbox: { app: "acme-sandboxes" },
@@ -187,7 +187,7 @@ test("non-JSON check --live fails when the target has no live drift implementati
     JSON.stringify({
       contract: 1,
       orgId: "acme",
-      publicUrl: "http://localhost:8080",
+      publicUrl: "http://localhost:8082",
       target: "docker",
       services: ["core"],
       sandbox: { app: "acme-sandboxes" },
@@ -219,7 +219,7 @@ else console.log("{}");
   const config = {
     contract: 1,
     orgId: "acme",
-    publicUrl: "http://localhost:8080",
+    publicUrl: "https://agent.acme.example",
     target: "aws",
     services: ["core"],
     env: { core: { AWS_DEPLOY_IMAGE: "acme-microvm-app", AWS_DEPLOY_IMAGE_VERSION: "1" } },
@@ -286,7 +286,7 @@ test("successful check --json --live reports the live-drift clause", async (t) =
   const task = renderTaskDefinition(config, "core", image, arns);
   const layerBody = JSON.stringify({ contract: 1, tools: [], skills: [] });
   const layerHash = createHash("sha256").update(layerBody).digest("hex");
-  const targetGroupName = `c-core-${createHash("sha1").update("c:core").digest("hex").slice(0, 6)}`;
+  const targetGroupName = `c-core-${createHash("sha1").update("c:core-public").digest("hex").slice(0, 6)}`;
   const manifest = {
     id: "manifest",
     createdAt: "2026-01-01T00:00:00.000Z",
@@ -311,14 +311,14 @@ else if (args.includes("describe-task-definition")) console.log(${JSON.stringify
 else if (args.includes("list-tasks")) console.log(JSON.stringify({ taskArns: ["live-core"] }));
 else if (args.includes("describe-tasks") && args.includes("live-core")) console.log(JSON.stringify({ tasks: [{ taskDefinitionArn: "task", lastStatus: "RUNNING", containers: [{ name: "core", networkInterfaces: [{ privateIpv4Address: "10.0.1.8" }] }] }] }));
 else if (args.includes("run-task")) console.log(JSON.stringify({ tasks: [{ taskArn: "canary" }] }));
-else if (args.includes("describe-tasks")) console.log(JSON.stringify({ tasks: [{ containers: [{ name: "core", exitCode: 0 }] }] }));
+else if (args.includes("describe-tasks")) console.log(JSON.stringify({ tasks: [{ lastStatus: "STOPPED", containers: [{ name: "core", exitCode: 0 }] }] }));
 else if (args.includes("dynamodb get-item") && args.includes("deployment/current")) console.log(JSON.stringify({ Item: { manifestId: { S: "manifest" } } }));
 else if (args.includes("dynamodb get-item") && args.includes("deployment/manifest/manifest")) console.log(JSON.stringify({ Item: { manifest: { S: ${JSON.stringify(JSON.stringify(manifest))} } } }));
 else if (args.includes("s3api get-object")) fs.writeFileSync(argv[argv.indexOf("--key") + 2], ${JSON.stringify(layerBody)});
 else if (args.includes("elbv2 describe-load-balancers")) console.log(JSON.stringify({ LoadBalancers: [{ LoadBalancerArn: "lb", DNSName: "acme.example.com", State: { Code: "active" } }] }));
-else if (args.includes("elbv2 describe-listeners")) console.log(JSON.stringify({ Listeners: [{ ListenerArn: "listener", Protocol: "HTTPS", Port: 443, Certificates: [{ CertificateArn: "certificate" }], DefaultActions: [{ Type: "fixed-response", FixedResponseConfig: { StatusCode: "404" } }] }] }));
+else if (args.includes("elbv2 describe-listeners")) console.log(JSON.stringify({ Listeners: [{ ListenerArn: "listener", Protocol: "HTTPS", Port: 443, Certificates: [{ CertificateArn: "certificate" }], DefaultActions: [{ Type: "forward", TargetGroupArn: "tg" }] }] }));
 else if (args.includes("elbv2 describe-target-groups")) console.log(JSON.stringify({ TargetGroups: [{ TargetGroupArn: "tg", TargetGroupName: ${JSON.stringify(targetGroupName)} }] }));
-else if (args.includes("elbv2 describe-rules")) console.log(JSON.stringify({ Rules: [{ IsDefault: false, Actions: [{ Type: "forward", TargetGroupArn: "tg" }], Conditions: [{ Field: "path-pattern", PathPatternConfig: { Values: ["/v1/*"] } }] }] }));
+else if (args.includes("elbv2 describe-rules")) console.log(JSON.stringify({ Rules: [{ IsDefault: true, Actions: [{ Type: "forward", TargetGroupArn: "tg" }] }] }));
 else if (args.includes("elbv2 describe-target-health")) console.log(JSON.stringify({ TargetHealthDescriptions: [{ TargetHealth: { State: "healthy" } }] }));
 else console.log("{}");
 `,
@@ -390,7 +390,7 @@ test("--tail must be a non-negative integer", async () => {
     JSON.stringify({
       contract: 1,
       orgId: "acme",
-      publicUrl: "http://localhost:8080",
+      publicUrl: "http://localhost:8082",
       target: "docker",
       services: ["core"],
       sandbox: { app: "acme-sandboxes" },
@@ -412,7 +412,7 @@ test("--env-file that does not exist is an error", async () => {
     JSON.stringify({
       contract: 1,
       orgId: "acme",
-      publicUrl: "http://localhost:8080",
+      publicUrl: "http://localhost:8082",
       target: "docker",
       services: ["core"],
       sandbox: { app: "acme-sandboxes" },
@@ -440,7 +440,7 @@ test("docker --only is rejected explicitly instead of silently restarting the fu
     JSON.stringify({
       contract: 1,
       orgId: "acme",
-      publicUrl: "http://localhost:8080",
+      publicUrl: "http://localhost:8082",
       target: "docker",
       services: ["core"],
     }),
@@ -482,7 +482,7 @@ test("infra delete-task-definitions requires explicit destructive confirmation",
       services: ["core"],
       plugins: [],
       skills: [],
-      env: { core: { HARNESS: "mock", AWS_DEPLOY_IMAGE: "acme-sandbox" } },
+      env: { core: { AWS_DEPLOY_IMAGE: "acme-sandbox" } },
       imageOverrides: {},
       aws: {
         accountId: "123456789012",
@@ -509,6 +509,7 @@ test("destructive commands reject extra positionals and boolean flags never cons
   for (const argv of [
     ["up", "unexpected"],
     ["up", "--dry-run", "unexpected"],
+    ["up", "--upgrade-minio", "unexpected"],
     ["sandbox", "build", "unexpected"],
     ["down", "--purge", "unexpected"],
     ["rollback", "unexpected"],
@@ -523,6 +524,9 @@ test("destructive commands reject extra positionals and boolean flags never cons
   const valuedBoolean = await run(["sandbox", "build", "--dry-run=false"]);
   assert.equal(valuedBoolean.exitCode, 2, valuedBoolean.out);
   assert.match(valuedBoolean.out, /--dry-run does not take a value/);
+  const valuedUpgrade = await run(["up", "--upgrade-minio=true"]);
+  assert.equal(valuedUpgrade.exitCode, 2, valuedUpgrade.out);
+  assert.match(valuedUpgrade.out, /--upgrade-minio does not take a value/);
 });
 
 test("unknown dev subcommands validate flags and extra arguments before reporting usage", async () => {
@@ -544,7 +548,7 @@ test("conformance honors the deploy-wide --config and --sandbox-dir flags", asyn
     JSON.stringify({
       contract: 1,
       orgId: "flagged",
-      publicUrl: "http://localhost:8080",
+      publicUrl: "http://localhost:8082",
       target: "docker",
       services: ["core"],
       sandbox: { app: "acme-sandboxes" },
@@ -587,7 +591,7 @@ test("config get prints raw scalars and JSON objects, honors --target, and fails
     JSON.stringify({
       contract: 1,
       orgId: "acme",
-      publicUrl: "http://localhost:8080",
+      publicUrl: "http://localhost:8082",
       target: "docker",
       services: ["core"],
       sandbox: { app: "acme-sandboxes" },
@@ -626,7 +630,7 @@ test("--target revalidates the effective provider config", async () => {
     JSON.stringify({
       contract: 1,
       orgId: "acme",
-      publicUrl: "http://localhost:8080",
+      publicUrl: "http://localhost:8082",
       target: "docker",
       services: ["core"],
       sandbox: { backend: "sprites", app: "acme-sandboxes" },
@@ -645,7 +649,7 @@ test("check --json routes failures on structured clause data, not message sniffi
   const base = {
     contract: 1,
     orgId: "acme",
-    publicUrl: "http://localhost:8080",
+    publicUrl: "http://localhost:8082",
     target: "docker",
     services: ["core"],
     sandbox: { app: "acme-sandboxes" },
@@ -701,7 +705,7 @@ test("check --json groups a multi-clause failure under each error's own clause, 
     JSON.stringify({
       contract: 1,
       orgId: "acme",
-      publicUrl: "http://localhost:8080",
+      publicUrl: "http://localhost:8082",
       target: "docker",
       services: ["core"],
       sandbox: { app: "acme-sandboxes" },

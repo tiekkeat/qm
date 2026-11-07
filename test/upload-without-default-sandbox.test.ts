@@ -1,12 +1,12 @@
 import "./support/auto-fake-sprites.ts";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { testConfig } from "./support/test-config.ts";
 import type { TurnRequest } from "../src/types.ts";
 
 test("an upload in a scope without a default sandbox still reaches the agent", async () => {
-  const built = buildApp(testConfig({ eagerProvisionEnabled: false }));
+  const built = buildApp(testConfig());
   await built.directory.replace([{ principalId: "U1", displayName: "Synthetic User", type: "internal" }]);
   await built.directory.replaceChannels(
     [{ channelId: "C1", name: "synthetic-upload", isPrivate: true }],
@@ -31,8 +31,8 @@ test("an upload in a scope without a default sandbox still reaches the agent", a
   assert.equal(upload.status, "ok", upload.status === "ok" ? undefined : upload.reason);
   assert.ok((await built.sessions.listLlmRequests(sessionId)).length > before);
   assert.equal(await built.sandboxResources.resolve("channel:C1"), null);
-  const entries = await built.sessions.getEntries(sessionId);
-  const text = JSON.stringify(entries.filter((e) => e.type === "user"));
+  const entries = await built.sessions.getItems(sessionId);
+  const text = JSON.stringify(entries.filter((e) => e.kind === "UserMessage"));
   assert.match(text, /sample\.txt/);
   assert.match(text, /not yet on a computer/);
   assert.match(text, /\/v1\/files\/[^/]+\/content/);

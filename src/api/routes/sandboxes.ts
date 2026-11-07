@@ -1,8 +1,8 @@
-import { redactSecrets } from "../../harness/redact-secrets.ts";
+import { redactSecrets } from "../../util/redact-secrets.ts";
 import { errMessage } from "../../util/errors.ts";
 import { sendJson } from "../http.ts";
 import { isObj } from "./shared.ts";
-import type { ApiCtx, Route } from "./route.ts";
+import { withAdmin, type ApiCtx, type Route } from "./route.ts";
 import type { SandboxAction } from "../app-sandboxes.ts";
 
 function principal(ctx: ApiCtx): string | null {
@@ -67,10 +67,20 @@ async function handle(ctx: ApiCtx): Promise<void> {
     });
   }
 }
-export const sandboxRoutes: ReadonlyArray<Route<ApiCtx>> = [
-  { method: "GET", path: "/v1/scopes/:scopeId/sandboxes", auth: "either", handle },
-  { method: "POST", path: "/v1/scopes/:scopeId/sandboxes", auth: "either", handle },
-  { method: "GET", path: "/v1/projects/:id/deletion", auth: "either", handle },
-  { method: "DELETE", path: "/v1/projects/:id", auth: "either", handle },
-  { method: "GET", path: "/v1/projects/:id/archive", auth: "either", handle },
-];
+export const sandboxRoutes: ReadonlyArray<Route<ApiCtx>> = (
+  [
+    { method: "GET", path: "/v1/scopes/:scopeId/sandboxes", auth: "either", handle },
+    { method: "POST", path: "/v1/scopes/:scopeId/sandboxes", auth: "either", handle },
+    { method: "GET", path: "/v1/projects/:id/deletion", auth: "either", handle },
+    { method: "DELETE", path: "/v1/projects/:id", auth: "either", handle },
+    { method: "GET", path: "/v1/projects/:id/archive", auth: "either", handle },
+  ] as Route<ApiCtx>[]
+).map((route) => {
+  if (!("path" in route) || route.auth === "public") return route;
+  if (route.path.startsWith("/v1/admin/")) return { ...withAdmin([route])[0]!, browser: "self" as const };
+  return {
+    ...route,
+    actor: route.method === "GET" ? ("query.principalId" as const) : ("body.principalId" as const),
+    browser: true as const,
+  };
+});

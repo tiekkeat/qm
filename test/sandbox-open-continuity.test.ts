@@ -106,11 +106,8 @@ function fixture(
     session: { id: "session" },
     resolution: {
       egress: { allowedHosts: [], deniedHosts: ["source-denied.test"] },
-      layers: [
-        { scopeId: "org:test", mode: "ro", mountPath: "global" },
-        { scopeId: "team:private", mode: "ro", mountPath: "private" },
-        { scopeId: source, mode: "rw", mountPath: "" },
-      ],
+      writableScopeId: source,
+      readOnlyScopeIds: ["org:test", "team:private"],
     },
     scopeId: source,
     memoryScopeId: source,
@@ -121,12 +118,10 @@ function fixture(
       return "synthetic-narrow-egress";
     },
     connectorEnv: { AGENT_API_TOKEN: "synthetic-room-capability", SHARED_SECRET: "synthetic-room-secret" },
-    ownerAuthAvailable: false,
     turnSessionDir: "turn/session",
     turnFilesDir: "turn/session/fire",
     visibleSkills: [roomSkill],
     visibleSkillsForTurn: async () => [roomSkill],
-    emitGapWork: () => {},
     perf: { credsMs: 0 },
   } as unknown as TurnSandboxContext);
   const tools = createToolContext({
@@ -137,7 +132,8 @@ function fixture(
     accessSandboxResource: turn.accessResource,
     provision: turn.provision,
     useSkill: turn.useSkill,
-    layers: [{ scopeId: source, mode: "rw", mountPath: "" }],
+    writableScopeId: source,
+    readOnlyScopeIds: [],
     commandPolicy: () => state.sourcePolicy,
     authorizeCommand: (_command: string, key = _command, exact?: boolean) => {
       approvalCalls.push([key, exact]);

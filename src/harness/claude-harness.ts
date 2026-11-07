@@ -401,7 +401,7 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
       : promptText(turn);
     const initial = userMessage(text, turn.images);
     if (turn.documents?.length && Array.isArray(initial.message.content)) {
-      initial.message.content.push(...(preparedDocuments as unknown as typeof initial.message.content));
+      (initial.message.content as unknown[]).push(...preparedDocuments);
     }
     let pendingPrompts = 1;
     let stopped = false;
@@ -516,7 +516,7 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
             opts.signals,
             turn.runId,
             {
-              onAbort: async (reason) => interrupt(true, reason),
+              onAbort: async (signal) => interrupt(true, signal.kind === "abort" ? signal.reason : undefined),
               onSteer: async (steer, ts, request, acknowledge) => {
                 if (ts && recordedMessageTimestamps(turn.history).has(ts)) return;
                 const prepared = await turn.prepareSteer?.(steer, request);
@@ -525,7 +525,7 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
                 const baseMessage = userMessage(prompt, prepared?.images);
                 const message = { ...userMessage(prompt, prepared?.images), uuid: baseMessage.uuid };
                 if (Array.isArray(message.message.content))
-                  message.message.content.push(
+                  (message.message.content as unknown[]).push(
                     ...((await documentBlocks(
                       prepared?.documents ?? [],
                       { api: "anthropic-messages", provider: "anthropic", input: ["text", "image"] },
@@ -639,7 +639,9 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
             if (message.uuid) seenUserMessages.add(message.uuid);
             const content = message.message.content;
             const echoedText =
-              typeof content === "string" ? content : content.find((block) => block.type === "text")?.text;
+              typeof content === "string"
+                ? content
+                : content.flatMap((block) => (block.type === "text" ? [block.text] : []))[0];
             if (
               !initialUserEchoSkipped &&
               (message.uuid === initial.uuid || (!message.uuid && echoedText === promptText(turn)))

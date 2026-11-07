@@ -1,3 +1,4 @@
+import { refreshChatGPTTokens } from "../../../model/subscription-oauth.ts";
 import { createCodexDeviceLogin } from "../../../model/codex-device-login.ts";
 import { errMessage } from "../../../util/errors.ts";
 import type { UserModelCredentialStore } from "../../../model/user-model-credential-store.ts";
@@ -18,9 +19,11 @@ async function completeLogin(
   try {
     while (Date.now() < expiresAt) {
       await new Promise((resolve) => setTimeout(resolve, 5000));
-      const result = await login.poll(id);
+      const result = await login.poll(actorId, id);
       if (result === "pending") continue;
-      if (!(await store.completeSharedLogin(id, result))) return;
+      if (result === "unknown") throw new Error("Shared Codex login expired");
+      const tokens = result.idToken || !result.refreshToken ? result : await refreshChatGPTTokens(result.refreshToken);
+      if (!(await store.completeSharedLogin(id, tokens))) return;
       audit(deps, {
         principalId: actorId,
         action: "shared-codex.connected",
@@ -52,7 +55,7 @@ export async function sharedCodexStart(ctx: ApiCtx): Promise<void> {
   if (!actor) return;
   if (!ctx.deps.userModelCredentials) return sendJson(ctx.res, 404, { error: "not_found" });
   try {
-    const prompt = await login.start();
+    const prompt = await login.start(actor.id);
     await ctx.deps.userModelCredentials.putSharedLogin(prompt.deviceAuthId, actor.id, prompt.expiresAt);
     void completeLogin(ctx.deps.userModelCredentials, ctx.deps, prompt.deviceAuthId, actor.id, prompt.expiresAt);
     audit(ctx.deps, {

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { createExecFileOps, posixJoin } from "../src/sandbox/exec-file-ops.ts";
+import { createExecFileOps, posixJoin, workspacePathOf } from "../src/sandbox/exec-file-ops.ts";
 
 const exec = promisify(execFile);
 
@@ -78,6 +78,21 @@ test("posixJoin rejects parent path segments", () => {
   assert.throws(() => posixJoin("/root/workspace", "a/../../x"), /must stay inside the workspace/);
 });
 
+test("posixJoin resolves an absolute path inside the workspace instead of nesting it", () => {
+  assert.equal(posixJoin("/root/workspace", "/root/workspace/a/b.txt"), "/root/workspace/a/b.txt");
+  assert.equal(posixJoin("/root/workspace/", "/root/workspace/a.txt"), "/root/workspace/a.txt");
+  assert.equal(posixJoin("/root/workspace", "/root/workspaces/a.txt"), "/root/workspace/root/workspaces/a.txt");
+  assert.throws(() => posixJoin("/root/workspace", "/root/workspace/../x"), /must stay inside the workspace/);
+});
+
+test("workspacePathOf maps only paths that normalize into the workspace", () => {
+  assert.equal(workspacePathOf("/root/workspace/", "/root/workspace/./a/b.txt"), "a/b.txt");
+  assert.equal(workspacePathOf("/root/workspace", "/root/workspaces/a.txt"), null);
+  assert.equal(workspacePathOf("/root/workspace", "/root/workspace/../x"), null);
+  assert.equal(workspacePathOf("/root/workspace", "/root/workspace"), null);
+  assert.equal(workspacePathOf("/", "/etc/x"), "etc/x");
+});
+
 test("concurrent imports keep separate archives through extraction and cleanup", { timeout: 10_000 }, async () => {
   const rootDir = await mkdtemp(join(tmpdir(), "qm-import-'"));
   const handle = { id: "test", rootDir };
@@ -130,6 +145,32 @@ test("concurrent imports keep separate archives through extraction and cleanup",
       assert.equal((await stat(join(rootDir, tree[1]!.path))).mode & 0o777, 0o755);
     }
     assert.deepEqual((await readdir(rootDir)).sort(), ["first", "second"]);
+  } finally {
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("listDir lists nothing for a missing directory but surfaces a failed listing", async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), "qm-list-"));
+  let failing = false;
+  const ops = createExecFileOps({
+    label: "test",
+    exec: async (_id, script) => {
+      if (failing) return { code: 124, stdout: "", stderr: "timed out" };
+      return exec("sh", ["-c", script]).then(
+        (r) => ({ ...r, code: 0 }),
+        (e: { code: number; stdout: string; stderr: string }) => ({ code: e.code, stdout: e.stdout, stderr: e.stderr }),
+      );
+    },
+    writeInline: async () => {},
+  });
+  try {
+    await mkdir(join(rootDir, "d"), { recursive: true });
+    await writeFile(join(rootDir, "d/f"), "x");
+    assert.deepEqual(await ops.listDir({ id: "test", rootDir }, "d"), ["d/f"]);
+    assert.deepEqual(await ops.listDir({ id: "test", rootDir }, "missing"), []);
+    failing = true;
+    await assert.rejects(ops.listDir({ id: "test", rootDir }, "d"), /test listDir failed \(exit 124\): timed out/);
   } finally {
     await rm(rootDir, { recursive: true, force: true });
   }

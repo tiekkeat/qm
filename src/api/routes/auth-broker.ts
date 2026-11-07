@@ -15,7 +15,7 @@ const MAX_HORIZON_MS = 24 * 60 * 60 * 1000;
 
 async function claimBrokerNonce(ctx: ApiCtx): Promise<void> {
   const { res, deps, body } = ctx;
-  if (!deps.replayDedupe?.durable) {
+  if (!deps.replayDedupe) {
     return sendJson(res, 503, {
       error: "not_configured",
       message:
@@ -67,17 +67,13 @@ async function emailAllowed(ctx: ApiCtx): Promise<void> {
   const allowed =
     deps.identity.classify(email).type === "internal" && (member ? externalMemberActive(member) : configured);
   if (allowed) return sendJson(res, 200, { allowed: true, expiresAt: member?.expiresAt });
-  const grants = (await deps.acl?.list()) ?? [];
+  const grants = (await deps.acl?.find({ granteeScopeIds: [`personal:${email}`], kind: "deploy" })) ?? [];
   const deployments = await app.listDeployments();
   const granted = deployments.filter(
     (d) =>
       d.status !== "archived" &&
       grants.some(
-        (g) =>
-          g.ownerScopeId === d.ownerScopeId &&
-          g.ref === encodeRef(deployRef(d.id)) &&
-          g.granteeScopeId === `personal:${email}` &&
-          g.permission === "read",
+        (g) => g.ownerScopeId === d.ownerScopeId && g.ref === encodeRef(deployRef(d.id)) && g.permission === "read",
       ),
   );
   const allowedOwners = await Promise.all(
@@ -137,7 +133,7 @@ async function brokerSession(ctx: ApiCtx): Promise<void> {
 async function trustedAdmin(ctx: ApiCtx): Promise<void> {
   const { deps, res, body } = ctx;
   const secret = deps.portalIdentitySecret;
-  if (!secret || secret.length < 32 || secret === ctx.secret || !deps.admin || !deps.replayDedupe?.durable)
+  if (!secret || secret.length < 32 || secret === ctx.secret || !deps.admin || !deps.replayDedupe)
     return sendJson(res, 503, { error: "not_configured" });
   const assertion = isObj(body) && typeof body.assertion === "string" ? body.assertion : "";
   const claims = await verifySignedPayload(assertion, secret);
@@ -182,7 +178,7 @@ async function trustedAdmin(ctx: ApiCtx): Promise<void> {
 
 async function redeemInvitation(ctx: ApiCtx): Promise<void> {
   const { deps, res, body } = ctx;
-  if (!deps.portalIdentitySecret || !deps.replayDedupe?.durable || !deps.identity || !deps.portalUrl)
+  if (!deps.portalIdentitySecret || !deps.replayDedupe || !deps.identity || !deps.portalUrl)
     return sendJson(res, 503, { error: "not_configured" });
   const token = isObj(body) && typeof body.token === "string" ? body.token : "";
   const claims = token.length <= 4096 ? await verifySignedPayload(token, deps.portalIdentitySecret) : null;
@@ -248,11 +244,11 @@ async function redeemInvitation(ctx: ApiCtx): Promise<void> {
 }
 
 export const authBrokerRoutes: ReadonlyArray<Route<ApiCtx>> = [
-  { method: "POST", path: "/v1/auth/invitations/redeem", auth: "source", handle: redeemInvitation },
-  { method: "POST", path: "/v1/auth/trusted/admin", auth: "source", handle: trustedAdmin },
-  { method: "POST", path: "/v1/auth/broker/sessions", auth: "source", handle: brokerSession },
-  { method: "POST", path: "/v1/auth/broker/sessions/use", auth: "source", handle: brokerSession },
-  { method: "POST", path: "/v1/auth/broker/sessions/revoke", auth: "source", handle: brokerSession },
-  { method: "POST", path: "/v1/auth/broker/claim", auth: "source", handle: claimBrokerNonce },
+  { method: "POST", path: "/v1/auth/invitations/redeem", actor: "system", auth: "source", handle: redeemInvitation },
+  { method: "POST", path: "/v1/auth/trusted/admin", actor: "system", auth: "source", handle: trustedAdmin },
+  { method: "POST", path: "/v1/auth/broker/sessions", actor: "system", auth: "source", handle: brokerSession },
+  { method: "POST", path: "/v1/auth/broker/sessions/use", actor: "system", auth: "source", handle: brokerSession },
+  { method: "POST", path: "/v1/auth/broker/sessions/revoke", actor: "person", auth: "source", handle: brokerSession },
+  { method: "POST", path: "/v1/auth/broker/claim", actor: "system", auth: "source", handle: claimBrokerNonce },
   { method: "GET", path: "/v1/auth/broker/email-allowed", auth: "source", handle: emailAllowed },
 ];

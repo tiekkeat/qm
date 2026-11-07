@@ -124,7 +124,7 @@ test("Postgres pending selection retains one live query across sweep timeouts", 
   const waiting = async (): Promise<number> => {
     const result = await observer.query<{ count: number }>(
       "SELECT count(*)::int AS count FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE $1",
-      ["SELECT json% FROM swarms%"],
+      ["SELECT id, json% FROM swarms%"],
     );
     return result.rows[0]!.count;
   };
@@ -282,7 +282,7 @@ test("Postgres session, message, reservation and outbox recovery deduplicate dur
     const recovered = (await store.get(initial.id))!;
     assert.equal(recovered.messages[0]!.notifications[member!.id]!.runId, notification.runId);
     const recoveredRun = (await restoredRuntime.runs.get(notification.runId!))!;
-    assert.ok(await sibling.binding({ ...recoveredRun.request, runId: recoveredRun.id, attempt: 1, background: true }));
+    assert.ok(await sibling.binding({ ...recoveredRun.request, runId: recoveredRun.id, attempt: 1 }));
     const session = await restoredSessions.get(recovered.members[1]!.sessionId!);
     assert.equal(session?.scopeId, initial.scopeId);
     assert.ok(await restoredSessions.getForParticipant(session!.id, "alice"));
@@ -300,7 +300,7 @@ test("Postgres session, message, reservation and outbox recovery deduplicate dur
       requestId: "unicode",
       audience: [],
       text: "body\u0000\ud800",
-      notify: false,
+      wake: false,
     });
     assert.equal(
       (await fixture.service.read(fixture.caller, { after: binaryText.seq - 1 }))[0]!.text,

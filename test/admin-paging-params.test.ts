@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { createInsecureTestServer } from "../src/api/server.ts";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import type { TurnRequest } from "../src/types.ts";
 import { testConfig } from "./support/test-config.ts";
 
@@ -25,7 +25,6 @@ test("admin list endpoints accept fractional limit values", { skip: !URL }, asyn
     auditLog: built.auditLog,
     errors: built.errors,
     runs: built.runs,
-    workspace: built.workspace,
     files: built.files,
     config: built.config,
     deliveries: built.deliveries,

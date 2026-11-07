@@ -2,19 +2,49 @@ import type { DurableMap } from "./persistence/durable-map.ts";
 import { orgId as configOrgId } from "./config.ts";
 import { scopeId, type ScopeId } from "./types.ts";
 
-export const FEATURE_NAMES = [
-  "app_annotations",
-  "persistent_subagents",
-  "responsive_spine",
-  "inbox_loops",
-  "slack_loading_indicator",
-  "external_app_sharing",
-  "loop_triage",
-  "swarms",
-  "team_scopes",
-  "ui_canvas",
-] as const;
-export type FeatureName = (typeof FEATURE_NAMES)[number];
+export const FEATURES = {
+  app_annotations: {
+    label: "App annotations",
+    personalOnly: true,
+    hint: "Enables app text comments and annotation tools for the selected people. Applies on the next app page load; app management permission is still required.",
+  },
+  personas: {
+    label: "Personas",
+    hint: "Lets the selected people create, share and chat with personas: reusable agents with their own instructions, skills and credentials.",
+  },
+  persistent_subagents: {
+    label: "Persistent subagents",
+    personalOnly: true,
+    hint: "Persistent subagents are available for personal scopes only.",
+  },
+  responsive_spine: { label: "Responsive spine (delegation)", personalOnly: true },
+  inbox_loops: { label: "Inbox Loops" },
+  slack_loading_indicator: {
+    label: "Slack loading indicator (experimental)",
+    hint: "Shows an activity card in Slack threads, including background work and monitors. After five minutes, the card links to the web conversation. Everyone in a shared thread can see it. Top-level DMs stay unchanged. Turning this off leaves existing cards.",
+  },
+  descriptive_session_titles: {
+    label: "Descriptive session titles",
+    personalOnly: true,
+    hint: "Titles the selected people's new conversations with a short summary of what they asked, anchored on a name or distinctive word, written by a stronger model. Regenerating a title uses it too.",
+  },
+  external_app_sharing: { label: "External app sharing (public links, outside emails)" },
+  loop_triage: { label: "Loop triage (prioritize and consolidate)" },
+  sidebar_last_message_titles: {
+    label: "Sidebar titles from last message (experimental)",
+    personalOnly: true,
+    hint: "Titles each sidebar chat with the last message sent in it and shows the usual title beneath. In shared chats that message may be from someone else. Applies on the next sidebar refresh.",
+  },
+  swarms: { label: "Swarms", personalOnly: true },
+  team_scopes: { label: "Team scopes" },
+  ui_canvas: {
+    label: "UI canvas and UI state (agent code runs in the page)",
+    personalOnly: true,
+    hint: "Lets the agent read the selected people's whole web UI and place live HTML/CSS/JS panels in their conversations. Canvas code runs unsandboxed in their page with their full session: it can do anything they can, including answering approvals. Personal scopes only. Turning it off stops canvases from loading on the next page load.",
+  },
+} as const satisfies Record<string, { label: string; personalOnly?: boolean; hint?: string }>;
+export type FeatureName = keyof typeof FEATURES;
+export const FEATURE_NAMES = Object.keys(FEATURES) as FeatureName[];
 
 export interface FeatureFlagRecord {
   featureName: FeatureName;
@@ -27,6 +57,7 @@ export interface FeatureFlagStore {
   list(): Promise<FeatureFlagRecord[]>;
   get(featureName: FeatureName): Promise<FeatureFlagRecord | null>;
   enabled(featureName: FeatureName, scope: ScopeId): Promise<boolean>;
+  enabledFor(scope: ScopeId): Promise<ReadonlySet<FeatureName>>;
   setEnabled(featureName: FeatureName, scope: ScopeId, on: boolean, updatedBy: string): Promise<FeatureFlagRecord>;
 }
 
@@ -37,13 +68,18 @@ export function createFeatureFlagStore(
   const orgScope = scopeId("org", configOrgId());
   const now = opts.now ?? Date.now;
   const key = (featureName: FeatureName) => featureName;
+  const list = async () => (await backing.all()).filter((row) => FEATURE_NAMES.includes(row.featureName));
+  const enabledFor = async (scope: ScopeId): Promise<ReadonlySet<FeatureName>> =>
+    new Set(
+      (await list())
+        .filter((row) => row.enabledScopes.includes(orgScope) || row.enabledScopes.includes(scope))
+        .map((row) => row.featureName),
+    );
   return {
-    list: async () => (await backing.all()).filter((row) => FEATURE_NAMES.includes(row.featureName)),
+    list,
     get: (featureName) => backing.get(key(featureName)),
-    async enabled(featureName, scope) {
-      const row = await backing.get(key(featureName));
-      return row?.enabledScopes.includes(orgScope) === true || row?.enabledScopes.includes(scope) === true;
-    },
+    enabled: async (featureName, scope) => (await enabledFor(scope)).has(featureName),
+    enabledFor,
     async setEnabled(featureName, scope, on, updatedBy) {
       if (!updatedBy.trim()) throw new Error("feature flag updater must not be empty");
       const current = await backing.get(key(featureName));

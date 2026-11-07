@@ -5,22 +5,26 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
-import { createMemoryMap } from "../src/persistence/durable-map.ts";
-import { createMemoryConfigStore, type PersistedScopedFlag } from "../src/resolution/config-store.ts";
+import { type PersistedScopedFlag } from "../src/resolution/config-store.ts";
 import { createServer } from "../src/api/server.ts";
 import { mintPortalIdentity } from "../src/auth/portal-identity.ts";
 import { signRequest } from "../src/auth/source-auth.ts";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp as buildProductionApp } from "../src/wiring.ts";
+import { stopAtEnd } from "./support/build-app.ts";
 import { userRuntimeConfigBody } from "../src/api/runtime-config.ts";
 import { resolveBrowserModel } from "../src/model/browser-model.ts";
 import { testConfig } from "./support/test-config.ts";
+import { testConfigStore, testMap, testDatabaseUrl } from "./support/test-database.ts";
+import { createPostgresReplayDedupe } from "../src/auth/replay-dedupe.ts";
+
+const buildApp = (...args: Parameters<typeof buildProductionApp>) => stopAtEnd(buildProductionApp(...args));
 
 const SECRET = "personal-account-test-signing-secret";
 
 test("personal account choice persists across instances without changing anyone else's choice", async () => {
-  const individualModelAuth = createMemoryMap<PersistedScopedFlag>();
-  const first = createMemoryConfigStore("default-org", { individualModelAuth });
-  const second = createMemoryConfigStore("default-org", { individualModelAuth });
+  const individualModelAuth = testMap<PersistedScopedFlag>();
+  const first = testConfigStore("default-org", { individualModelAuth });
+  const second = testConfigStore("default-org", { individualModelAuth });
   assert.equal(await first.getIndividualModelAuthDurable("alice"), false);
   await first.setPersonalModelAuth("alice", true);
   assert.equal(await second.getIndividualModelAuthDurable("alice"), true);
@@ -28,16 +32,14 @@ test("personal account choice persists across instances without changing anyone 
   assert.equal(await second.getIndividualModelAuthDurable(), false);
   await second.setPersonalModelAuth("alice", false);
   assert.equal(await first.getIndividualModelAuthDurable("alice"), false);
-  first.setIndividualModelAuth(true);
-  await first.flushScope("org:default-org");
+  await first.setIndividualModelAuth(true);
   assert.equal(await second.getIndividualModelAuthDurable("alice"), true);
 });
 
 test("account API binds choice to the signed-in person, preserves connections, and fails closed after disconnect", async () => {
   const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "personal-account-")) }));
-  built.config.setInternalMemberOverrides(["alice@default-org", "bob@default-org"]);
-  await built.config.flushScope("org:default-org");
   const server = createServer(built.app, {
+    replayDedupe: createPostgresReplayDedupe(testDatabaseUrl()),
     signingSecret: SECRET,
     requireSignedPortalIdentity: true,
     capabilitySecret: SECRET + "capability",
@@ -97,8 +99,7 @@ test("account API binds choice to the signed-in person, preserves connections, a
     await built.userModelCredentials.delete("alice@default-org", "anthropic");
     assert.equal(await built.config.getIndividualModelAuthDurable("alice@default-org"), true);
     assert.equal((await request("company")).status, 200);
-    built.config.setIndividualModelAuth(true);
-    await built.config.flushScope("org:default-org");
+    await built.config.setIndividualModelAuth(true);
     assert.equal((await request("company")).status, 403);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -115,20 +116,18 @@ test("personal provider choice is durable and controls the submitted run indepen
     actor: { externalId: "U1" },
     conversation: { kind: "dm", threadRef: "personal-provider-choice" },
     text: "hello",
-    liveActor: true,
+    origin: { kind: "human" },
     async: true,
     model: "company-only-custom-model",
-    harness: "pi",
   });
   const run = await built.runs.get(submitted.runId!);
   assert.equal(run?.request.modelAccount, "openai");
   assert.equal(run?.request.model, undefined);
-  assert.equal(run?.request.harness, undefined);
   await built.config.setPersonalModelAuth("U1", false);
   assert.equal((await built.runs.get(submitted.runId!))?.request.modelAccount, "openai");
   const steered = await built.app.signalRun(submitted.runId!, { kind: "steer", text: "more work" }, "U1");
-  assert.equal(steered.accepted, false);
-  assert.match(steered.reason ?? "", /account_changed/);
+  assert.equal(steered.accepted, true, "a steer on a different account runs as its own turn on that account");
+  assert.equal((await built.runs.get(steered.queuedRunId!))?.request.modelAccount, "company");
   assert.equal((await built.app.signalRun(submitted.runId!, { kind: "abort" }, "U1")).accepted, true);
 });
 
@@ -139,7 +138,7 @@ test("shared chat messages queue instead of borrowing another person's account",
     actor: { externalId: user },
     conversation: { kind: "channel" as const, threadRef: "account-steering", channelRef: "C1" },
     text: "hello",
-    liveActor: true,
+    origin: { kind: "human" as const },
     async: true,
   });
   await built.config.setPersonalModelAuth("U1", true, "anthropic");
@@ -162,7 +161,6 @@ test("a granted shared Codex choice follows its owner into scheduled turns", asy
   await built.userModelCredentials.setSharedGrant("owner@default-org", true);
   await built.config.setSharedModelAuth("owner@default-org");
   built.config.setApprovedHarnesses(["pi", "codex"]);
-  await built.config.flushScope("org:default-org");
   const runtime = await userRuntimeConfigBody(
     { deps: { config: built.config, userModelCredentials: built.userModelCredentials } },
     "personal:owner@default-org",
@@ -182,7 +180,7 @@ test("a granted shared Codex choice follows its owner into scheduled turns", asy
     actor: { externalId: "owner@default-org" },
     conversation: { kind: "dm", threadRef: "shared-codex-scheduled" },
     text: "summarize the project",
-    triggered: true,
+    origin: { kind: "automation" },
     async: true,
   });
   assert.equal((await built.runs.get(submitted.runId!))?.request.modelAccount, "shared-openai");

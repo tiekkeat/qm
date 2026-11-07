@@ -7,13 +7,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { createInsecureTestServer } from "../src/api/server.ts";
-import { createMemorySessionStore } from "../src/sessions/memory-session-store.ts";
-import { cacheHitRatio } from "../src/admin/metrics-sink.ts";
-import { buildApp } from "../src/wiring.ts";
+import { cacheHitRatio } from "../src/api/routes/admin/spend.ts";
+import { buildApp } from "./support/build-app.ts";
 import { scopeId, type TurnRequest } from "../src/types.ts";
 import type { SessionStore } from "../src/sessions/session-store.ts";
 import { bill } from "./support/spend-usage.ts";
 import { testConfig } from "./support/test-config.ts";
+import { createPostgresSessionStore } from "../src/sessions/postgres-session-store.ts";
+import { testDatabaseUrl } from "./support/test-database.ts";
 
 const DAY = 86_400_000;
 const ALICE = { "x-admin-actor": "admin-alice@default-org" };
@@ -26,7 +27,6 @@ function start(sessions?: SessionStore) {
     admin: built.admin,
     sessions: sessions ?? built.sessions,
     auditLog: built.auditLog,
-    metrics: built.metrics,
     runs: built.runs,
   });
   server.listen(0);
@@ -56,7 +56,7 @@ const conserved = (report: any, column: string): number =>
   [...report.people, ...report.scopes].reduce((sum: number, e: any) => sum + e[column], 0);
 
 test("spend: uses the saved report and exposes its freshness", async () => {
-  const store = createMemorySessionStore();
+  const store = createPostgresSessionStore(testDatabaseUrl());
   const asOf = Date.UTC(2026, 0, 1);
   let reads = 0;
   store.spendReport = async (range) => {
@@ -91,9 +91,13 @@ test("spend: live and cron dollars land on the owning person, shared scopes on t
     const alice = body.people.find((p: any) => p.principalId === "alice");
     const bob = body.people.find((p: any) => p.principalId === "bob");
     assert.ok(alice && bob, "both principals appear with the ids the Users page shows");
-    assert.ok(alice.live.costUsd > 0 && alice.cron.costUsd > 0, "alice carries both live and cron dollars");
-    assert.equal(bob.cron.costUsd, 0, "bob never ran a cron");
-    assert.equal(alice.cron.costUsd, 0.5, "the cron is billed to its scope owner, not to a speaker");
+    assert.ok(
+      alice.live.costUsd > 0 && alice.background.sources.cron.costUsd > 0,
+      "alice carries both live and cron dollars",
+    );
+    assert.equal(bob.background.sources.cron.costUsd, 0, "bob never ran a cron");
+    assert.equal(alice.background.sources.cron.costUsd, 0.5, "the cron is billed to its scope owner, not to a speaker");
+    assert.equal(alice.background.costUsd, 0.5, "crons count toward background");
 
     assert.deepEqual(
       body.scopes.map((e: any) => [e.principalId, e.scopeId, e.kind, e.costUsd]),
@@ -130,13 +134,13 @@ test("spend: people plus shared scopes reconcile to the org totals", async () =>
   }
 });
 
-test("spend: a mock-harness turn shows zero dollars with its tokens intact", async () => {
+test("spend: a mock-agent turn shows zero dollars with its tokens intact", async () => {
   const s = start();
   try {
     assert.equal((await s.built.app.turn(dm("codexlike", "hello there"))).status, "ok");
     const body = await getJson(s.base, "/v1/admin/spend");
     const row = body.people.find((p: any) => p.principalId === "codexlike");
-    assert.ok(row, "a scope whose harness books no dollars is still listed");
+    assert.ok(row, "a scope whose agent books no dollars is still listed");
     assert.equal(row.costUsd, 0);
     assert.ok(row.tokens > 0, "tokens are a separate column, so $0 turns stay visible");
     assert.ok(row.cacheHitRatio !== null && row.cacheHitRatio >= 0 && row.cacheHitRatio <= 1);
@@ -167,7 +171,7 @@ test("spend: a window in the past excludes today's rows entirely", async () => {
 
 test("spend: from/to and bucket=week reshape the series over backdated rows", async () => {
   const clock = { at: Date.UTC(2026, 0, 5, 12) };
-  const store = createMemorySessionStore({ now: () => clock.at });
+  const store = createPostgresSessionStore(testDatabaseUrl(), { now: () => clock.at });
   const s = start(store);
   try {
     await bill(store, "dm:alice:d1", "dm", scopeId("personal", "alice"), { costUsd: 2 });
@@ -212,7 +216,7 @@ test("spend: from/to and bucket=week reshape the series over backdated rows", as
 
 test("spend: ?format=csv exports the same numbers for the same window", async () => {
   const clock = { at: Date.UTC(2026, 0, 5, 12) };
-  const store = createMemorySessionStore({ now: () => clock.at });
+  const store = createPostgresSessionStore(testDatabaseUrl(), { now: () => clock.at });
   const s = start(store);
   try {
     await seedPricedFixture(store);
@@ -229,11 +233,11 @@ test("spend: ?format=csv exports the same numbers for the same window", async ()
     const lines = body.trimEnd().split("\r\n");
     assert.equal(
       lines[0],
-      "principal_id,scope_id,kind,display_name,live_usd,cron_usd,background_usd,total_usd,calls,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,cache_hit_ratio",
+      "principal_id,scope_id,kind,display_name,live_usd,background_usd,cron_usd,loop_usd,swarm_usd,webhook_usd,monitor_usd,total_usd,calls,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,cache_hit_ratio",
     );
     assert.equal(lines.length, json.people.length + json.scopes.length + 1);
     const alice = lines.find((l) => l.startsWith("alice,"))!.split(",");
-    assert.equal(Number(alice[7]), json.people.find((p: any) => p.principalId === "alice").costUsd);
+    assert.equal(Number(alice[11]), json.people.find((p: any) => p.principalId === "alice").costUsd);
   } finally {
     await s.close();
   }
@@ -313,9 +317,60 @@ test("spend: an empty deployment answers 200 with zeroed totals", async () => {
   }
 });
 
+test("spend: cron JSON and CSV name each billed cron, giving admins the task an untitled cron is known by", async () => {
+  const clock = { at: Date.UTC(2026, 0, 5, 12) };
+  const store = createPostgresSessionStore(testDatabaseUrl(), { now: () => clock.at });
+  const s = start(store);
+  try {
+    const cron = await s.built.app.createCron({
+      ownerScopeId: "personal:alice",
+      owner: "alice",
+      createdBy: "alice",
+      schedule: { everyMs: 3_600_000 },
+      action: "check the build",
+    });
+    await bill(store, `cron:${cron.id}:fire:1`, "dm", scopeId("personal", "alice"), { costUsd: 3 });
+    await bill(store, "dm:alice:priced", "dm", scopeId("personal", "alice"), { costUsd: 2 });
+    const query = "from=2026-01-05&to=2026-01-06";
+    const json = await getJson(s.base, `/v1/admin/spend?${query}`);
+    assert.deepEqual(
+      json.crons.map((c: any) => [c.cronId, c.scopeId, c.costUsd, c.info.action]),
+      [[cron.id, "personal:alice", 3, "check the build"]],
+    );
+    const r = await get(s.base, `/v1/admin/spend?${query}&breakdown=cron&format=csv`);
+    assert.equal(r.status, 200);
+    assert.match(
+      r.headers.get("content-disposition")!,
+      /^attachment; filename="qm-spend-crons-2026-01-05-2026-01-06\.csv"/,
+    );
+    const [header, line, ...rest] = (await r.text()).trimEnd().split("\r\n");
+    assert.match(
+      header!,
+      /^cron_id,title,owner,scope_id,live_usd,background_usd,cron_usd,loop_usd,swarm_usd,webhook_usd,monitor_usd,total_usd,/,
+    );
+    assert.deepEqual(line!.split(",").slice(0, 12), [
+      cron.id,
+      "",
+      "alice",
+      "personal:alice",
+      "0",
+      "3",
+      "3",
+      "0",
+      "0",
+      "0",
+      "0",
+      "3",
+    ]);
+    assert.deepEqual(rest, []);
+  } finally {
+    await s.close();
+  }
+});
+
 test("spend: model CSV selects the model breakdown with its own filename", async () => {
   const clock = { at: Date.UTC(2026, 0, 5, 12) };
-  const store = createMemorySessionStore({ now: () => clock.at });
+  const store = createPostgresSessionStore(testDatabaseUrl(), { now: () => clock.at });
   const s = start(store);
   try {
     await seedPricedFixture(store);
@@ -342,8 +397,8 @@ test("spend: model CSV selects the model breakdown with its own filename", async
     for (const [i, model] of json.models.entries()) {
       const cells = lines[i + 1]!.split(",");
       assert.equal(cells[0], model.model);
-      assert.equal(Number(cells[4]), model.costUsd);
-      assert.equal(Number(cells[5]), model.calls);
+      assert.equal(Number(cells[8]), model.costUsd);
+      assert.equal(Number(cells[9]), model.calls);
     }
     assert.equal(
       json.models.reduce((sum: number, m: any) => sum + m.costUsd, 0),

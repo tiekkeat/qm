@@ -62,7 +62,7 @@ export function parseMessageEvent(event: unknown): SlackMessageEvent {
     user: str(e.user),
     username: str(e.username),
     bot_id: str(e.bot_id),
-    bot_profile: botProfile ? { name: str(botProfile.name) } : undefined,
+    bot_profile: botProfile ? { ...botProfile, name: str(botProfile.name) } : undefined,
     client_msg_id: str(e.client_msg_id),
     text: str(e.text),
     ts: coerced(e.ts) ?? "",
@@ -195,6 +195,18 @@ export function channelShareTs(res: unknown, channel: string): string | undefine
 export function parseChannelPage(res: unknown): Array<{ id?: string; is_member?: boolean }> {
   const channels = rec(res)?.channels;
   return Array.isArray(channels) ? channels : [];
+}
+
+export const SLACK_AUTH_ERRORS: ReadonlySet<string> = new Set([
+  "not_authed",
+  "invalid_auth",
+  "token_expired",
+  "token_revoked",
+  "account_inactive",
+]);
+
+export function isDirectChannelType(channelType: unknown): boolean {
+  return channelType === "im" || channelType === "mpim";
 }
 
 export function slackErrorCode(err: unknown): string | undefined {

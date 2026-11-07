@@ -1,5 +1,6 @@
 import test from "node:test";
-import { createMemoryRunSignalStore } from "../src/runs/run-signal-store.ts";
+import { createPostgresRunSignalStore } from "../src/runs/postgres-run-signal-store.ts";
+import { testDatabaseUrl } from "./support/test-database.ts";
 import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -529,7 +530,7 @@ test("OpenCode includes steered PDF and extracted documents without copying echo
     ]);
   `,
   );
-  const signals = createMemoryRunSignalStore();
+  const signals = createPostgresRunSignalStore(testDatabaseUrl());
   const harness = createOpenCodeHarness({ binaryPath: binary, signals, turnWallClockMs: 10_000 });
   t.after(async () => {
     await harness.turns.close?.();
@@ -668,7 +669,7 @@ test("OpenCode child requests inherit fast mode and a reused runtime honors swit
 for (const mechanism of ["signal", "cancel", "both"] as const) {
   test(`OpenCode preserves explicit Stop provenance via ${mechanism}`, async (t) => {
     const dir = mkdtempSync(join(tmpdir(), "qm-opencode-stop-"));
-    const signals = createMemoryRunSignalStore();
+    const signals = createPostgresRunSignalStore(testDatabaseUrl());
     const cancel = new AbortController();
     const harness = createOpenCodeHarness({
       binaryPath: fakeSidecar(

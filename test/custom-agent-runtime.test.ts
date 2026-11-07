@@ -1,7 +1,7 @@
 import "./support/auto-fake-sprites.ts";
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { testConfig, TEST_CAPABILITY_SECRET } from "./support/test-config.ts";
 import { createInsecureTestServer } from "../src/api/server.ts";
 import { mintCapabilityToken } from "../src/auth/capability-token.ts";
@@ -39,8 +39,8 @@ test("chat selects a pinned revision, records attribution, and resets through /a
     const requests = await built.sessions.listLlmRequests(first.sessionId!);
     assert.match(JSON.stringify(requests), /AGENT-QUARTZ-731/);
     assert.doesNotMatch(JSON.stringify(requests), /EXAMPLE-CONTENT-ONLY-ON-DEMAND/);
-    const user = (await built.sessions.getEntries(first.sessionId!)).find((e) => e.type === "user")!;
-    assert.deepEqual((user.payload as { customAgent: unknown }).customAgent, { id: a.id, version: 1 });
+    const user = (await built.sessions.getItems(first.sessionId!)).find((e) => e.kind === "UserMessage")!;
+    assert.deepEqual(user.body.customAgent, { id: a.id, version: 1 });
     await built.customAgents.save("U1", a.id, { ...pkg, instructions: "AGENT-NEW-V2" }, 1);
     await built.customAgents.publish("U1", a.id, 2);
     const next = await built.app.turn({ ...req, text: "Follow up" });

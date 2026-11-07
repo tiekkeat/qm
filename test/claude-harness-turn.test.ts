@@ -1,12 +1,17 @@
+import { randomUUID } from "node:crypto";
+import { storedItem } from "../src/sessions/items.ts";
+import { nativeEntryItem } from "../src/harness/transcript.ts";
+import { nativeHistoryItem } from "../src/harness/transcript.ts";
 import { readFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { test, mock } from "node:test";
 import assert from "node:assert/strict";
-import { createMemoryRunSignalStore } from "../src/runs/run-signal-store.ts";
+import { createPostgresRunSignalStore } from "../src/runs/postgres-run-signal-store.ts";
+import { testDatabaseUrl } from "./support/test-database.ts";
 import type { HarnessLlmRequestRecord, HarnessTurnInput } from "../src/harness/harness.ts";
 import type { NewEntry } from "../src/sessions/session-store.ts";
 import type { ScopeId, SessionEntry } from "../src/types.ts";
-import { findTrailingPartialTurn, resumeStrategy, turnAtSeq } from "../src/core/turn-resume.ts";
+import { findTrailingPartialTurn, turnAtSeq } from "../src/core/turn-resume.ts";
 
 type FakeSdkMessage = Record<string, unknown>;
 type Script = (prompts: AsyncIterable<{ message: { content: unknown } }>) => AsyncGenerator<FakeSdkMessage>;
@@ -88,6 +93,7 @@ function harnessTurn(overrides: Partial<HarnessTurnInput> = {}): {
   const llmRequests: HarnessLlmRequestRecord[] = [];
   const scope = "org:test" as unknown as ScopeId;
   const turn: HarnessTurnInput = {
+    runId: randomUUID(),
     session: { id: "session-1" } as HarnessTurnInput["session"],
     input: "what is the capital of france?",
     systemPrompt: "be brief",
@@ -99,6 +105,7 @@ function harnessTurn(overrides: Partial<HarnessTurnInput> = {}): {
     emit: async (entry: NewEntry) => {
       const saved = {
         ...entry,
+        original: storedItem(nativeEntryItem(entry), { sessionId: "session-1", seq: entries.length + 1, createdAt: Date.now(), turnId: turn.runId }),
         sessionId: "session-1",
         seq: entries.length + 1,
         createdAt: Date.now(),
@@ -148,7 +155,7 @@ test("Claude notices use each turn's timezone without leaking it into later turn
 });
 
 test("a steered turn persists every reply, not only the last result's", async () => {
-  const signals = createMemoryRunSignalStore();
+  const signals = createPostgresRunSignalStore(testDatabaseUrl());
   const runId = "run-steer";
   currentScript = async function* (prompts) {
     const iterator = prompts[Symbol.asyncIterator]();
@@ -189,7 +196,7 @@ test("a steered turn persists every reply, not only the last result's", async ()
 for (const shutdown of [false, true]) {
   test(`a user stop stays explicit when shutdown=${shutdown}`, async () => {
     const cancel = new AbortController();
-    const signals = createMemoryRunSignalStore();
+    const signals = createPostgresRunSignalStore(testDatabaseUrl());
     const runId = "run-stop-error";
     currentScript = async function* (prompts) {
       await prompts[Symbol.asyncIterator]().next();
@@ -408,7 +415,7 @@ test("recorded LLM requests carry real timing and usage instead of a hardcoded t
 });
 
 test("each steered prompt gets its own LLM request record", async () => {
-  const signals = createMemoryRunSignalStore();
+  const signals = createPostgresRunSignalStore(testDatabaseUrl());
   const runId = "run-steps";
   currentScript = async function* (prompts) {
     const iterator = prompts[Symbol.asyncIterator]();
@@ -542,7 +549,7 @@ for (const terminal of [{ stop_reason: "max_tokens" }, { is_error: true }]) {
 }
 
 test("steering forwards prepared images and file paths while retaining the original caption in history", async () => {
-  const signals = createMemoryRunSignalStore();
+  const signals = createPostgresRunSignalStore(testDatabaseUrl());
   const runId = "run-steer-files";
   const request = {
     surface: "web",
@@ -609,7 +616,7 @@ test("Claude sends documents without persisting their contents in session entrie
 });
 
 test("Claude includes steered native and fallback documents without capturing their echoed contents", async () => {
-  const signals = createMemoryRunSignalStore();
+  const signals = createPostgresRunSignalStore(testDatabaseUrl());
   const pdf = (await readFile(new URL("./fixtures/documents/sample.pdf", import.meta.url))).toString("base64");
   const docx = (await readFile(new URL("./fixtures/documents/sample.docx", import.meta.url))).toString("base64");
   let sent = "";
@@ -688,7 +695,7 @@ for (const surfaceTools of [false, true]) {
 }
 
 test("Claude emits repeated-text steers only at distinct native user echoes", async () => {
-  const signals = createMemoryRunSignalStore();
+  const signals = createPostgresRunSignalStore(testDatabaseUrl());
   const { turn, entries } = harnessTurn({ runId: "echo-intake", input: "same text" });
   currentScript = async function* (prompts) {
     const iterator = prompts[Symbol.asyncIterator]();
@@ -727,7 +734,7 @@ test("Claude emits repeated-text steers only at distinct native user echoes", as
 });
 
 test("Claude retains a queued message which the SDK never consumes", async () => {
-  const signals = createMemoryRunSignalStore();
+  const signals = createPostgresRunSignalStore(testDatabaseUrl());
   const { turn, entries } = harnessTurn({ runId: "no-echo" });
   currentScript = async function* (prompts) {
     const iterator = prompts[Symbol.asyncIterator]();
@@ -858,11 +865,10 @@ for (const shutdown of [false, true]) {
       entries.map((entry) => entry.type).filter((type) => type !== "thinking"),
       shutdown ? ["user", "tool_call", "tool_result"] : ["user", "tool_call", "tool_result", "assistant", "system"],
     );
-    const partial = findTrailingPartialTurn(entries, turn.input);
+    const partial = findTrailingPartialTurn(entries.map(nativeHistoryItem), turn.runId);
     if (shutdown) {
       assert.ok(partial);
-      assert.notEqual(resumeStrategy(entries, partial).kind, "restart");
-      assert.equal(turnAtSeq(entries, partial.userSeq)?.answer, undefined);
+      assert.equal(turnAtSeq(entries.map(nativeHistoryItem), partial.userSeq)?.answer, undefined);
     } else {
       assert.deepEqual(entries.at(-2)!.payload, { text: "Visible partial", stopped: true });
       assert.deepEqual(entries.at(-1)!.payload, {

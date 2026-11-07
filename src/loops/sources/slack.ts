@@ -1,5 +1,5 @@
 import { WebClient } from "@slack/web-api";
-import type { LoopItem, LoopSourcePayload } from "../../types.ts";
+import type { LoopItem, LoopSourcePayload } from "../types.ts";
 import { normalizeSlackApiUrl } from "../../slack/config.ts";
 import { SLACK_POST_SPLIT_LIMIT } from "../../slack/delivery.ts";
 import { neutralizeMentions, wireMentionKeys } from "../../slack/mrkdwn.ts";
@@ -60,18 +60,23 @@ function metaOf(item: LoopItem): SlackMeta | undefined {
 export function slackConversationRef(
   channelId: string,
   ts: string,
-  threadTs?: string,
-  isDirectMessage = channelId.startsWith("D"),
+  threadTs: string | undefined,
+  isDirectMessage: boolean,
 ): string {
   return isDirectMessage && !threadTs ? channelId : `${channelId}:${threadTs ?? ts}`;
+}
+
+export function slackConversationOf(item: LoopItem): { channelId: string; threadTs?: string } | undefined {
+  const slack = metaOf(item);
+  if (!slack) return undefined;
+  const threadTs = slackReplyThreadTs(item);
+  return { channelId: slack.channelId, ...(threadTs ? { threadTs } : {}) };
 }
 
 export function slackReplyThreadTs(item: LoopItem): string | undefined {
   const slack = metaOf(item);
   if (!slack) return undefined;
-  if (slack.threadTs) return slack.threadTs;
-  const dm = slack.isDirectMessage ?? slack.channelId.startsWith("D");
-  return dm ? undefined : slack.ts;
+  return slack.threadTs ?? (slack.isDirectMessage ? undefined : slack.ts);
 }
 
 function itemReactions(item: LoopItem): string[] {
@@ -80,7 +85,10 @@ function itemReactions(item: LoopItem): string[] {
 }
 
 export function slackUserClientFactory(apiUrl?: string): (token: string) => SlackUserClient {
-  const options = apiUrl ? { slackApiUrl: normalizeSlackApiUrl(apiUrl) } : {};
+  const options = {
+    attachOriginalToWebAPIRequestError: false,
+    ...(apiUrl ? { slackApiUrl: normalizeSlackApiUrl(apiUrl) } : {}),
+  };
   return (token) => new WebClient(token, options);
 }
 
@@ -179,7 +187,8 @@ export const slackAdapter: LoopSourceAdapter = {
     const rawKey = clip(raw.sourceKey ?? raw.dedupeKey, 300);
     if (!rawKey) return { error: "sourceKey required" };
     const slack = parseSlackMeta(raw.slack);
-    if (!slack) return { error: "slack items need slack.channelId and slack.ts" };
+    if (!slack || slack.isDirectMessage === undefined)
+      return { error: "slack items need slack.channelId, slack.ts and slack.isDirectMessage" };
     const dedupeKey = slackConversationRef(slack.channelId, slack.ts, slack.threadTs, slack.isDirectMessage);
     const draft = raw.draft === undefined ? undefined : parseReplyDraft(raw.draft);
     if (draft === null) return { error: "draft needs a string body" };
@@ -187,7 +196,7 @@ export const slackAdapter: LoopSourceAdapter = {
       dedupeKey,
       summary: common.snippet,
       sourceAt: common.receivedAt,
-      sourcePayload: { source: "slack", ...common, slack } as LoopSourcePayload,
+      sourcePayload: { ...common, slack } as LoopSourcePayload,
       ...(draft ? { proposal: { data: draft as unknown as LoopSourcePayload } } : {}),
     };
     return entry;
@@ -196,10 +205,8 @@ export const slackAdapter: LoopSourceAdapter = {
     const slack = metaOf(item);
     if (!slack) return false;
     return (
-      slackConversationRef(slack.channelId, slack.ts, slack.threadTs, slack.isDirectMessage) === conversationRef ||
-      (!slack.threadTs &&
-        (slack.isDirectMessage ?? slack.channelId.startsWith("D")) &&
-        conversationRef === `${slack.channelId}:${slack.ts}`)
+      slackConversationRef(slack.channelId, slack.ts, slack.threadTs, slack.isDirectMessage === true) ===
+      conversationRef
     );
   },
   parseProposal(raw) {

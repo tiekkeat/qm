@@ -17,7 +17,13 @@ async function deliver(
   sourceThreadRef?: string,
   webUiPublicUrl?: string,
   text = "two screenshots and the notes",
-  row: { createdAt?: number; history?: Record<string, unknown>[]; loseAck?: boolean; approval?: unknown } = {},
+  row: {
+    createdAt?: number;
+    history?: Record<string, unknown>[];
+    loseAck?: boolean;
+    approval?: unknown;
+    updateError?: string;
+  } = {},
 ) {
   const delivery = {
     id: "D1",
@@ -34,6 +40,8 @@ async function deliver(
   const acknowledgements: string[] = [];
   const uploads: Record<string, unknown>[] = [];
   const posts: Record<string, unknown>[] = [];
+  const updates: Record<string, unknown>[] = [];
+  const failures: Array<[string, string]> = [];
   const marks: Array<{ channel: string; ts: string }> = [];
   const probes: Record<string, unknown>[] = [];
   const history = row.history ?? [];
@@ -49,6 +57,7 @@ async function deliver(
     getApproval: async () => row.approval ?? null,
     readBlob: async (id: string) => Buffer.from(id),
     claimDeliveries: async (type: string) => queues.get(type)?.splice(0) ?? [],
+    failDelivery: async (id: string, code: string) => void failures.push([id, code]),
     ackDelivery: async (id: string) => {
       if (row.loseAck) throw new Error("acknowledgement lost");
       acknowledgements.push(id);
@@ -72,6 +81,11 @@ async function deliver(
       info: async () => ({ file: { shares: { private: { C1: [{ ts: "101.300" }] } } } }),
     },
     chat: {
+      update: async (args: Record<string, unknown>) => {
+        updates.push(args);
+        if (row.updateError) throw Object.assign(new Error(row.updateError), { data: { error: row.updateError } });
+        return { ok: true };
+      },
       postMessage: async (args: Record<string, unknown>) => {
         posts.push(args);
         history.push({ ...args, ts: "separate-message" });
@@ -92,7 +106,7 @@ async function deliver(
   });
 
   await poller.pollDeliveries(client);
-  return { acknowledgements, uploads, posts, marks, probes, conversationsOpened };
+  return { acknowledgements, uploads, posts, updates, failures, marks, probes, conversationsOpened };
 }
 
 for (const type of ["slack", "group", "principal"]) {
@@ -199,6 +213,35 @@ for (const type of ["slack", "group", "principal"]) {
     assert.equal(uploads.length, 1, "the fallback still batches the files themselves");
     assert.equal(uploads[0]!.initial_comment, undefined);
     assert.deepEqual(uploadedNames(uploads), ["first.png", "second.jpg", "notes.pdf"]);
+  });
+}
+
+for (const [label, sourceThreadRef, webUiPublicUrl, footer] of [
+  [
+    "a persona post",
+    undefined,
+    "https://agent.example/web-ui/",
+    "Persona: <https://agent.example/web-ui/personas/p%201|Ada &lt;&amp;&gt;>",
+  ],
+  ["a persona post without a web UI", undefined, undefined, "Persona: Ada &lt;&amp;&gt;"],
+  [
+    "a persona's cron post",
+    "cron:c1:fire:123",
+    "https://agent.example",
+    "Persona: <https://agent.example/personas/p%201|Ada &lt;&amp;&gt;> · Weekly &lt;project&gt; &amp; check-in · <https://agent.example/crons/c1|Settings>",
+  ],
+] as const) {
+  test(`${label} names the persona in the footer`, async () => {
+    const { posts } = await deliver(
+      { persona: { id: "p 1", name: "Ada <&>" } },
+      sourceThreadRef,
+      webUiPublicUrl,
+      "Hello",
+    );
+    assert.deepEqual((posts[0]!.blocks as unknown[]).at(-1), {
+      type: "context",
+      elements: [{ type: "mrkdwn", text: footer, verbatim: true }],
+    });
   });
 }
 
@@ -325,6 +368,26 @@ test("delegated approvals recover native buttons from durable records", async ()
   assert.deepEqual(second.acknowledgements, ["D1"]);
 });
 
+test("an approval too long for Slack links its Deny-only card to the conversation on the web", async () => {
+  const approval = {
+    requestId: "A1",
+    sessionId: "S 1",
+    command: `example_send {"a":"${"&".repeat(15_000)}","to":"attacker@example.com"}`,
+    reason: "this tool asks for approval before each call",
+    request: { actor: { externalId: "U1" } },
+  };
+  const out = await deliver(
+    { type: "principal", target: "U1", commandApprovalId: "A1" },
+    undefined,
+    "https://qm.example.com/",
+    "Approval needed",
+    { approval },
+  );
+  const rendered = JSON.stringify(out.posts[0]!.blocks);
+  assert.match(rendered, /<https:\/\/qm\.example\.com\/s\/S%201\|this conversation in QM>/);
+  assert.doesNotMatch(rendered, /hilo_allow_once|attacker@example\.com/);
+});
+
 for (const approval of [null, { requestId: "A1", command: "publish", request: { actor: { externalId: "U2" } } }]) {
   test(`delegated approvals discard ${approval ? "mismatched" : "expired"} records`, async () => {
     const out = await deliver(
@@ -385,3 +448,58 @@ for (const type of ["slack", "group", "principal"]) {
     assert.deepEqual(recovered.acknowledgements, ["D1"]);
   });
 }
+
+test("an explicit edit rewrites the target message in place and posts nothing new", async () => {
+  const { updates, posts, uploads, acknowledgements } = await deliver(
+    { target: "C1", edit: { messageTs: "99.100" } },
+    undefined,
+    undefined,
+    "corrected numbers",
+  );
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0]!.channel, "C1");
+  assert.equal(updates[0]!.ts, "99.100");
+  assert.equal(updates[0]!.text, "corrected numbers");
+  assert.deepEqual(posts, []);
+  assert.deepEqual(uploads, []);
+  assert.deepEqual(acknowledgements, ["D1"]);
+});
+
+test("an edit Slack refuses fails the delivery instead of posting the text as a new message", async () => {
+  const { updates, posts, failures } = await deliver(
+    { target: "C1", edit: { messageTs: "99.100" } },
+    undefined,
+    undefined,
+    "corrected numbers",
+    { updateError: "cant_update_message" },
+  );
+  assert.equal(updates.length, 1);
+  assert.deepEqual(posts, []);
+  assert.deepEqual(failures, [["D1", "cant_update_message"]]);
+});
+
+test("an edit of a message that no longer exists fails the delivery instead of retrying", async () => {
+  const { posts, failures } = await deliver(
+    { target: "C1", edit: { messageTs: "99.100" } },
+    undefined,
+    undefined,
+    "corrected numbers",
+    { updateError: "message_not_found" },
+  );
+  assert.deepEqual(posts, []);
+  assert.deepEqual(failures, [["D1", "edit_target_not_found"]]);
+});
+
+test("a reply revised by the reply check carries a plain-text edit note footer", async () => {
+  const { posts } = await deliver(
+    { type: "slack", editNote: "Edited after a reply check: em dash" },
+    undefined,
+    undefined,
+    "Clean reply",
+  );
+  const blocks = posts.at(-1)!.blocks as Array<{ type: string; elements?: unknown[] }>;
+  assert.deepEqual(blocks.at(-1), {
+    type: "context",
+    elements: [{ type: "plain_text", text: "Edited after a reply check: em dash", emoji: false }],
+  });
+});

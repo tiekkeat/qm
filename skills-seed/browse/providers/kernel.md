@@ -17,8 +17,8 @@ Use the first of these that exists:
 1. **The person's own key**: a `KERNEL_API_KEY` handle of theirs in your keychain
    manifest. Name it in `credentials`.
 2. **An org key delivered as env**: `KERNEL_API_KEY` already set in your shell.
-3. **The org's shared Kernel credential**: a `service_kernel` row in the Credentials
-   inventory (proxy, host `api.onkernel.com`). Name `service_kernel` in `credentials`.
+3. **The org's shared Kernel credential**: a `kernel` row in the Credentials
+   inventory (proxy, host `api.onkernel.com`). Name `kernel` in `credentials`.
    You never see this key. QM adds it to each request you send through its credential
    broker (see the use-shared-credential skill), so `KERNEL_API_KEY` stays unset.
 
@@ -37,19 +37,20 @@ kapi() {
     fi
   else
     python3 - "$1" "$2" "${3:-}" <<'PY'
-import json, os, sys, urllib.error, urllib.request
+import json, os, subprocess, sys
 method, path, body = sys.argv[1:4]
 req = {"credential": "kernel", "method": method, "url": "https://api.onkernel.com" + path}
 if body:
     req["headers"] = {"content-type": "application/json"}
     req["body"] = body
-r = urllib.request.Request(os.environ["AGENT_API_URL"] + "/v1/credentials/broker",
-    data=json.dumps(req).encode(), method="POST",
-    headers={"x-agent-capability": os.environ["AGENT_CREDENTIAL_TOKEN"], "content-type": "application/json"})
-try:
-    env = json.load(urllib.request.urlopen(r))
-except urllib.error.HTTPError as e:
-    sys.stderr.write(f"broker {e.code}: {e.read().decode()[:500]}\n"); sys.exit(1)
+r = subprocess.run(["curl", "-sS", "--fail-with-body", "-X", "POST",
+    os.environ["AGENT_API_URL"] + "/v1/credentials/broker",
+    "-H", "x-agent-capability: " + os.environ["AGENT_CREDENTIAL_TOKEN"],
+    "-H", "content-type: application/json", "--data-binary", "@-"],
+    input=json.dumps(req), capture_output=True, text=True)
+if r.returncode:
+    sys.stderr.write(f"broker: {(r.stdout or r.stderr)[:500]}\n"); sys.exit(1)
+env = json.loads(r.stdout)
 if not 200 <= env.get("status", 0) < 300:
     sys.stderr.write(f"kernel {env.get('status')}: {(env.get('body') or '')[:500]}\n"); sys.exit(1)
 sys.stdout.write(env.get("body") or "")
@@ -82,7 +83,7 @@ This doc's isolation depends on two settings that the skill can't enforce itself
    restricted to it, for the same reason as above: within one project, any key that can
    create browsers can see every running browser.
 
-If you're an agent and the `service_kernel` row in your inventory allows `GET`, tell the person
+If you're an agent and the `kernel` row in your inventory allows `GET`, tell the person
 (and an org admin) that profiles aren't isolated yet. Don't work around it.
 
 ## Profiles

@@ -45,22 +45,24 @@ test("Pi and MCP security overrides are materialized by the root lockfile", () =
   assert.equal(pi?.resolved, piCodingAgentTarball);
 
   assert.deepEqual(lockedVersions(packages, "brace-expansion"), ["5.0.12"]);
-  assert.deepEqual(lockedVersions(packages, "fast-uri").sort(), ["3.1.8", "4.1.5"]);
-  assert.deepEqual(lockedVersions(packages, "hono"), ["4.13.9"]);
+  assert.deepEqual(lockedVersions(packages, "fast-uri").sort(), ["3.1.9", "4.2.3"]);
+  assert.deepEqual(lockedVersions(packages, "hono"), ["4.13.13"]);
   assert.deepEqual(lockedVersions(packages, "protobufjs"), ["7.6.6"]);
-  assert.deepEqual(lockedVersions(packages, "undici"), ["8.10.2"]);
-  assert.deepEqual(lockedVersions(packages, "@hono/node-server"), ["2.0.10"]);
+  assert.deepEqual(lockedVersions(packages, "undici"), ["8.12.3"]);
+  assert.deepEqual(lockedVersions(packages, "undici8"), []);
+  assert.deepEqual(lockedVersions(packages, "@hono/node-server"), ["2.1.5"]);
   assert.equal(dependencyVersion(minimatchManifest, "brace-expansion"), "5.0.12");
   for (const dependency of ["@fastify/ajv-compiler", "ajv", "fast-json-stringify"]) {
     const parentManifest = new URL(`../node_modules/${dependency}/package.json`, import.meta.url);
     assert.equal(
       dependencyVersion(parentManifest, "fast-uri"),
-      dependency === "fast-json-stringify" ? "4.1.5" : "3.1.8",
+      dependency === "fast-json-stringify" ? "4.2.3" : "3.1.9",
     );
   }
-  assert.equal(dependencyVersion(piManifest, "undici"), "8.10.2");
+  assert.equal(dependencyVersion(piManifest, "undici"), "8.12.3");
   assert.equal(dependencyVersion(piManifest, "protobufjs"), "7.6.6");
-  assert.equal(installedVersion("@hono/node-server"), "2.0.10");
+  assert.equal(installedVersion("@hono/node-server"), "2.1.5");
+  assert.equal(JSON.parse(readFileSync(piManifest, "utf8")).license, "MIT");
   assert.equal(installedVersion("@earendil-works/pi-coding-agent"), "1.0.4");
 });
 
@@ -79,6 +81,9 @@ function versionAtLeast(version: unknown, floor: string): boolean {
 // falls back below these advisory fixes fails the release build.
 const advisoryFixes = {
   "@modelcontextprotocol/sdk": "1.31.0", // GHSA-6qxp-vccf-f47h
+  "follow-redirects": "1.16.2",
+  glob: "14.0.2",
+  minimatch: "11.0.1",
   "proxy-addr": "2.0.8", // GHSA-jqcg-44mw-7w3h
   "smol-toml": "1.9.0", // GHSA-r4xh-jqrq-34v2
 };

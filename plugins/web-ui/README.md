@@ -3,13 +3,17 @@
 An end-user web surface with a custom chat shell, connected to the
 platform core. It still uses Pi's `Agent` state machine and selected Pi web utilities
 for markdown, attachment loading, and model metadata, but the visible conversation UI is
-owned by this plugin. Two processes:
+owned by this plugin. Two parts:
 
-- **A zero-dep `node:http` server** (`server/index.ts`) — holds the signed-in principal
+- **A zero-dep `node:http` server** (`server/index.ts`) — runs inside core, which starts it on a loopback
+  port behind the portal (`src/web/front-door.ts`). It holds the signed-in principal
   in an `HttpOnly` cookie, injects it as the turn's actor, and proxies a small set of
   `/api/*` routes to the core (chat turns, unified history, and **webhook management** —
   see below). It never imports the core and never sends a model/API key to the browser.
-- **A Vite-bundled front-end** (`src/`) — a custom Lit shell + transcript + composer.
+- **A Vite-bundled front-end** (`src/`) — a custom Lit shell + transcript + composer. The built bundle
+  (`dist-web/`) is not read from disk at runtime: core publishes it as a content-hashed release to its
+  object store and the server serves the live release from there, so `qm ui publish` can replace it
+  without a restart (see [docs/combined-services.md](../../docs/combined-services.md)).
   Pi's `Agent` LLM-call boundary (`streamFn`) is swapped for a bridge to the core.
   It `POST`s the turn (`POST /v1/turns?async=1`), then watches the in-flight reply over
   **SSE** (`GET /api/runs/:id/events`, relayed from the core's `partial`) so tokens are
@@ -22,31 +26,19 @@ owned by this plugin. Two processes:
 is served at the portal root — the default `WEB_UI_BASE=/` build is the one the portal fronts
 (the old `/web-ui/` prefix is gone; the portal 308-redirects `/web-ui/*` to root for stale
 links). The front-end joins its base via `import.meta.env.BASE_URL` (the `withBase()` helper in
-`core-bridge.ts`), so direct/standalone access and `npm run dev` behave identically.
+`core-bridge.ts`), so every base path behaves identically.
 Core binds run reads and signals to the portal-verified actor;
 no run bearer is exposed to browser code or placed in a URL. The active-run resume index
 (`/api/runs/active`) is per-process best-effort with a durable core fallback for personal threads.
 
-```
-npm install --prefix ../admin
-npm install
-npm run build
-npm run serve
-
-npm start
-```
-
-Dev (HMR): run `npm run serve` in one terminal and `npm run dev` in another — Vite serves
-the front-end on :5173 and proxies `/signin`, `/me`, `/api/*` to the node server.
-
-Env (see `.env.example`): `CORE_API_URL` (default `http://localhost:8080`),
-`CORE_ORG_ID` (default `acme`), `PORT` (default 8096), `WEB_UI_PUBLIC_URL`,
-`WEB_UI_PRINCIPALS` (csv allowlist; empty = any id, **dev only**),
-and `CORE_SIGNING_SECRET` (same value as the core when source-auth is enabled).
+Core runs this server in-process and serves the built bundle as a published release; see
+[docs/combined-services.md](../../docs/combined-services.md). Build the bundle with
+`npm install && npm run build`. For development, `scripts/dev-instance.sh up --watch` runs core
+with Vite hot reload for this front-end.
 
 ## Suggested activities
 
-Suggested activity generation is **on by default** when the configured harness supports
+Suggested activity generation is **on by default** when the configured model supports
 it. Set `SUGGESTED_ACTIVITIES_ENABLED=false` on core to disable generation. Optionally
 set `WEB_UI_SUGGESTED_ACTIVITIES` on web to a JSON array for fixed fallback starters;
 unset it as well to hide suggestions entirely. No deployment-specific activity content
@@ -93,8 +85,8 @@ subsequent runs happen around 2am in the browser's timezone, with the minute
 staggered by user. The cron runner uses the normal owner-scoped session, runtime
 selection, memory, history, tools, and authorized data access. It has no delivery
 destination. The standing task in `src/suggestions/activities.ts` asks it to research
-relevant context, avoid mutations or notifications, and return three validated
-activity objects. Draft prompts use a natural, collaborative voice, such as "Let's...",
+relevant context, avoid mutations or notifications, and return five validated
+activity objects: three are shown and two wait in reserve. Draft prompts use a natural, collaborative voice, such as "Let's...",
 with relevant facts and uncertainties as neutral context, without attributing knowledge,
 feelings, or beliefs to the user. They preserve explicit user
 preferences and scope while leaving the approach to the responding agent. It does not
@@ -106,6 +98,18 @@ previous result while a refresh runs and briefly polls for the first/new result;
 opening another chat does not normally invoke a model. Failed initial generations
 can retry after five minutes. Existing cron queueing, run persistence, authorization,
 fire history, and failure handling apply.
+
+When generation is enabled, each suggestion has a low-contrast dismiss button that
+strengthens on row hover or keyboard focus. Dismissing collapses that row while the next
+reserve suggestion expands into the list with the same height-and-fade motion the list
+uses when it collapses and reappears around a draft. The core stores dismissals on the
+user's suggestion profile (the 30 most recent IDs and titles), filters them out of every
+later response on every device, and adds their titles to the managed cron task so the
+next run avoids them; user-edited cron tasks are left alone. Three seconds after the last
+dismissal in a burst, the browser asks for a refresh; opening a new chat does the same if that
+request never arrived. The core starts one immediate run
+of the user's suggestions cron only when a dismissal is newer than the latest run and no
+run is in flight. Until it lands, fewer rows show; new rows then expand in.
 
 Cadence is reevaluated hourly. Ten or more user messages in sampled recent private
 conversations within 24 hours increases refreshes to every four hours; otherwise it
@@ -130,7 +134,7 @@ Below 860px the same build behaves like an app rather than a shrunken desktop:
   button's column so nothing renders under it.
 - **Bottom sheets.** Popover menus — composer settings, a session's ⋯, the user menu, the
   per-session tools — render as sheets with a backdrop; tap outside or swipe down to dismiss.
-- **Compact composer.** Attach · input · settings · send on one row; model, harness, effort, and
+- **Compact composer.** Attach · input · settings · send on one row; model, effort, and
   Fast live in the settings sheet. Inputs are 16px so iOS never zooms on focus, and the layout
   tracks the visual viewport so the composer stays above the on-screen keyboard.
 - **Touch targets.** Message actions, file chips, selects, drawer rows, approvals, and back
@@ -147,7 +151,7 @@ the CSS media queries, the composer, and the split canvas.
 
 - **Custom chat UI** — a first-party conversation surface with a left history rail, centered
   transcript, bottom composer, inline **model selector** (the models core reports as
-  serviceable for the approved harnesses),
+  serviceable),
   explicit **effort selector** (`low|medium|high|xhigh|max|ultracode|auto`), **Fast mode**
   toggle, attachments, streaming partials, and a theme picker. Settings → Theme takes
   light, dark, or system, or an imported palette: drop in an iTerm2 `.itermcolors` preset or
@@ -165,8 +169,8 @@ the CSS media queries, the composer, and the split canvas.
   (→ core `GET /v1/skills?principalId=`, resolved by `app.listVisibleSkills`). The skill _body_
   never reaches the browser; only name/description/scope do.
 - **Functional selectors** — the chosen model + effort + Fast mode ride along on each turn
-  (`POST /v1/turns` `model`/`thinkingLevel`/`fastMode`); the Pi harness applies them
-  server-side, bypassing Pi's stale thinking-level clamp for newer effort values and falling
+  (`POST /v1/turns` `model`/`thinkingLevel`/`fastMode`); the agent applies them
+  server-side, bypassing pi-ai's stale thinking-level clamp for newer effort values and falling
   back to its default on any unknown value. Attachments are forwarded as `IncomingAttachment`s
   and materialized into the agent's sandbox inbox (same path as Slack file shares).
 - **Unified history** — every session you participated in (DMs, channels, web), via
@@ -236,13 +240,13 @@ the CSS media queries, the composer, and the split canvas.
     per-member grants are sequencing-gated (off until enabled), so those stay owner-only until then.
   - **Connectors** — per-provider OAuth status with Connect / Reconnect / Disconnect. The server
     proxies `GET /api/connectors` → core `/v1/connectors/oauth/status`, `POST /api/connectors/:p/start`
-    → core `/v1/connectors/oauth/:p/start` (redirect URI = this surface's
-    `/connectors/oauth/:p/callback`), and `POST /api/connectors/revoke` → core
+    → core `/v1/connectors/oauth/:p/start` (redirect URI = the portal's
+    `/v1/connectors/oauth/:p/callback`, passed straight to core), and `POST /api/connectors/revoke` → core
     `/v1/connectors/oauth/revoke`. The callback exchanges the code server-side (tokens never reach
     the browser) and bounces back into the SPA via a base-relative redirect.
   - **Deploys** — `GET /api/deployments` → core `/v1/deployments`, grouped into manageable,
     shared, and archived views. Detail and restore routes expose authorized metadata and bring an
-    archived version back online; running apps open through the surface's signed deployment proxy.
+    archived version back online; running apps open through the portal's `/deployments/:id/` proxy to core.
 
 ## Notes
 
@@ -290,21 +294,34 @@ In web chat, an assistant reply can include `::connect-apps{}` as a standalone p
 
 ## Optional product analytics
 
-Set `POSTHOG_API_KEY` to a PostHog project ingestion token to enable browser
-analytics. `POSTHOG_HOST` defaults to `https://us.i.posthog.com` and must be an
-HTTPS origin. The authenticated `/me` response supplies this public configuration;
-the portal serves the same web application, so it needs no separate SDK.
+QM ships no analytics vendor. A deployment plugs its own in through two hooks.
 
-Events are explicit pageviews by navigation view, accepted `message_sent` events,
-and `session_started` for the first user message in a chat. Company grouping uses
-`CORE_ORG_ID`; user identities combine company and authenticated principal. Browser
-analytics is disabled during impersonation. Autocapture, replay, exception capture,
-performance capture and feature flags are disabled. Event properties exclude chat
-content, URLs, query strings, titles and referrers. Delivery is best effort.
+Browser: set `WEB_UI_ANALYTICS` on the web UI to a JSON object:
 
-Set the same variables on core to capture `app_published` after a successful new
-application or version deployment. Publications use the application's creator and
-company, matching browser identity. No key means no analytics requests.
+- `module` (required): a same-origin path or HTTPS URL of an ES module the
+  deployment serves. It must export `createAnalytics({ org, user, options })`,
+  returning (or resolving to) an object with optional `page(view)`,
+  `track(event, { insertId })` and `stop()` methods.
+- `connect` (optional): HTTPS origins the module needs to reach; they are added to
+  `connect-src`. A cross-origin `module` URL's origin is added to `script-src`.
+- `options` (optional): any JSON, passed to `createAnalytics` unchanged.
+
+The authenticated `/me` response supplies this configuration. The web UI loads the
+module after sign-in and never during impersonation, stops the previous instance on
+sign-out or identity change, and isolates module errors. It reports navigation views
+through `page`, and accepted `message_sent` events and `session_started` for the
+first user message in a chat through `track`, with stable insert IDs for
+deduplication. It passes no chat content, URLs, titles or referrers; anything else a
+module collects, such as session replay, and how it masks it, is the deployment's
+choice.
+
+Server: set `ANALYTICS_EVENTS_URL` on core to an HTTP or HTTPS endpoint, and
+optionally `ANALYTICS_EVENTS_TOKEN` (delivered as a secret) to send it as a bearer
+token. Core then POSTs JSON events
+`{ event, timestamp, company, principal, insert_id, properties }`, best effort with a
+two-second timeout. `app_published` follows a successful new application or version
+deployment, using the application's creator and company. Without a URL, core sends
+nothing.
 
 Core also captures `response_completed` and `response_failed` when a human turn
 reaches its final run state, including when a separate worker executes it.

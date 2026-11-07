@@ -1,106 +1,89 @@
-// Generic Model Context Protocol (MCP) client — HTTP transport only.
-//
-// Speaks JSON-RPC 2.0 over a single POST endpoint, accepting both plain JSON
-// and SSE-framed responses (the two response shapes the spec's streamable
-// HTTP transport allows). Supports three auth modes: none, static bearer
-// token, and OAuth2 client-credentials minted against `<base>/token`.
-//
-// This is the transport layer only: no registry, no tool injection, no
-// policy. See mcp-tool-service.ts for the layer that turns registered
-// servers into agent tools.
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { ClientCredentialsProvider } from "@modelcontextprotocol/sdk/client/auth-extensions.js";
+import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js";
+import { StreamableHTTPClientTransport, StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { OAuthError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { swallowAs } from "../util/errors.ts";
+import { publicFetch, type AddressFetch } from "../util/network.ts";
 
-const TOKEN_SKEW_MS = 60_000;
-const MCP_ACCEPT = "application/json, text/event-stream";
+const MAX_TOOLS = 64;
+const CALL_TIMEOUT_MS = 300_000;
+const OAUTH_DENIALS: ReadonlySet<string> = new Set([
+  "invalid_client",
+  "invalid_grant",
+  "unauthorized_client",
+  "invalid_token",
+  "insufficient_scope",
+  "access_denied",
+]);
 
-interface McpHttpResponse {
-  ok: boolean;
-  status: number;
-  text(): Promise<string>;
-  headers?: { get(name: string): string | null };
-}
-
-export type McpFetch = (
-  url: string,
-  init: { method: string; headers: Record<string, string>; body: string },
-) => Promise<McpHttpResponse>;
-
-const realFetch: McpFetch = (url, init) => fetch(url, { ...init, redirect: "error" });
-
-function endpointUrl(mcpUrl: string): string {
-  const trimmed = mcpUrl.replace(/\/+$/g, "");
-  return new URL(trimmed).pathname === "/" ? `${trimmed}/mcp` : trimmed;
-}
-
-function hostOf(base: string): string {
-  try {
-    return new URL(base).host;
-  } catch {
-    return base;
+export class McpCallError extends Error {
+  readonly status: number | undefined;
+  readonly code: string | undefined;
+  constructor(message: string, detail: { status?: number; code?: string; cause?: unknown }) {
+    super(message, { cause: detail.cause });
+    this.status = detail.status;
+    this.code = detail.code;
   }
 }
 
-function safeJson(text: string): unknown {
+export function mcpResultText(result: CallToolResult): string {
+  return result.content
+    .flatMap((c) => (c.type === "text" ? [c.text] : []))
+    .join("\n")
+    .trim();
+}
+
+export interface McpEnvelope {
+  code?: string;
+  status?: string;
+}
+
+function envelopeOf(value: unknown): McpEnvelope {
+  if (!value || typeof value !== "object") return {};
+  const { code, status, error } = value as { code?: unknown; status?: unknown; error?: { code?: unknown } };
+  const nested = error && typeof error === "object" ? error.code : undefined;
+  const found = typeof code === "string" ? code : nested;
+  return {
+    ...(typeof found === "string" && /^[\w.:-]{1,64}$/.test(found) ? { code: found } : {}),
+    ...(typeof status === "string" ? { status } : {}),
+  };
+}
+
+export const mcpEnvelope = (result: CallToolResult): McpEnvelope => envelopeOf(result.structuredContent);
+
+function jsonOf(text: string): unknown {
   try {
     return JSON.parse(text);
   } catch {
-    return null;
+    return undefined;
   }
 }
 
-interface McpEnvelope {
-  result?: unknown;
-  error?: { message?: string };
-  id?: unknown;
+function errorCode(result: CallToolResult): string | undefined {
+  return [result.structuredContent, ...result.content.map((c) => (c.type === "text" ? jsonOf(c.text) : undefined))]
+    .map((value) => envelopeOf(value).code)
+    .find((code) => code !== undefined);
 }
 
-function parseSseEnvelopes(body: string): McpEnvelope[] {
-  const out: McpEnvelope[] = [];
-  for (const frame of body.split(/\r?\n\r?\n/)) {
-    const data = frame
-      .split(/\r?\n/)
-      .filter((line) => line.startsWith("data:"))
-      .map((line) => line.slice(5).replace(/^ /, ""))
-      .join("\n");
-    if (!data) continue;
-    const parsed = safeJson(data) as McpEnvelope | null;
-    if (parsed) out.push(parsed);
-  }
-  return out;
-}
-
-function parseMcpEnvelope(text: string, contentType: string | null | undefined, id?: unknown): McpEnvelope | null {
-  const isSse = !!contentType && contentType.toLowerCase().includes("text/event-stream");
-  if (isSse) {
-    const envelopes = parseSseEnvelopes(text);
-    const carries = (e: McpEnvelope): boolean => e.result !== undefined || e.error !== undefined;
-    return (
-      (id !== undefined ? envelopes.find((e) => e.id === id && carries(e)) : undefined) ??
-      envelopes.find(carries) ??
-      null
-    );
-  }
-  return safeJson(text) as McpEnvelope | null;
-}
-
-export interface McpToolResult {
-  content?: Array<{ type?: string; text?: string }>;
-  structuredContent?: unknown;
-  isError?: boolean;
-}
-
-export function mcpResultText(result: McpToolResult): string {
-  if (!Array.isArray(result.content)) return "";
-  return result.content
-    .filter((c) => c?.type === "text")
-    .map((c) => String(c.text ?? ""))
-    .join("\n")
-    .trim();
+function httpStatus(error: unknown): number | undefined {
+  if (error instanceof StreamableHTTPError && (error.code ?? 0) > 0) return error.code;
+  if (error instanceof UnauthorizedError) return 401;
+  if (error instanceof OAuthError && OAUTH_DENIALS.has(error.errorCode)) return 401;
+  return undefined;
 }
 
 interface McpRemoteTool {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
+  annotations?: { readOnlyHint?: boolean; destructiveHint?: boolean };
+}
+
+export interface McpListing {
+  tools: McpRemoteTool[];
+  about?: string;
 }
 
 export type McpAuth =
@@ -109,100 +92,91 @@ export type McpAuth =
   | { mode: "client-credentials"; clientId: string; clientSecret: string };
 
 export interface McpClient {
-  readonly base: string;
-  readonly host: string;
-  listTools(): Promise<McpRemoteTool[]>;
-  callTool(name: string, args: Record<string, unknown>): Promise<McpToolResult>;
+  listTools(opts?: { headers?: Record<string, string>; maxTools?: number }): Promise<McpListing>;
+  callTool(name: string, args: Record<string, unknown>, headers?: Record<string, string>): Promise<CallToolResult>;
 }
 
-interface CachedToken {
-  accessToken: string;
-  expiresAt: number;
-}
+export function createMcpClient(opts: { url: string; auth: McpAuth; fetch?: AddressFetch }): McpClient {
+  const trimmed = opts.url.replace(/\/+$/g, "");
+  const endpoint = new URL(new URL(trimmed).pathname === "/" ? `${trimmed}/mcp` : trimmed);
+  const { auth } = opts;
+  const fetchFn = opts.fetch ?? publicFetch;
+  const authProvider =
+    auth.mode === "client-credentials"
+      ? new ClientCredentialsProvider({
+          clientId: auth.clientId,
+          clientSecret: auth.clientSecret,
+          expectedIssuer: new URL("/", endpoint).href,
+        })
+      : undefined;
 
-export function createMcpClient(opts: {
-  url: string;
-  auth: McpAuth;
-  fetchImpl?: McpFetch;
-  now?: () => number;
-}): McpClient {
-  const fetchImpl = opts.fetchImpl ?? realFetch;
-  const now = opts.now ?? (() => Date.now());
-  const endpoint = endpointUrl(opts.url);
-  const base = endpoint.replace(/\/mcp$/g, "");
-  const host = hostOf(base);
-  let cached: CachedToken | null = null;
-  let rpcId = 0;
-
-  async function mintToken(clientId: string, clientSecret: string): Promise<string> {
-    if (cached && now() < cached.expiresAt - TOKEN_SKEW_MS) return cached.accessToken;
-    const res = await fetchImpl(`${base}/token`, {
-      method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
-      body: new URLSearchParams({
-        grant_type: "client_credentials",
-        client_id: clientId,
-        client_secret: clientSecret,
-      }).toString(),
+  async function session<T>(
+    op: string,
+    work: (client: Client) => Promise<T>,
+    extraHeaders: Record<string, string> = {},
+  ): Promise<T> {
+    const headers = { ...extraHeaders, ...(auth.mode === "bearer" ? { authorization: `Bearer ${auth.token}` } : {}) };
+    const transport = new StreamableHTTPClientTransport(endpoint, {
+      ...(authProvider ? { authProvider } : {}),
+      ...(Object.keys(headers).length ? { requestInit: { headers } } : {}),
+      fetch: (url, init) => fetchFn(url, { ...init, redirect: "error" }),
     });
-    if (!res.ok) throw new Error(`mcp token mint failed (HTTP ${res.status})`);
-    const body = (safeJson(await res.text()) ?? {}) as { access_token?: unknown; expires_in?: unknown };
-    const accessToken = typeof body.access_token === "string" ? body.access_token : "";
-    if (!accessToken) throw new Error("mcp token mint returned no access_token");
-    const expiresIn = typeof body.expires_in === "number" ? body.expires_in : 0;
-    cached = { accessToken, expiresAt: expiresIn > 0 ? now() + expiresIn * 1000 : Infinity };
-    return accessToken;
-  }
-
-  async function authHeaders(): Promise<Record<string, string>> {
-    const auth = opts.auth;
-    if (auth.mode === "none") return {};
-    if (auth.mode === "bearer") return { authorization: `Bearer ${auth.token}` };
-    return { authorization: `Bearer ${await mintToken(auth.clientId, auth.clientSecret)}` };
-  }
-
-  async function rpc(method: string, params: Record<string, unknown>): Promise<unknown> {
-    const id = ++rpcId;
-    const res = await fetchImpl(endpoint, {
-      method: "POST",
-      headers: {
-        ...(await authHeaders()),
-        "content-type": "application/json",
-        accept: MCP_ACCEPT,
-      },
-      body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
-    });
-    if (!res.ok) throw new Error(`mcp ${method} failed (HTTP ${res.status})`);
-    const parsed = parseMcpEnvelope(await res.text(), res.headers?.get("content-type"), id);
-    if (!parsed) throw new Error(`mcp ${method} returned non-JSON`);
-    if (parsed.error) throw new Error(`mcp ${method} error: ${parsed.error.message ?? "unknown"}`);
-    return parsed.result ?? {};
+    const client = new Client({ name: "qm", version: "1.0.0" });
+    try {
+      await client.connect(transport);
+      return await work(client);
+    } catch (e) {
+      const status = httpStatus(e);
+      throw new McpCallError(`mcp ${op} failed${status ? ` (HTTP ${status})` : ""}`, {
+        ...(status ? { status } : {}),
+        ...(e instanceof OAuthError ? { code: e.errorCode } : {}),
+        cause: e,
+      });
+    } finally {
+      await transport.terminateSession().catch(swallowAs("mcp: end session", undefined));
+      await client.close();
+    }
   }
 
   return {
-    base,
-    host,
-    async listTools() {
-      const result = (await rpc("tools/list", {})) as { tools?: unknown };
-      if (!Array.isArray(result.tools)) return [];
-      const out: McpRemoteTool[] = [];
-      for (const raw of result.tools) {
-        const t = raw as { name?: unknown; description?: unknown; inputSchema?: unknown };
-        if (typeof t.name !== "string" || !t.name) continue;
-        out.push({
-          name: t.name,
-          description: typeof t.description === "string" ? t.description : "",
-          inputSchema:
-            t.inputSchema && typeof t.inputSchema === "object"
-              ? (t.inputSchema as Record<string, unknown>)
-              : { type: "object", properties: {} },
-        });
+    listTools: (opts) =>
+      session(
+        "tools/list",
+        async (client) => {
+          const tools: McpRemoteTool[] = [];
+          let cursor: string | undefined;
+          do {
+            const page = await client.listTools(cursor === undefined ? undefined : { cursor });
+            for (const t of page.tools)
+              tools.push({
+                name: t.name,
+                description: t.description ?? "",
+                inputSchema: t.inputSchema,
+                ...(t.annotations ? { annotations: t.annotations } : {}),
+              });
+            cursor = page.nextCursor;
+          } while (cursor && tools.length < (opts?.maxTools ?? MAX_TOOLS));
+          const about = (client.getServerVersion()?.description || client.getInstructions() || "").trim();
+          return {
+            tools: tools.slice(0, opts?.maxTools ?? MAX_TOOLS),
+            ...(about ? { about } : {}),
+          };
+        },
+        opts?.headers,
+      ),
+    async callTool(name, args, headers) {
+      const result = (await session(
+        "tools/call",
+        (client) => client.callTool({ name, arguments: args }, undefined, { timeout: CALL_TIMEOUT_MS }),
+        headers,
+      )) as CallToolResult;
+      if (result.isError) {
+        const code = errorCode(result);
+        const detail =
+          mcpResultText(result) ||
+          (result.structuredContent ? JSON.stringify(result.structuredContent) : "(no detail)");
+        throw new McpCallError(`mcp tool ${name} error: ${detail}`, code ? { code } : {});
       }
-      return out;
-    },
-    async callTool(name, args) {
-      const result = (await rpc("tools/call", { name, arguments: args })) as McpToolResult;
-      if (result.isError) throw new Error(`mcp tool ${name} error: ${mcpResultText(result) || "(no detail)"}`);
       return result;
     },
   };

@@ -337,6 +337,8 @@ export function createMcpConnectionService(opts: {
           ...result.tools.map((tool): McpToolDescriptor => ({
             name: toolName(connection.id, tool.name),
             serverId: id,
+            serverName: connection.name,
+            needsApproval: true,
             remoteName: tool.name,
             description: tool.description ?? "",
             inputSchema: tool.inputSchema,
@@ -459,6 +461,7 @@ export function createMcpConnectionService(opts: {
         .map((tool) => ({
           ...tool,
           readOnly: connection.tools.find((known) => known.remoteName === tool.remoteName)!.readOnly,
+          needsApproval: !connection.tools.find((known) => known.remoteName === tool.remoteName)!.readOnly,
         }));
       selected.push({ right, owner, tools });
     }
@@ -770,7 +773,7 @@ export function createMcpConnectionService(opts: {
               if (result.isError) throw new Error("Remote MCP tool returned an error");
               audit(`call.${descriptor.remoteName}`, connection, context.principalId, "ok", chosen.owner);
               return (
-                mcpResultText(result as import("./mcp-client.ts").McpToolResult) ||
+                mcpResultText(result as import("@modelcontextprotocol/sdk/types.js").CallToolResult) ||
                 JSON.stringify(result.structuredContent ?? "")
               ).slice(0, 60_000);
             });

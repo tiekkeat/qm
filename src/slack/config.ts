@@ -7,15 +7,6 @@ import { normalizeAllowFrom, parseAllowFrom } from "./allow-from.ts";
 export const NO_RETRY = { retryConfig: { retries: 0 } } as const;
 export const HISTORY_NO_RETRY = { ...NO_RETRY, rejectRateLimitedCalls: true } as const;
 
-export type SlackContextSource = "live" | "shadow" | "mirror";
-
-export function parseSlackContextSource(value: string | undefined): SlackContextSource {
-  const source = value?.trim() || "live";
-  if (source !== "live" && source !== "shadow" && source !== "mirror")
-    throw new Error("SLACK_CONTEXT_SOURCE must be live, shadow, or mirror");
-  return source;
-}
-
 function parseSlackHistoryLimit(value: string | undefined): number | undefined {
   if (!value?.trim()) return undefined;
   const limit = Number(value);
@@ -26,7 +17,6 @@ function parseSlackHistoryLimit(value: string | undefined): number | undefined {
 
 export interface SlackPluginConfig {
   externalAccess?: ExternalSlackAccess;
-  contextSource?: SlackContextSource;
   historyLimit?: number;
   installationId?: string;
   sharedServiceUrl?: string;
@@ -90,7 +80,6 @@ export function slackPluginConfigFromEnv(
     ...(env.SLACK_EXTERNAL_ACCESS
       ? { externalAccess: parseExternalSlackAccess(JSON.parse(env.SLACK_EXTERNAL_ACCESS)) }
       : {}),
-    ...(env.SLACK_CONTEXT_SOURCE ? { contextSource: parseSlackContextSource(env.SLACK_CONTEXT_SOURCE) } : {}),
     ...(receiverFactory ? { receiverFactory } : {}),
     ...opt("historyLimit", parseSlackHistoryLimit(env.SLACK_HISTORY_LIMIT)),
     ...opt("appToken", env.SLACK_APP_TOKEN),
@@ -101,7 +90,7 @@ export function slackPluginConfigFromEnv(
     ...opt("ackCapMs", num(env.SLACK_ACK_CAP_MS)),
     ...opt("userToken", env.SLACK_USER_TOKEN),
     ...opt("copilotBotToken", env.SLACK_COPILOT_BOT_TOKEN),
-    ...opt("webUiPublicUrl", env.WEB_UI_PUBLIC_URL),
+    ...opt("webUiPublicUrl", env.PUBLIC_WEB_URL),
     ...opt("sharedServiceUrl", env.QM_SLACK_SERVICE_URL),
     ...opt("identityEmail", env.SLACK_IDENTITY_EMAIL),
     ...(() => {
@@ -160,9 +149,8 @@ export function slackAccountConfigsFromEnv(env: Record<string, string | undefine
       SLACK_API_URL: str(a.apiUrl),
       SLACK_IDENTITY_EMAIL: str(a.identityEmail) ?? "1",
       SLACK_LOG_LEVEL: env.SLACK_LOG_LEVEL,
-      SLACK_CONTEXT_SOURCE: env.SLACK_CONTEXT_SOURCE,
       SLACK_HISTORY_LIMIT: env.SLACK_HISTORY_LIMIT,
-      WEB_UI_PUBLIC_URL: env.WEB_UI_PUBLIC_URL,
+      PUBLIC_WEB_URL: env.PUBLIC_WEB_URL,
       QM_SLACK_SERVICE_URL: env.QM_SLACK_SERVICE_URL,
     };
     const config = slackPluginConfigFromEnv(accountEnv);

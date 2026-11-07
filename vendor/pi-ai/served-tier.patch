@@ -1,0 +1,35 @@
+diff --git a/dist/api/openai-responses-shared.js b/dist/api/openai-responses-shared.js
+--- a/dist/api/openai-responses-shared.js
++++ b/dist/api/openai-responses-shared.js
+@@ -453,6 +453,8 @@
+             };
+         }
+         calculateCost(model, output.usage);
++        if (!options?.resolveServiceTier && typeof response?.service_tier === "string")
++            output.serviceTier = response.service_tier;
+         if (options?.applyServiceTierPricing) {
+             const serviceTier = options.resolveServiceTier
+                 ? options.resolveServiceTier(response?.service_tier, options.serviceTier)
+diff --git a/dist/api/openai-responses.js b/dist/api/openai-responses.js
+--- a/dist/api/openai-responses.js
++++ b/dist/api/openai-responses.js
+@@ -293,7 +293,7 @@
+     }
+     return params;
+ }
+-function getServiceTierCostMultiplier(model, serviceTier) {
++export function getServiceTierCostMultiplier(model, serviceTier) {
+     switch (serviceTier) {
+         case "flex":
+             return 0.5;
+diff --git a/dist/types.d.ts b/dist/types.d.ts
+--- a/dist/types.d.ts
++++ b/dist/types.d.ts
+@@ -385,6 +385,7 @@
+     model: string;
+     responseModel?: string;
+     responseId?: string;
++    serviceTier?: string;
+     /** Exact provider-native effort level used for this response. Absent for legacy or unmanaged responses. */
+     providerThinkingLevel?: string;
+     /** Pi thinking level the agent loop requested for this response. Absent outside the agent loop and for legacy responses. */

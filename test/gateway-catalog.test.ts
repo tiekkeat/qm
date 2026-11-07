@@ -1,24 +1,25 @@
-import { nativeDocumentFormat } from "../src/harness/document-inputs.ts";
+import { nativeDocumentFormat } from "../src/agent/document-inputs.ts";
 import { runtimeFallback } from "../src/api/runtime-config.ts";
-import { validateWebTurnModelOptions } from "../src/core/turn-options.ts";
-import { createMemoryConfigStore } from "../src/resolution/config-store.ts";
-import { resolveRuntimeChoice } from "../src/harness/harness-router.ts";
+import { validateWebTurnModelOptions } from "../src/api/runtime-config.ts";
+import { resolveRuntimeChoice } from "../src/agent/runtime-choice.ts";
 import { afterEach, test } from "node:test";
 import assert from "node:assert/strict";
 import { createGatewayCatalog } from "../src/model/gateway-catalog.ts";
 import { setGatewayModels } from "../src/model/gateway-models.ts";
 import { modelGatewayRequest } from "../src/model/provider-endpoints.ts";
 import {
+  contextTokenBudgetForModel,
   modelIdReserved,
   modelUnavailableReason,
   modelServiceable,
-  modelSupportedByHarness,
+  modelSupported,
   resolveModel,
   safeModelMetadata,
 } from "../src/model/pi-models.ts";
 import { builtInModelCatalog } from "../src/model/model-catalog.ts";
-import { validateCustomProviderSpec } from "../src/model/custom-providers.ts";
+import { setCustomProviders, validateCustomProviderSpec } from "../src/model/custom-providers.ts";
 import { loadConfig } from "../src/config.ts";
+import { testConfigStore } from "./support/test-database.ts";
 
 const config = {
   url: "https://gateway.example/prefix/v1",
@@ -70,7 +71,6 @@ afterEach(() => setGatewayModels([]));
 
 test("gateway configuration no longer requires a model list", () => {
   const parsed = loadConfig({
-    HARNESS: "mock",
     MODEL_GATEWAY_URL: config.url,
     MODEL_GATEWAY_API_KEY: config.apiKey,
     MODEL_GATEWAY_API_KEY_HEADER: config.apiKeyHeader,
@@ -103,8 +103,7 @@ test("discovers unknown tool models through the company key without leaking tran
   assert.equal(validateWebTurnModelOptions({ model: id }, null, availability), null);
   assert.match(validateWebTurnModelOptions({ model: id }, [], availability) ?? "", /not enabled/);
 
-  assert.equal(modelSupportedByHarness(id, "pi"), true);
-  assert.equal(modelSupportedByHarness(id, "claude"), false);
+  assert.equal(modelSupported(id), true);
   assert.equal(modelServiceable(id, { anthropic: true, openai: true, openrouter: true }), false);
   assert.equal(
     modelServiceable(id, { anthropic: false, openai: false, openrouter: false, modelIds: new Set([id]) }),
@@ -123,10 +122,11 @@ test("only models present in both responses with valid chat capabilities are sel
     group("no-tools", { supports_function_calling: false }),
     group("no-context", { max_input_tokens: null }),
     group("bad-price", { input_cost_per_token: -1 }),
-    group("bad-output", { max_output_tokens: 200000 }),
+    group("bad-output", { max_output_tokens: null }),
+    group("no-output-room", { max_input_tokens: 1, max_output_tokens: 1 }),
     group("not-authorized"),
   ]);
-  f.listing(["vendor/new-model", "embed", "no-tools", "no-context", "bad-price", "bad-output"]);
+  f.listing(["vendor/new-model", "embed", "no-tools", "no-context", "bad-price", "bad-output", "no-output-room"]);
   await f.catalog.refresh();
   assert.deepEqual(Object.keys(f.catalog.transport.models), ["gateway/vendor/new-model", "gateway/embed"]);
   assert.deepEqual(
@@ -135,6 +135,26 @@ test("only models present in both responses with valid chat capabilities are sel
       .map((m) => m.id),
     ["gateway/vendor/new-model"],
   );
+});
+
+test("output limits at or above the context window fall back to a safe limit instead of being rejected", async () => {
+  const f = fixture([
+    group("vendor/equal-limits", { max_input_tokens: 1_000_000, max_output_tokens: 1_000_000 }),
+    group("vendor/output-over-context", { max_input_tokens: 128_000, max_output_tokens: 200_000 }),
+    group("vendor/small-context", { max_input_tokens: 32_000, max_output_tokens: 32_000 }),
+    group("vendor/honest-output", { max_input_tokens: 1_000_000, max_output_tokens: 128_000 }),
+  ]);
+  await f.catalog.refresh();
+  const limits = (id: string) => {
+    const model = resolveModel(`gateway/${id}`);
+    return [model?.contextWindow, model?.maxTokens];
+  };
+  assert.deepEqual(limits("vendor/equal-limits"), [1_000_000, 65_536]);
+  assert.deepEqual(limits("vendor/output-over-context"), [128_000, 64_000]);
+  assert.deepEqual(limits("vendor/small-context"), [32_000, 16_000]);
+  assert.deepEqual(limits("vendor/honest-output"), [1_000_000, 128_000]);
+  assert.equal(contextTokenBudgetForModel("gateway/vendor/equal-limits"), 150_000);
+  assert.equal(contextTokenBudgetForModel("gateway/vendor/small-context"), 8_000);
 });
 
 test("successful revocation clears legacy aliases and cached models and cannot be undone by a failure", async () => {
@@ -209,7 +229,7 @@ test("malformed and oversized catalogs cannot grant access", async () => {
   }
 });
 
-test("gateway namespace cannot be registered by custom providers even before discovery", () => {
+test("custom provider models live in their own namespace, never the gateway one", () => {
   assert.doesNotThrow(() =>
     validateCustomProviderSpec({
       id: "gateway",
@@ -227,23 +247,33 @@ test("gateway namespace cannot be registered by custom providers even before dis
     baseUrl: config.url,
     models: [{ id: "gateway/future" }],
   };
-  assert.throws(() => validateCustomProviderSpec(spec), /already registered/);
+  assert.doesNotThrow(() => validateCustomProviderSpec(spec));
+  setCustomProviders([spec]);
+  assert.equal(resolveModel("custom/custom/gateway/future")?.provider, "custom");
+  assert.equal(resolveModel("gateway/future"), undefined);
+  setCustomProviders([]);
   assert.throws(
     () => validateCustomProviderSpec({ ...spec, id: "qm:gateway", models: [{ id: "other" }] }),
     /must match/,
   );
 });
 
-test("removed gateway selections never fall back to a different org or direct model", () => {
-  const store = createMemoryConfigStore("default-org");
+test("removed gateway selections never fall back to a different org or direct model", async () => {
+  const store = testConfigStore("default-org");
   const org = "org:default-org" as const;
   const personal = "personal:alice" as const;
-  const fallback = { harnessId: "pi" as const, modelId: "claude-opus-5" };
-  store.setRuntimeSelection(org, { harnessId: "pi", modelId: "gateway/removed" });
-  assert.throws(() => resolveRuntimeChoice(store, org, personal, fallback), /Gateway model is unavailable/);
-  store.setRuntimeSelection(org, fallback);
-  store.setRuntimeSelection(personal, { harnessId: "pi", modelId: "gateway/removed" });
-  assert.throws(() => resolveRuntimeChoice(store, org, personal, fallback), /Gateway model is unavailable/);
+  const fallback = { modelId: "claude-opus-5" };
+  await store.setRuntimeSelection(org, { modelId: "gateway/removed" });
+  await assert.rejects(
+    async () => await resolveRuntimeChoice(store, org, personal, fallback),
+    /Gateway model is unavailable/,
+  );
+  await store.setRuntimeSelection(org, fallback);
+  await store.setRuntimeSelection(personal, { modelId: "gateway/removed" });
+  await assert.rejects(
+    async () => await resolveRuntimeChoice(store, org, personal, fallback),
+    /Gateway model is unavailable/,
+  );
 });
 
 test("gateway aliases hide duplicate picker options while preserving saved routes", async () => {
@@ -291,7 +321,7 @@ test("gateway-only fallback retains models hidden by picker aliases", async () =
   await f.catalog.refresh();
   assert.ok(!builtInModelCatalog().some((model) => model.id === `gateway/${target}`));
   const fallback = runtimeFallback({
-    deps: { harnessId: "pi", providerKeys: { anthropic: false, openai: false, openrouter: false } },
+    deps: { providerKeys: { anthropic: false, openai: false, openrouter: false } },
   });
   assert.equal(fallback.modelId, `gateway/${target}`);
   assert.ok(

@@ -11,13 +11,17 @@ without parsing display text. Pi 1.0.4 already preserves native stop reasons.
 The patch also preserves AbortError as an aborted result when lazy request setup
 is cancelled, rather than reporting cancellation as a provider failure.
 
-The source-controlled installer applies the patch after npm installation:
+`served-tier.patch` retains the service tier returned by OpenAI and exposes Pi’s pricing multiplier to QM. This preserves official QM’s served-tier billing behavior while keeping Pi 1.0.4.
+
+`served-tier-types.patch` exposes the matching TypeScript declaration.
+
+The source-controlled installer applies all three patches after npm installation:
 
 ```sh
 node scripts/patch-pi-ai.mjs
 ```
 
-The root `postinstall` runs this automatically. Installs using `--ignore-scripts`
+The root and web UI `postinstall` hooks run this automatically. Installs using `--ignore-scripts`
 must run it explicitly. The core Docker dependency installer does so before
 building the image. Application is idempotent and fails if the installed version
 or patch context is incompatible.

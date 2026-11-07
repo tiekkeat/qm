@@ -17,15 +17,14 @@ const env = await browserEnv({
     if (path.startsWith("/api/runtime-config"))
       return Response.json({
         scopeId: "personal:tester",
-        approvedHarnesses: [],
-        modelsByHarness: {},
+        models: [],
         modelCatalog: {},
-        effective: { harnessId: "pi", modelId: "m" },
+        effective: { modelId: "m" },
       });
     if (path.endsWith("/approvals")) return Response.json({ approvals: [] });
-    if (path === "/api/sessions") return Response.json({ sessions: known });
+    if (path.startsWith("/api/sessions?")) return Response.json({ sessions: known });
     const id = path.match(/^\/api\/sessions\/([^/?]+)/)?.[1];
-    if (id) return Response.json({ session: known.find((s) => s.id === id), entries: [] });
+    if (id) return Response.json({ session: known.find((s) => s.id === id), items: [] });
     return Response.json({ contexts: [], items: [], crons: [] });
   },
 });
@@ -137,19 +136,37 @@ test("background canvas updates preserve non-chat detail routes", async () => {
 test("single and multiview headers render mutually exclusive tools and pane controls", async () => {
   known = [];
   await canvas(session("first"));
-  assert.equal(document.querySelectorAll(".split-pane-actions .session-tool").length, 6);
+  assert.equal(
+    document.querySelectorAll(".split-pane-actions .session-tool:not(.split-group-session-action)").length,
+    6,
+  );
+  const hoverTitle = () => {
+    const title = document.querySelector<HTMLElement>(".split-pane-title")!;
+    title.dispatchEvent(new MouseEvent("mouseenter"));
+    return title.hasAttribute("data-qm-tooltip-anchor");
+  };
+  assert.equal(hoverTitle(), false, "single-pane titles do not repeat the title as a tooltip");
   assert.deepEqual(
-    labels().filter((label) => /Tools|Split this pane|Open full screen|Close pane/.test(label!)),
+    labels().filter((label) => ["Pane layout and tools", "Expand pane", "Close pane"].includes(label!)),
     [],
   );
   await canvas(session("first"), session("second"));
-  assert.equal(document.querySelectorAll(".split-pane-actions .session-tool").length, 0);
-  for (const label of ["Tools", "Split this pane with a new session", "Open full screen", "Close pane"])
+  assert.equal(hoverTitle(), false, "split titles suppress their tooltip");
+  assert.equal(
+    document.querySelectorAll(".split-pane-actions .session-tool:not(.split-group-session-action)").length,
+    0,
+  );
+  for (const label of ["Pane layout and tools", "Expand pane", "Close pane"])
     assert.ok(labels().includes(label), label);
   document.querySelector<HTMLButtonElement>(".split-tools-btn")!.click();
   assert.ok(document.querySelector('.split-pane-actions [role="menu"]'));
   await closePane(1);
   assert.equal(document.querySelector('.split-pane-actions [role="menu"]'), null);
   assert.equal(document.querySelector(".split-tools-btn"), null);
+  assert.equal(hoverTitle(), false, "closing the split keeps the title without a tooltip");
+  assert.equal(
+    document.querySelectorAll(".split-pane-actions .session-tool:not(.split-group-session-action)").length,
+    6,
+  );
   assert.equal(document.querySelectorAll('.split-pane-actions [aria-label="Close pane"]').length, 0);
 });

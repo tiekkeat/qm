@@ -1,3 +1,4 @@
+import { nativeHistoryItem } from "../src/harness/transcript.ts";
 import { turnAtSeq } from "../src/core/turn-resume.ts";
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -29,7 +30,8 @@ import {
 } from "../src/harness/codex-harness.ts";
 import type { HarnessLlmRequestRecord, HarnessTurnInput } from "../src/harness/harness.ts";
 import { harnessToolContext } from "../src/harness/harness-shared.ts";
-import { createMemoryRunSignalStore } from "../src/runs/run-signal-store.ts";
+import { createPostgresRunSignalStore } from "../src/runs/postgres-run-signal-store.ts";
+import { testDatabaseUrl } from "./support/test-database.ts";
 import { NonRetryableTurnError, ProviderTurnError } from "../src/core/turn-error.ts";
 import type { ScopeId, Session, SessionEntry } from "../src/types.ts";
 import { createMemoryTaskStore } from "../src/tasks/memory-task-store.ts";
@@ -1609,7 +1611,7 @@ rl.on("line", (line) => {
 
 test("a user stop whose interrupted turn reports status=failed is a clean stop, and the stop stays pending", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "qm-codex-stop-failed-test-"));
-  const signals = createMemoryRunSignalStore();
+  const signals = createPostgresRunSignalStore(testDatabaseUrl());
   const harness = createCodexHarness({
     binaryPath: stopReportsFailedCodexBinary(dir),
     env: process.env,
@@ -1918,7 +1920,7 @@ for (const final of [true, false]) {
   for (const mechanism of ["signal", "cancel", "both"] as const) {
     test(`Codex saves only pre-stop ${final ? "final" : "commentary"} text via ${mechanism}`, async (t) => {
       const dir = mkdtempSync(join(tmpdir(), "qm-codex-partial-stop-"));
-      const signals = createMemoryRunSignalStore();
+      const signals = createPostgresRunSignalStore(testDatabaseUrl());
       const harness = createCodexHarness({
         binaryPath: stopReportsFailedCodexBinary(dir, true, final),
         env: testHarnessEnv(dir),
@@ -2010,7 +2012,7 @@ test("Codex steers extracted documents into the active turn without copying cont
   if (msg.method === "turn/interrupt") {`,
   );
   writeFileSync(binary, source);
-  const signals = createMemoryRunSignalStore();
+  const signals = createPostgresRunSignalStore(testDatabaseUrl());
   const harness = createCodexHarness({ binaryPath: binary, env: process.env, turnWallClockMs: 10_000, signals });
   t.after(async () => {
     await harness.turns.close?.();
@@ -2250,7 +2252,7 @@ test("Codex skips the stopped reply when shutdown cancels the turn, leaving it o
     entries.filter((entry) => entry.type === "text").map((entry) => entry.payload),
     [{ text: "Checking.", phase: "commentary" }],
   );
-  assert.equal(turnAtSeq(entries, entries[0]!.seq)?.answer, undefined);
+  assert.equal(turnAtSeq(entries.map(nativeHistoryItem), entries[0]!.seq)?.answer, undefined);
 });
 
 test("Codex resumes durable work without appending a duplicate user entry", async (t) => {

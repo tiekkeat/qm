@@ -1,24 +1,25 @@
 import { isSubagentThreadRef } from "../sessions/session-syscalls.ts";
 import { errMessage, swallowAs } from "../util/errors.ts";
 import { slackFailureText } from "./turn-flow.ts";
+import { slackSectionBlocks } from "./mrkdwn.ts";
 import {
   APPROVAL_ACTION_IDS,
   type ApprovalActionId,
   type StoredApproval,
+  approvalDecisionMessage,
   approvalMessage,
   clip,
+  type ApprovalDecisionRecord,
   createApprovalRegistry,
   createThreadTracker,
-  inlineCode,
-  isBoundaryRefusal,
   recoveredApprovalContext,
   resolveReactionTargets,
   slackReplyArgs,
-  stripAckPrefix,
   toSlackMrkdwn,
   uploadAttachments,
   uploadFailureNote,
 } from "./lib.ts";
+import { stripAckPrefix } from "../core/orchestrator/turn-helpers.ts";
 import { parseBlockAction, parseInteractionBody } from "./payloads.ts";
 import type { SlackCoreClient } from "../api/slack-core-client.ts";
 import type { TurnResult } from "../types.ts";
@@ -185,14 +186,14 @@ export function createApprovals(deps: {
           client,
           channel,
           messageTs,
-          "_That approval request expired — let me know when you want to try again._",
+          "_That approval request expired or was withdrawn — let me know when you want to try again._",
         ).catch(swallowAs("slack: update approval message", undefined));
       } else if (channel && clickerId) {
         await client.chat
           .postEphemeral({
             channel,
             user: clickerId,
-            text: "That approval request expired — let me know when you want to try again.",
+            text: "That approval request expired or was withdrawn — let me know when you want to try again.",
           })
           .catch(swallowAs("slack: chat.postEphemeral", undefined));
       }
@@ -226,14 +227,14 @@ export function createApprovals(deps: {
           client,
           channel,
           messageTs,
-          "_That approval request expired — let me know when you want to try again._",
+          "_That approval request expired or was withdrawn — let me know when you want to try again._",
         ).catch(swallowAs("slack: update approval message", undefined));
       } else if (channel && clickerId) {
         await client.chat
           .postEphemeral({
             channel,
             user: clickerId,
-            text: "That approval request expired — let me know when you want to try again.",
+            text: "That approval request expired or was withdrawn — let me know when you want to try again.",
           })
           .catch(swallowAs("slack: chat.postEphemeral", undefined));
       }
@@ -283,6 +284,13 @@ export function createApprovals(deps: {
     const delegated = isSubagentThreadRef(ctx.turn.conversation.threadRef);
     const cardChannel = ctx.approvalChannel;
     const cardIsRemote = cardChannel !== ctx.channel;
+    const decided: ApprovalDecisionRecord = { decision: selected, by: clickerId, at: Date.now(), state: "done" };
+    const decisionCard = (extra: string[] = []) => approvalDecisionMessage(ctx, decided, extra);
+    const updateCard = (card: { text: string; blocks: Array<Record<string, unknown>> }) =>
+      updateSlackMessage(client, cardChannel, messageTs, card.text, card.blocks);
+    await updateCard(approvalDecisionMessage(ctx, { ...decided, state: "pending" })).catch(
+      swallowAs("slack: update approval message", undefined),
+    );
     try {
       const approver = await directory.classifyActor(client, clickerId);
       const onQueued =
@@ -324,29 +332,29 @@ export function createApprovals(deps: {
         const outcome = await runTurn({ ...ctx.turn, actor: approver, approval }, onQueued ? { onQueued } : {});
         settle();
         if (await sealedOut(outcome.result)) return;
-        await updateSlackMessage(client, cardChannel, messageTs, `Denied ${inlineCode(ctx.command)}.`);
+        await updateCard(decisionCard());
         ackConveyedQuarantine(outcome);
         return;
       }
 
-      let scopeLabel = "Allowed always";
-      if (selected === "once") scopeLabel = "Allowed once";
-      else if (selected === "session") scopeLabel = "Allowed for this conversation";
-      await updateSlackMessage(client, cardChannel, messageTs, `${scopeLabel}; running ${inlineCode(ctx.command)}...`);
       const outcome = await runTurn({ ...ctx.turn, actor: approver, approval }, onQueued ? { onQueued } : {});
       const result = outcome.result;
       settle();
 
       if (await sealedOut(result)) return;
 
+      if (result.steered) {
+        await updateCard(decisionCard());
+        return;
+      }
+
       if (delegated) {
-        await updateSlackMessage(
-          client,
-          cardChannel,
-          messageTs,
-          result.status === "failed" || result.status === "refused"
-            ? `Approved; the delegated task could not continue: ${result.reason ?? "execution failed"}`
-            : `Approved ${inlineCode(ctx.command)}. Results will return to the original conversation.`,
+        await updateCard(
+          decisionCard([
+            result.status === "failed" || result.status === "refused"
+              ? `The delegated task could not continue: ${result.reason ?? "execution failed"}`
+              : "Results will return to the original conversation.",
+          ]),
         );
         return;
       }
@@ -360,10 +368,17 @@ export function createApprovals(deps: {
         if (replyBody) reply = toSlackMrkdwn(replyBody);
         else if (result.attachments?.length || reactions.length) reply = "Done.";
         if (cardIsRemote) {
-          await updateSlackMessage(client, cardChannel, messageTs, `Approved; ran ${inlineCode(ctx.command)}.`);
+          await updateCard(decisionCard());
           await postApprovalFollowup(client, ctx, reply);
         } else {
-          await updateSlackMessage(client, cardChannel, messageTs, reply);
+          const replyBlocks = slackSectionBlocks(reply);
+          await updateSlackMessage(
+            client,
+            cardChannel,
+            messageTs,
+            reply,
+            replyBlocks.length < 48 ? [...replyBlocks, ...approvalDecisionMessage(ctx, decided).blocks] : undefined,
+          );
         }
         if (result.attachments?.length) {
           try {
@@ -392,23 +407,13 @@ export function createApprovals(deps: {
           ...(ctx.slackIdsByPrincipal ? { slackIdsByPrincipal: ctx.slackIdsByPrincipal } : {}),
           ...(ctx.recovered ? { recovered: true } : {}),
         });
-        await updateSlackMessage(
-          client,
-          cardChannel,
-          messageTs,
-          "Approved. A new command needs approval; its card will arrive separately.",
-        );
+        await updateCard(decisionCard(["A new command needs approval; its card will arrive separately."]));
         return;
       }
 
-      const failLink = isBoundaryRefusal(result.reason) ? null : (result.adminUrl ?? null);
+      const failLink = result.refusalKind === "internal_only" ? null : (result.adminUrl ?? null);
       const failDetail = failLink ? ` Full error: ${failLink}` : "";
-      await updateSlackMessage(
-        client,
-        cardChannel,
-        messageTs,
-        `I can't continue — ${userFacingFailureClause(result)}.${failDetail}`,
-      );
+      await updateCard(decisionCard([`I can't continue — ${userFacingFailureClause(result)}.${failDetail}`]));
       ackConveyedQuarantine(outcome);
     } catch (err) {
       console.error("%s", `[slack] approval ${requestId} action failed:`, errMessage(err));

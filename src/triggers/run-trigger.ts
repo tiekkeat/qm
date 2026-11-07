@@ -1,26 +1,20 @@
-import type {
-  DeliveryProvenance,
-  Destination,
-  Principal,
-  RecipientConsent,
-  ScopeId,
-  TurnRequest,
-  TurnResult,
-} from "../types.ts";
+import type { DeliveryProvenance, Destination, Principal, ScopeId, TurnRequest, TurnResult } from "../types.ts";
+import type { CronScript } from "./types.ts";
 import { actsAsScope, parseScopeId } from "../types.ts";
 import type { IdentityService } from "../identity/identity-service.ts";
 import type { DeliveryStore } from "../delivery/delivery-store.ts";
 import type { IdempotencyStore } from "../idempotency/idempotency-store.ts";
-import { turnModelOptions } from "../core/turn-options.ts";
+import { turnModelOptions } from "../agent/runtime-choice.ts";
 import { userFacingFailureClause } from "../core/failure-copy.ts";
-import { principalDestination, reachEnqueue } from "../reach/reach.ts";
-import { consentRequiredRecipient, recipientConsentSatisfied } from "./trigger-store.ts";
+import { TransientTurnFailure } from "../core/turn-error.ts";
+import { reachEnqueue } from "../reach/reach.ts";
 import { isVisible, type VisibilityDirectory } from "../directory/visibility.ts";
-import type { DirectoryMember, DirectoryStore } from "../directory/directory-store.ts";
+import type { DirectoryMember, DirectoryStore, RecipientResolution } from "../directory/directory-store.ts";
 import { samePerson } from "../directory/person.ts";
+import { grantsHomedWithOwner } from "../cron/authority.ts";
 import type { CurrentScopeMembers } from "../resolution/scope-membership.ts";
 import { isProjectGroupRef } from "../projects/project-store.ts";
-import { reportFailureAs } from "../util/errors.ts";
+import { reportFailureAs, swallowAs } from "../util/errors.ts";
 
 const MEMBERSHIP_SKIP_NOTE = "the acting person is no longer a member of this trigger's home scope — run skipped";
 const UNKNOWN_HOME_SKIP_NOTE =
@@ -38,11 +32,12 @@ export interface TriggerDeps {
     groupMembership?(groupId: string, principalId: string): Promise<boolean | undefined>;
     conversationMembers?: DirectoryStore["conversationMembers"];
   };
-  sessions?: { listByParticipant(principalId: string): Promise<readonly { scopeId: ScopeId }[]> };
+  sessions?: { participantScopes(principalId: string): Promise<readonly { scopeId: ScopeId }[]> };
+  resolveRecipient?: (query: string) => Promise<RecipientResolution>;
 }
 
-export interface TriggerSpec extends Pick<TurnRequest, "model" | "harness" | "fastMode" | "attachments"> {
-  runtime?: import("../harness/harness.ts").RuntimeChoice | null;
+export interface TriggerSpec extends Pick<TurnRequest, "model" | "fastMode" | "attachments" | "infrequentCron"> {
+  runtime?: import("../agent/agent.ts").RuntimeChoice | null;
   title?: string;
   owner: string;
   ownerScopeId: ScopeId;
@@ -53,55 +48,36 @@ export interface TriggerSpec extends Pick<TurnRequest, "model" | "harness" | "fa
   destination?: Destination;
   message?: string;
   threadRef?: string;
+  personaId?: string;
   unattendedGrants?: string[];
-  recipientConsent?: RecipientConsent;
-  recipientConsentRequired?: boolean;
+  cronScript?: CronScript;
   shadow?: boolean;
   thinkingLevel?: string;
   readOnly?: boolean;
   turnWallClockMs?: number;
   errorNotice?: (noteOrStatus: string) => string;
+  redrivesHandOff?: boolean;
   onClaimed?: () => Promise<void>;
-  deferWhenBusy?: boolean;
 }
 
 export interface TriggerOutcome {
   authzFailed: boolean;
   ownerLeft?: boolean;
   ran: boolean;
-  deferred?: boolean;
   status?: TurnResult["status"];
+  errorCode?: string;
   note?: string;
   userNote?: string;
   reply?: string;
   sessionId?: string;
 }
 
-class FireDeferred extends Error {
-  constructor() {
-    super("fire deferred: session busy");
-  }
-}
-
 function isTriggerFailure(outcome: TriggerOutcome): boolean {
   return outcome.ran && outcome.status !== undefined && outcome.status !== "ok" && outcome.status !== "silent";
 }
 
-const NO_UPDATE_SENTINEL = "[no-update]";
-const SILENT_POLL_MARKERS = new Set([NO_UPDATE_SENTINEL, "no_reply", "[silent]"]);
-
 const POLL_SURFACES = new Set(["cron", "webhook", "monitor"]);
 export const isPollSurface = (surface: string): boolean => POLL_SURFACES.has(surface);
-
-export function isSilentPollReply(reply: string): boolean {
-  const finalLine = reply
-    .trimEnd()
-    .split(/\r?\n/)
-    .findLast((line) => line.trim() !== "")
-    ?.trim()
-    .toLowerCase();
-  return finalLine === undefined || SILENT_POLL_MARKERS.has(finalLine);
-}
 
 function deliveryProvenance(spec: TriggerSpec, threadRef: string, res?: TurnResult): DeliveryProvenance {
   return {
@@ -124,8 +100,8 @@ async function relayAttribution(deps: TriggerDeps, spec: TriggerSpec): Promise<s
 }
 
 async function participatesInScope(deps: TriggerDeps, actorId: string, scope: ScopeId): Promise<boolean> {
-  const sessions = await deps.sessions?.listByParticipant(actorId).catch(() => []);
-  return sessions?.some((s) => s.scopeId === scope) === true;
+  const scopes = await deps.sessions?.participantScopes(actorId).catch(swallowAs("trigger: participant scopes", []));
+  return scopes?.some((s) => s.scopeId === scope) === true;
 }
 
 async function actorMayReadScope(
@@ -174,7 +150,13 @@ export async function destinationVisible(
     return isVisible(deps.directory, actorId, { kind: "channel", channelId: id });
   }
   if (destination.type === "group") return isVisible(deps.directory, actorId, { kind: "group", groupId: id });
-  return true;
+  if (destination.type !== "principal" || samePerson(destination.target, actorId) || !deps.resolveRecipient)
+    return true;
+  const recipient = await deps.resolveRecipient(destination.target);
+  return (
+    recipient.kind === "one" &&
+    (samePerson(recipient.member.principalId, destination.target) || recipient.member.slackId === destination.target)
+  );
 }
 
 const SCHEDULED_SURFACES = new Set(["cron", "loop", "keychain-ask"]);
@@ -259,159 +241,143 @@ export async function runTrigger(deps: TriggerDeps, spec: TriggerSpec): Promise<
     ? (destinationIsHome && homeAccess.ok) || (await destinationVisible(deps, actorId, spec.destination))
     : true;
   const notVisibleNote = "destination is no longer visible to the cron owner — delivery skipped";
-  const requiredRecipient = consentRequiredRecipient({
-    owner: spec.owner,
-    standing: spec.recipientConsentRequired === true,
-    destination: spec.destination,
-  });
-  const consented = recipientConsentSatisfied(spec, requiredRecipient);
-  const consentNote =
-    spec.recipientConsent?.status === "declined"
-      ? "recipient turned this delivery off — skipped"
-      : "awaiting the recipient's consent — delivery skipped";
-  const liveDelivery = spec.surface === "monitor" && Boolean(spec.destination) && consented && deliverable;
+  const liveDelivery =
+    spec.surface === "monitor" && spec.destination?.type !== "webhook" && Boolean(spec.destination) && deliverable;
 
   let status: TurnResult["status"] | undefined;
+  let errorCode: string | undefined;
   let note: string | undefined;
   let userNote: string | undefined;
   let reply: string | undefined;
   let sessionId: string | undefined;
-  const ownerSkipNotice = async () => {
-    if (runsAsScope) return;
+  let runDelivers = false;
+  let scriptVerdict: string | undefined;
+  const sendErrorNotice = async (reason: string): Promise<void> => {
+    if (!spec.errorNotice || !spec.destination || !deliverable) return;
     await deps.deliveries.enqueue({
-      destination: principalDestination(spec.owner, spec.owner),
-      text: `Scheduled delivery skipped: ${consentNote}`,
+      destination: spec.destination,
+      text: spec.errorNotice(reason),
       idempotencyKey: `${spec.fireKey}:err`,
       provenance: deliveryProvenance(spec, threadRef),
       ...(spec.shadow ? { shadow: true } : {}),
     });
   };
-  let deferred = false;
-  const ran = await deps.idempotency
-    .once(spec.fireKey, async () => {
-      await spec.onClaimed?.();
-      if (spec.message !== undefined) {
-        status = "ok";
-        if (!spec.destination) return;
-        if (!consented) {
-          status = "refused";
-          note = consentNote;
-          await ownerSkipNotice();
-          return;
-        }
-        if (!deliverable) {
-          status = "refused";
-          note = notVisibleNote;
-          return;
-        }
-        const attributeAs = await relayAttribution(deps, spec);
-        await reachEnqueue({
-          deliveries: deps.deliveries,
-          destination: spec.destination,
-          text: spec.message,
-          idempotencyKey: spec.fireKey,
-          provenance: deliveryProvenance(spec, threadRef),
-          ...(attributeAs ? { attributeAs } : {}),
-          ...(spec.shadow ? { shadow: true } : {}),
-        });
+  const ran = await deps.idempotency.once(spec.fireKey, async () => {
+    await spec.onClaimed?.();
+    if (spec.message !== undefined) {
+      status = "ok";
+      if (!spec.destination) return;
+      if (!deliverable) {
+        status = "refused";
+        note = notVisibleNote;
         return;
       }
-      if (!homeAccess.ok) {
-        note = homeAccess.note ?? MEMBERSHIP_SKIP_NOTE;
-        return;
-      }
-      const res = await deps.run({
-        surface: spec.surface,
-        actor: { externalId: actorId },
-        conversation,
-        text: typeof spec.input === "string" ? spec.input : spec.input(roster),
-        ...(spec.securityScreenData !== undefined ? { securityScreenData: spec.securityScreenData } : {}),
-        triggered: true,
-        ...(ownerKind === "personal" && spec.unattendedGrants ? { unattendedGrants: spec.unattendedGrants } : {}),
-        ...(spec.runtime ? { model: spec.runtime.modelId, harness: spec.runtime.harnessId } : {}),
-        ...turnModelOptions({
-          triggered: true,
-          surface: spec.surface,
-          thinkingLevel: spec.runtime?.effortLevel ?? spec.thinkingLevel,
-          fastMode: spec.fastMode ?? spec.runtime?.fastMode,
-        }),
-        ...(spec.model ? { model: spec.model } : {}),
-        ...(spec.harness ? { harness: spec.harness } : {}),
-        ...(spec.attachments?.length ? { attachments: spec.attachments } : {}),
-        ...(spec.readOnly ? { readOnly: true } : {}),
-        ...(typeof spec.turnWallClockMs === "number" ? { turnWallClockMs: spec.turnWallClockMs } : {}),
-        ...(spec.destination ? { triggerDestination: spec.destination } : {}),
-        ...(liveDelivery ? { surfaceTools: true, addressed: true } : {}),
-        ...(scheduled && !runsAsScope && conversation.kind !== "dm" ? { ownerKeychainUnion: true } : {}),
+      const attributeAs = await relayAttribution(deps, spec);
+      await reachEnqueue({
+        deliveries: deps.deliveries,
+        destination: spec.destination,
+        text: spec.message,
         idempotencyKey: spec.fireKey,
+        provenance: deliveryProvenance(spec, threadRef),
+        ...(attributeAs ? { attributeAs } : {}),
+        ...(spec.shadow ? { shadow: true } : {}),
       });
-      if (spec.deferWhenBusy && res.refusalKind === "session_busy") throw new FireDeferred();
-      status = res.status;
-      reply = res.reply;
-      sessionId = res.sessionId;
-      if (res.status === "silent") return;
-      if (res.status === "pending_approval") {
-        note = "hit a require_approval command — failed closed (no human at fire/event time)";
-        console.warn(`[trigger] ${spec.surface} ${spec.fireKey} ${note}`);
-        return;
-      }
-      if (res.status === "ok" && (res.reply || res.attachments?.length)) {
-        if (!spec.destination) return;
-        if (liveDelivery) return;
-        if (!consented) {
-          status = "refused";
-          note = consentNote;
-          await ownerSkipNotice();
-          return;
-        }
-        if (!deliverable) {
-          status = "refused";
-          note = notVisibleNote;
-          return;
-        }
-        await reachEnqueue({
-          deliveries: deps.deliveries,
-          destination: spec.destination,
-          text: res.reply ?? "",
-          ...(res.attachments?.length ? { attachments: res.attachments } : {}),
-          idempotencyKey: spec.fireKey,
-          provenance: deliveryProvenance(spec, threadRef, res),
-          ...(spec.shadow ? { shadow: true } : {}),
-        });
-        return;
-      }
-      if (res.status === "ok") note = "produced no reply";
-      else {
-        note = res.reason ? `${res.status}: ${res.reason}` : res.status;
-        userNote = userFacingFailureClause(res);
-      }
-    })
-    .catch((e: unknown) => {
-      if (!(e instanceof FireDeferred)) throw e;
-      deferred = true;
-      return false;
+      return;
+    }
+    if (!homeAccess.ok) {
+      note = homeAccess.note ?? MEMBERSHIP_SKIP_NOTE;
+      return;
+    }
+    const res = await deps.run({
+      surface: spec.surface,
+      actor: { externalId: actorId },
+      conversation,
+      text: typeof spec.input === "string" ? spec.input : spec.input(roster),
+      origin: {
+        kind: "automation",
+        ...(spec.securityScreenData !== undefined ? { screenData: spec.securityScreenData } : {}),
+        ...(spec.destination ? { destination: spec.destination } : {}),
+        ...(scheduled && !runsAsScope && conversation.kind !== "dm" ? { useOwnerKeychain: true } : {}),
+      },
+      ...(spec.unattendedGrants && grantsHomedWithOwner(spec) ? { unattendedGrants: spec.unattendedGrants } : {}),
+      ...(spec.cronScript ? { cronScript: spec.cronScript } : {}),
+      ...(spec.personaId ? { personaId: spec.personaId } : {}),
+      ...(spec.infrequentCron ? { infrequentCron: true } : {}),
+      ...(spec.runtime ? { model: spec.runtime.modelId } : {}),
+      ...turnModelOptions({
+        triggered: true,
+        surface: spec.surface,
+        infrequentCron: spec.infrequentCron,
+        thinkingLevel: spec.runtime?.effortLevel ?? spec.thinkingLevel,
+        fastMode: spec.fastMode ?? spec.runtime?.fastMode,
+      }),
+      ...(spec.model ? { model: spec.model } : {}),
+      ...(spec.attachments?.length ? { attachments: spec.attachments } : {}),
+      ...(spec.readOnly ? { readOnly: true } : {}),
+      ...(typeof spec.turnWallClockMs === "number" ? { turnWallClockMs: spec.turnWallClockMs } : {}),
+      ...(spec.destination?.type === "webhook" && deliverable && !spec.shadow
+        ? { deliveryTarget: spec.destination.target }
+        : {}),
+      ...(liveDelivery ? { surfaceTools: true, addressed: true } : {}),
+      idempotencyKey: spec.fireKey,
     });
+    if (res.status === "queued") {
+      if (!spec.redrivesHandOff) await sendErrorNotice(userFacingFailureClause(res));
+      throw new TransientTurnFailure(`turn ${res.runId ?? ""} was still waiting to finish when this process shut down`);
+    }
+    status = res.status;
+    errorCode = res.errorCode;
+    reply = res.reply;
+    sessionId = res.sessionId;
+    runDelivers = spec.destination?.type === "webhook" && deliverable && !spec.shadow && Boolean(res.runId);
+    scriptVerdict = res.scriptVerdict;
+    if (res.status === "silent") return;
+    if (res.status === "pending_approval") {
+      if (runDelivers) return;
+      note = "hit a require_approval command — failed closed (no human at fire/event time)";
+      console.warn(`[trigger] ${spec.surface} ${spec.fireKey} ${note}`);
+      return;
+    }
+    if (res.status === "ok" && (res.reply || res.attachments?.length)) {
+      if (runDelivers) return;
+      if (!spec.destination) return;
+      if (liveDelivery) return;
+      if (!deliverable) {
+        status = "refused";
+        note = notVisibleNote;
+        return;
+      }
+      await reachEnqueue({
+        deliveries: deps.deliveries,
+        destination: res.persona ? { ...spec.destination, persona: res.persona } : spec.destination,
+        text: res.reply ?? "",
+        ...(res.attachments?.length ? { attachments: res.attachments } : {}),
+        idempotencyKey: spec.fireKey,
+        provenance: deliveryProvenance(spec, threadRef, res),
+        ...(spec.shadow ? { shadow: true } : {}),
+      });
+      return;
+    }
+    if (res.status === "ok") note = "produced no reply";
+    else {
+      note = res.reason ? `${res.status}: ${res.reason}` : res.status;
+      userNote = userFacingFailureClause(res);
+    }
+  });
 
+  const loggedNote = scriptVerdict && note ? `${scriptVerdict}; ${note}` : (scriptVerdict ?? note);
   const outcome: TriggerOutcome = {
     authzFailed: false,
     ran,
-    ...(deferred ? { deferred } : {}),
     ...(status ? { status } : {}),
-    ...(note ? { note } : {}),
+    ...(errorCode ? { errorCode } : {}),
+    ...(loggedNote ? { note: loggedNote } : {}),
     ...(userNote ? { userNote } : {}),
     ...(reply !== undefined ? { reply } : {}),
     ...(sessionId ? { sessionId } : {}),
   };
 
-  if (spec.errorNotice && spec.destination && consented && deliverable && isTriggerFailure(outcome)) {
-    await deps.deliveries.enqueue({
-      destination: spec.destination,
-      text: spec.errorNotice(userNote ?? note ?? status!),
-      idempotencyKey: `${spec.fireKey}:err`,
-      provenance: deliveryProvenance(spec, threadRef),
-      ...(spec.shadow ? { shadow: true } : {}),
-    });
-  }
+  if (isTriggerFailure(outcome) && !runDelivers) await sendErrorNotice(userNote ?? note ?? status!);
 
   return outcome;
 }

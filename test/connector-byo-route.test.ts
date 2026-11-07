@@ -6,11 +6,16 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
-import { createInsecureTestServer } from "../src/api/server.ts";
-import { buildApp, type BuiltApp } from "../src/wiring.ts";
+import { createInsecureTestServer, createServer } from "../src/api/server.ts";
+import { mintCapabilityToken, CAPABILITY_TTL_MS } from "../src/auth/capability-token.ts";
+import { scopeId } from "../src/types.ts";
+import { type BuiltApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { testConfig } from "./support/test-config.ts";
 
 import { createManagedSlack } from "../src/surfaces/slack-managed.ts";
+import { createPostgresReplayDedupe } from "../src/auth/replay-dedupe.ts";
+import { testDatabaseUrl } from "./support/test-database.ts";
 
 const ADMIN = { "content-type": "application/json", "x-admin-actor": "admin-alice@default-org" };
 
@@ -210,7 +215,7 @@ test("the catalog endpoint exposes per-provider setup guidance (no secrets)", as
       catalog: Array<{ provider: string; setupGuide: { url: string; steps: string[] }; consentMode: string }>;
     };
     const names = catalog.map((c) => c.provider).sort();
-    assert.deepEqual(names, ["dropbox", "github", "google", "linear", "notion", "slack", "x"]);
+    assert.deepEqual(names, ["dropbox", "github", "google", "linear", "notion", "slack", "x", "zoom"]);
     const google = catalog.find((c) => c.provider === "google")!;
     assert.ok(google.setupGuide.steps.length >= 3);
     assert.match(google.setupGuide.url, /^https:\/\//);
@@ -248,6 +253,53 @@ test("managed deployments accept validated own apps and preserve credentials on 
     assert.equal(status.installAvailable, true);
     assert.equal(new URL(status.createUrl).searchParams.get("new_app"), "1");
     assert.equal((await srv.built.slackInstallation.get())?.botToken, "xoxb-own");
+  } finally {
+    await srv.close();
+  }
+});
+
+test("an agent capability token can read the connector catalog; an unauthenticated request cannot", async () => {
+  const secret = "catalog-route-secret".repeat(3);
+  const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "catalog-")), signingSecret: secret }));
+  const server = createServer(built.app, {
+    replayDedupe: createPostgresReplayDedupe(testDatabaseUrl()),
+    signingSecret: secret,
+  });
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const base = `http://localhost:${(server.address() as AddressInfo).port}`;
+  try {
+    const token = await mintCapabilityToken(
+      { actorId: "U1", scopeId: scopeId("personal", "U1"), exp: Date.now() + CAPABILITY_TTL_MS },
+      secret,
+    );
+    const res = await fetch(`${base}/v1/connectors/catalog`, { headers: { "x-agent-capability": token } });
+    assert.equal(res.status, 200);
+    const { catalog } = (await res.json()) as { catalog: Array<{ provider: string; configured: boolean }> };
+    assert.ok(catalog.some((c) => c.provider === "google" && c.configured === false));
+    assert.equal((await fetch(`${base}/v1/connectors/catalog`)).status, 401);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("connector writes save without consulting another scope's client", async () => {
+  const srv = start();
+  try {
+    const disabled = await putConnector(srv.base, {
+      provider: "google",
+      clientId: "org-cid",
+      clientSecret: "org-secret",
+      enabled: false,
+    });
+    assert.equal(disabled.status, 200);
+    const team = await fetch(`${srv.base}/v1/admin/scopes/team:eng/connectors`, {
+      method: "PUT",
+      headers: ADMIN,
+      body: JSON.stringify({ provider: "google", clientId: "team-cid", clientSecret: "team-secret" }),
+    });
+    assert.equal(team.status, 200);
+    const saved = await srv.built.config.getConnectorClientSecret(scopeId("team", "eng"), "google");
+    assert.equal(saved?.clientId, "team-cid");
   } finally {
     await srv.close();
   }

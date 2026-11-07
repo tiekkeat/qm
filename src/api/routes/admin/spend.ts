@@ -1,6 +1,5 @@
-import { cacheHitRatio } from "../../../admin/metrics-sink.ts";
-import { canonicalPerson } from "../../../directory/person.ts";
 import { parseScopeId, personalScope, type ScopeId } from "../../../types.ts";
+import type { Cron } from "../../../triggers/types.ts";
 import type { SessionOrigin, SessionStore, SpendRow } from "../../../sessions/session-store.ts";
 import { constantTimeEqual } from "../../../util/crypto.ts";
 import { contentDispositionAttachment, contentTypeWithUtf8Charset, sendJson } from "../../http.ts";
@@ -8,18 +7,37 @@ import { audit, authorizeAdmin, orgScope } from "../shared.ts";
 import { discoverScopes } from "./common.ts";
 import { type ApiCtx, type BaseCtx } from "../route.ts";
 
+export function cacheHitRatio(s: { cacheRead?: number; cacheWrite?: number; uncachedInput?: number }): number | null {
+  const read = s.cacheRead;
+  const write = s.cacheWrite;
+  const uncached = s.uncachedInput;
+  if (read === undefined && write === undefined && uncached === undefined) return null;
+  const r = read ?? 0;
+  const denom = r + (write ?? 0) + (uncached ?? 0);
+  if (denom <= 0) return null;
+  return r / denom;
+}
+
 const DAY_MS = 86_400_000;
 const DEFAULT_WINDOW_DAYS = 30;
-const EXPORT_MAX_DAYS = 93;
+const MAX_SPEND_DAYS = 93;
+const CRON_LOOKUP_CONCURRENCY = 8;
 const SPEND_EXPORT_PRINCIPAL = "spend-export";
 const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
 const EPOCH_MS = /^\d+$/;
 const CSV_FORMULA_LEAD = /^[=+\-@\t\r]/;
 const CSV_NEEDS_QUOTES = /["\r\n,]/;
+const BACKGROUND_SOURCES = ["cron", "loop", "swarm", "webhook", "monitor"] as const satisfies readonly Exclude<
+  SessionOrigin,
+  "conversation"
+>[];
+type BackgroundSource = (typeof BACKGROUND_SOURCES)[number];
+type SpendSource = "live" | BackgroundSource;
+const SPEND_SOURCES: readonly SpendSource[] = ["live", ...BACKGROUND_SOURCES];
 const CSV_TOTALS_HEADER = [
   "live_usd",
-  "cron_usd",
   "background_usd",
+  ...BACKGROUND_SOURCES.map((source) => `${source}_usd`),
   "total_usd",
   "calls",
   "input_tokens",
@@ -29,10 +47,9 @@ const CSV_TOTALS_HEADER = [
   "cache_hit_ratio",
 ];
 
-type SpendBreakdown = "entity" | "model";
+const SPEND_BREAKDOWNS = ["entity", "model", "cron"] as const;
+type SpendBreakdown = (typeof SPEND_BREAKDOWNS)[number];
 type SpendBucket = "day" | "week";
-type OriginBucket = "live" | "cron" | "background";
-const ORIGIN_BUCKETS: readonly OriginBucket[] = ["live", "cron", "background"];
 
 interface SpendBucketTotals {
   costUsd: number;
@@ -50,15 +67,25 @@ interface SpendTotals {
   cacheWrite: number;
   cacheHitRatio: number | null;
   live: SpendBucketTotals;
-  cron: SpendBucketTotals;
-  background: SpendBucketTotals;
+  background: SpendBucketTotals & { sources: Record<BackgroundSource, SpendBucketTotals> };
 }
 
 interface SpendEntity extends SpendTotals {
+  userId: string | null;
   principalId: string | null;
   scopeId: ScopeId;
   kind: string;
   displayName: string;
+}
+
+type SpendExportCron = Pick<Cron, "id" | "title" | "owner" | "ownerScopeId" | "schedule" | "enabled" | "archived">;
+type SpendCronInfo = SpendExportCron & Pick<Cron, "action" | "message">;
+
+interface SpendCron extends SpendTotals {
+  cronId: string;
+  scopeId: ScopeId;
+  scopeName: string;
+  info: SpendCronInfo | null;
 }
 
 interface SpendSeriesPoint {
@@ -68,8 +95,7 @@ interface SpendSeriesPoint {
   models: { model: string | null; costUsd: number }[];
   people: { principalId: string | null; costUsd: number }[];
   live: { costUsd: number };
-  cron: { costUsd: number };
-  background: { costUsd: number };
+  background: { costUsd: number; sources: Record<BackgroundSource, { costUsd: number }> };
 }
 
 export interface SpendReport {
@@ -78,6 +104,7 @@ export interface SpendReport {
   series: SpendSeriesPoint[];
   people: SpendEntity[];
   scopes: SpendEntity[];
+  crons: SpendCron[];
   models: ({ model: string | null } & SpendTotals)[];
 }
 
@@ -87,7 +114,8 @@ export interface SpendExportRow extends Tally {
   kind: string;
   principalId: string | null;
   displayName: string;
-  origin: OriginBucket;
+  source: SpendSource;
+  cronId: string | null;
   model: string | null;
 }
 
@@ -96,7 +124,11 @@ export interface SpendSummaryOptions {
   to: number;
   bucket: SpendBucket;
   label: (scopeId: ScopeId) => string;
+  cron: (cronId: string) => SpendCronInfo | null;
+  person: PersonOf;
 }
+
+export type PersonOf = (ref: string) => { userId: string | null; principalId: string };
 
 interface Tally {
   costUsd: number;
@@ -108,19 +140,30 @@ interface Tally {
 }
 
 interface EntityAccumulator {
+  userId: string | null;
   principalId: string | null;
   scopeId: ScopeId;
   kind: string;
   sources: ScopeId[];
-  byOrigin: Record<OriginBucket, Tally>;
+  bySource: Record<SpendSource, Tally>;
 }
 
 function emptyTally(): Tally {
   return { costUsd: 0, calls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 }
 
-function emptyOrigins(): Record<OriginBucket, Tally> {
-  return { live: emptyTally(), cron: emptyTally(), background: emptyTally() };
+function emptySources(): Record<SpendSource, Tally> {
+  return Object.fromEntries(SPEND_SOURCES.map((source) => [source, emptyTally()])) as Record<SpendSource, Tally>;
+}
+
+function backgroundSources<T>(value: (source: BackgroundSource) => T): Record<BackgroundSource, T> {
+  return Object.fromEntries(BACKGROUND_SOURCES.map((source) => [source, value(source)])) as Record<BackgroundSource, T>;
+}
+
+function backgroundTally(bySource: Record<SpendSource, Tally>): Tally {
+  const total = emptyTally();
+  for (const source of BACKGROUND_SOURCES) addTally(total, bySource[source]);
+  return total;
 }
 
 function addRow(t: Tally, r: SpendRow): void {
@@ -149,10 +192,8 @@ function bucketTotals(t: Tally): SpendBucketTotals {
   return { costUsd: t.costUsd, calls: t.calls, tokens: tokensOf(t) };
 }
 
-function originBucket(origin: SessionOrigin): OriginBucket {
-  if (origin === "conversation") return "live";
-  if (origin === "cron") return "cron";
-  return "background";
+function spendSource(origin: SessionOrigin): SpendSource {
+  return origin === "conversation" ? "live" : origin;
 }
 
 function isoDay(day: number): string {
@@ -163,9 +204,11 @@ function weekStart(day: number): number {
   return day - ((day + 3) % 7);
 }
 
-function totalsOf(byOrigin: Record<OriginBucket, Tally>): SpendTotals {
+function totalsOf(bySource: Record<SpendSource, Tally>): SpendTotals {
+  const background = backgroundTally(bySource);
   const total = emptyTally();
-  for (const bucket of ORIGIN_BUCKETS) addTally(total, byOrigin[bucket]);
+  addTally(total, bySource.live);
+  addTally(total, background);
   return {
     costUsd: total.costUsd,
     calls: total.calls,
@@ -179,18 +222,25 @@ function totalsOf(byOrigin: Record<OriginBucket, Tally>): SpendTotals {
       cacheWrite: total.cacheWrite,
       uncachedInput: total.input,
     }),
-    live: bucketTotals(byOrigin.live),
-    cron: bucketTotals(byOrigin.cron),
-    background: bucketTotals(byOrigin.background),
+    live: bucketTotals(bySource.live),
+    background: {
+      ...bucketTotals(background),
+      sources: backgroundSources((source) => bucketTotals(bySource[source])),
+    },
   };
 }
 
-function resolveScope(scopeId: ScopeId): { key: ScopeId; person: string | null; kind: string } {
+function resolveScope(
+  scopeId: ScopeId,
+  personOf: PersonOf,
+): { key: ScopeId; person: string | null; userId: string | null; kind: string } {
   const parsed = parseScopeId(scopeId);
-  const person = parsed.kind === "personal" && parsed.ref ? canonicalPerson(parsed.ref) : null;
+  const resolved = parsed.kind === "personal" && parsed.ref ? personOf(parsed.ref) : null;
+  const person = resolved?.principalId ?? null;
   return {
     key: person === null ? scopeId : personalScope(person),
     person,
+    userId: resolved?.userId ?? null,
     kind: person === null ? (parsed.kind ?? "unknown") : "person",
   };
 }
@@ -201,11 +251,12 @@ function displayNameOf(sources: readonly ScopeId[], label: (scopeId: ScopeId) =>
 
 function entityOf(acc: EntityAccumulator, label: (scopeId: ScopeId) => string): SpendEntity {
   return {
+    userId: acc.userId,
     principalId: acc.principalId,
     scopeId: acc.scopeId,
     kind: acc.kind,
     displayName: displayNameOf(acc.sources, label),
-    ...totalsOf(acc.byOrigin),
+    ...totalsOf(acc.bySource),
   };
 }
 
@@ -216,52 +267,56 @@ function byCodePoint(a: string | null, b: string | null): number {
   return a < b ? -1 : 1;
 }
 
-function byCostThenId(a: SpendEntity, b: SpendEntity): number {
-  if (a.costUsd !== b.costUsd) return b.costUsd - a.costUsd;
-  return byCodePoint(a.scopeId, b.scopeId);
+function byCostThen<T extends { costUsd: number }>(id: (row: T) => string | null): (a: T, b: T) => number {
+  return (a, b) => (a.costUsd !== b.costUsd ? b.costUsd - a.costUsd : byCodePoint(id(a), id(b)));
 }
 
-function byCostThenModel(
-  a: { model: string | null; costUsd: number },
-  b: { model: string | null; costUsd: number },
-): number {
-  if (a.costUsd !== b.costUsd) return b.costUsd - a.costUsd;
-  return byCodePoint(a.model, b.model);
-}
+const byCostThenId = byCostThen<SpendEntity>((entity) => entity.scopeId);
+const byCostThenModel = byCostThen<{ model: string | null; costUsd: number }>((row) => row.model);
+const byCostThenCron = byCostThen<SpendCron>((row) => row.cronId);
 
 export function summarizeSpend(rows: readonly SpendRow[], opts: SpendSummaryOptions): SpendReport {
   const accumulators = new Map<string, EntityAccumulator>();
   const buckets = new Map<
     number,
-    { byOrigin: Record<OriginBucket, Tally>; models: Map<string | null, number>; people: Map<string | null, number> }
+    { bySource: Record<SpendSource, Tally>; models: Map<string | null, number>; people: Map<string | null, number> }
   >();
-  const modelBuckets = new Map<string | null, Record<OriginBucket, Tally>>();
-  const orgOrigins = emptyOrigins();
+  const modelBuckets = new Map<string | null, Record<SpendSource, Tally>>();
+  const cronBuckets = new Map<string, { scopeId: ScopeId; bySource: Record<SpendSource, Tally> }>();
+  const orgSources = emptySources();
   for (const row of rows) {
-    const { key, person, kind } = resolveScope(row.scopeId);
+    const { key, person, userId, kind } = resolveScope(row.scopeId, opts.person);
     let acc = accumulators.get(key);
     if (!acc) {
-      acc = { principalId: person, scopeId: key, kind, sources: [], byOrigin: emptyOrigins() };
+      acc = { userId, principalId: person, scopeId: key, kind, sources: [], bySource: emptySources() };
       accumulators.set(key, acc);
     }
     if (!acc.sources.includes(row.scopeId)) acc.sources.push(row.scopeId);
-    const origin = originBucket(row.origin);
-    addRow(acc.byOrigin[origin], row);
-    addRow(orgOrigins[origin], row);
+    const source = spendSource(row.origin);
+    addRow(acc.bySource[source], row);
+    addRow(orgSources[source], row);
+    if (row.cronId !== null) {
+      let cron = cronBuckets.get(row.cronId);
+      if (!cron) {
+        cron = { scopeId: row.scopeId, bySource: emptySources() };
+        cronBuckets.set(row.cronId, cron);
+      }
+      addRow(cron.bySource[source], row);
+    }
     let model = modelBuckets.get(row.model);
     if (!model) {
-      model = emptyOrigins();
+      model = emptySources();
       modelBuckets.set(row.model, model);
     }
-    addRow(model[origin], row);
+    addRow(model[source], row);
 
     const bucketKey = opts.bucket === "week" ? weekStart(row.day) : row.day;
     let bucket = buckets.get(bucketKey);
     if (!bucket) {
-      bucket = { byOrigin: emptyOrigins(), models: new Map(), people: new Map() };
+      bucket = { bySource: emptySources(), models: new Map(), people: new Map() };
       buckets.set(bucketKey, bucket);
     }
-    addRow(bucket.byOrigin[origin], row);
+    addRow(bucket.bySource[source], row);
     bucket.models.set(row.model, (bucket.models.get(row.model) ?? 0) + row.costUsd);
     bucket.people.set(person, (bucket.people.get(person) ?? 0) + row.costUsd);
   }
@@ -270,15 +325,27 @@ export function summarizeSpend(rows: readonly SpendRow[], opts: SpendSummaryOpti
   const people = entities.filter((e) => e.principalId !== null).sort(byCostThenId);
   const scopes = entities.filter((e) => e.principalId === null).sort(byCostThenId);
 
+  const crons = [...cronBuckets.entries()]
+    .map(([cronId, { scopeId, bySource }]) => ({
+      cronId,
+      scopeId,
+      scopeName: opts.label(scopeId),
+      info: opts.cron(cronId),
+      ...totalsOf(bySource),
+    }))
+    .sort(byCostThenCron);
+
   const models = [...modelBuckets.entries()]
-    .map(([model, byOrigin]) => ({ model, ...totalsOf(byOrigin) }))
+    .map(([model, bySource]) => ({ model, ...totalsOf(bySource) }))
     .sort(byCostThenModel);
 
   const series = [...buckets.entries()]
     .sort(([a], [b]) => a - b)
-    .map(([day, { byOrigin, models, people }]) => {
+    .map(([day, { bySource, models, people }]) => {
+      const background = backgroundTally(bySource);
       const total = emptyTally();
-      for (const bucket of ORIGIN_BUCKETS) addTally(total, byOrigin[bucket]);
+      addTally(total, bySource.live);
+      addTally(total, background);
       return {
         day: isoDay(day),
         costUsd: total.costUsd,
@@ -287,9 +354,11 @@ export function summarizeSpend(rows: readonly SpendRow[], opts: SpendSummaryOpti
         people: [...people]
           .sort(([a], [b]) => byCodePoint(a, b))
           .map(([principalId, costUsd]) => ({ principalId, costUsd })),
-        live: { costUsd: byOrigin.live.costUsd },
-        cron: { costUsd: byOrigin.cron.costUsd },
-        background: { costUsd: byOrigin.background.costUsd },
+        live: { costUsd: bySource.live.costUsd },
+        background: {
+          costUsd: background.costUsd,
+          sources: backgroundSources((source) => ({ costUsd: bySource[source].costUsd })),
+        },
       };
     });
 
@@ -299,24 +368,29 @@ export function summarizeSpend(rows: readonly SpendRow[], opts: SpendSummaryOpti
       to: isoDay(Math.floor(opts.to / DAY_MS)),
       bucket: opts.bucket,
     },
-    org: totalsOf(orgOrigins),
+    org: totalsOf(orgSources),
     series,
     people,
     scopes,
+    crons,
     models,
   };
 }
 
-export function spendExportRows(rows: readonly SpendRow[], label: (scopeId: ScopeId) => string): SpendExportRow[] {
+export function spendExportRows(
+  rows: readonly SpendRow[],
+  label: (scopeId: ScopeId) => string,
+  personOf: PersonOf,
+): SpendExportRow[] {
   const sources = new Map<ScopeId, ScopeId[]>();
   const merged = new Map<string, SpendExportRow>();
   for (const row of rows) {
-    const { key: scopeId, person, kind } = resolveScope(row.scopeId);
+    const { key: scopeId, person, kind } = resolveScope(row.scopeId, personOf);
     const seen = sources.get(scopeId);
     if (!seen) sources.set(scopeId, [row.scopeId]);
     else if (!seen.includes(row.scopeId)) seen.push(row.scopeId);
-    const origin = originBucket(row.origin);
-    const key = JSON.stringify([row.day, scopeId, origin, row.model]);
+    const source = spendSource(row.origin);
+    const key = JSON.stringify([row.day, scopeId, source, row.cronId, row.model]);
     let out = merged.get(key);
     if (!out) {
       out = {
@@ -325,7 +399,8 @@ export function spendExportRows(rows: readonly SpendRow[], label: (scopeId: Scop
         kind,
         principalId: person,
         displayName: "",
-        origin,
+        source,
+        cronId: row.cronId,
         model: row.model,
         ...emptyTally(),
       };
@@ -339,7 +414,8 @@ export function spendExportRows(rows: readonly SpendRow[], label: (scopeId: Scop
       (a, b) =>
         byCodePoint(a.day, b.day) ||
         byCodePoint(a.scopeId, b.scopeId) ||
-        ORIGIN_BUCKETS.indexOf(a.origin) - ORIGIN_BUCKETS.indexOf(b.origin) ||
+        SPEND_SOURCES.indexOf(a.source) - SPEND_SOURCES.indexOf(b.source) ||
+        byCodePoint(a.cronId ?? "", b.cronId ?? "") ||
         byCodePoint(a.model ?? "", b.model ?? ""),
     );
 }
@@ -351,23 +427,42 @@ function csvCell(value: string | number | null): string {
   return CSV_NEEDS_QUOTES.test(defanged) ? `"${defanged.replaceAll('"', '""')}"` : defanged;
 }
 
-export function spendCsv(report: SpendReport, breakdown: SpendBreakdown = "entity"): string {
-  const modelBreakdown = breakdown === "model";
-  const header = modelBreakdown ? ["model"] : ["principal_id", "scope_id", "kind", "display_name"];
-  const rows = modelBreakdown
-    ? report.models.map((row) => ({ labels: [row.model ?? "Unknown model"], totals: row }))
-    : [...report.people, ...report.scopes].map((row) => ({
-        labels: [row.principalId, row.scopeId, row.kind, row.displayName],
+function csvBreakdown(
+  report: SpendReport,
+  breakdown: SpendBreakdown,
+): { header: string[]; rows: { labels: (string | null)[]; totals: SpendTotals }[] } {
+  if (breakdown === "model")
+    return {
+      header: ["model"],
+      rows: report.models.map((row) => ({ labels: [row.model ?? "Unknown model"], totals: row })),
+    };
+  if (breakdown === "cron")
+    return {
+      header: ["cron_id", "title", "owner", "scope_id"],
+      rows: report.crons.map((row) => ({
+        labels: [row.cronId, row.info?.title ?? null, row.info?.owner ?? null, row.scopeId],
         totals: row,
-      }));
+      })),
+    };
+  return {
+    header: ["principal_id", "scope_id", "kind", "display_name"],
+    rows: [...report.people, ...report.scopes].map((row) => ({
+      labels: [row.principalId, row.scopeId, row.kind, row.displayName],
+      totals: row,
+    })),
+  };
+}
+
+export function spendCsv(report: SpendReport, breakdown: SpendBreakdown = "entity"): string {
+  const { header, rows } = csvBreakdown(report, breakdown);
   const lines = [[...header, ...CSV_TOTALS_HEADER].join(",")];
   for (const { labels, totals: row } of rows) {
     lines.push(
       [
         ...labels,
         row.live.costUsd,
-        row.cron.costUsd,
         row.background.costUsd,
+        ...BACKGROUND_SOURCES.map((source) => row.background.sources[source].costUsd),
         row.costUsd,
         row.calls,
         row.input,
@@ -397,11 +492,56 @@ function parseBound(raw: string): number | null {
   return Number.isSafeInteger(parsed) && Number.isFinite(new Date(parsed).getTime()) ? parsed : null;
 }
 
+function spendBucket(url: URL): SpendBucket | null {
+  const bucket = url.searchParams.get("bucket") ?? "day";
+  return bucket === "day" || bucket === "week" ? bucket : null;
+}
+
+function spendDays(url: URL): { from: number; to: number } | string {
+  const from = parseDay(url.searchParams.get("from") ?? "");
+  const to = parseDay(url.searchParams.get("to") ?? "");
+  if (from === null || to === null) return "from and to must be YYYY-MM-DD dates (UTC)";
+  if (to <= from || to - from > MAX_SPEND_DAYS * DAY_MS)
+    return `to must be later than from and at most ${MAX_SPEND_DAYS} days after it`;
+  return { from, to };
+}
+
 async function loadSpendRows(
   sessions: SessionStore,
   range: { from: number; to: number },
 ): Promise<{ rows: SpendRow[]; asOf?: number }> {
   return sessions.spendReport ? sessions.spendReport(range) : { rows: await sessions.spendRollup(range) };
+}
+
+function cronInfo(cron: Cron): SpendCronInfo {
+  const { id, title, message, action, owner, ownerScopeId, schedule, enabled, archived } = cron;
+  return { id, title, message, action, owner, ownerScopeId, schedule, enabled, archived };
+}
+
+async function cronInfoLookup(
+  app: BaseCtx["app"],
+  rows: readonly { cronId: string | null }[],
+): Promise<Map<string, SpendCronInfo>> {
+  const ids = [...new Set(rows.flatMap((row) => (row.cronId === null ? [] : [row.cronId])))];
+  const crons = new Map<string, SpendCronInfo>();
+  for (let start = 0; start < ids.length; start += CRON_LOOKUP_CONCURRENCY) {
+    const batch = await Promise.all(ids.slice(start, start + CRON_LOOKUP_CONCURRENCY).map((id) => app.getCron(id)));
+    for (const cron of batch) if (cron) crons.set(cron.id, cronInfo(cron));
+  }
+  return crons;
+}
+
+async function peopleOf(deps: BaseCtx["deps"], rows: readonly { scopeId: ScopeId }[]): Promise<PersonOf> {
+  const refs = new Set<string>();
+  for (const { scopeId } of rows) {
+    const parsed = parseScopeId(scopeId);
+    if (parsed.kind === "personal" && parsed.ref) refs.add(parsed.ref);
+  }
+  const users = (await deps.admin?.users.resolve([...refs])) ?? new Map();
+  return (ref) => {
+    const user = users.get(ref);
+    return user ? { userId: user.id, principalId: user.principalId } : { userId: null, principalId: ref };
+  };
 }
 
 export async function spendExport(ctx: BaseCtx): Promise<void> {
@@ -412,16 +552,10 @@ export async function spendExport(ctx: BaseCtx): Promise<void> {
   if (typeof authorization !== "string" || !constantTimeEqual(authorization, `Bearer ${token}`))
     return sendJson(res, 401, { error: "unauthorized" });
   if (!deps.sessions) return sendJson(res, 503, { error: "spend_unavailable" });
-  const from = parseDay(url.searchParams.get("from") ?? "");
-  const to = parseDay(url.searchParams.get("to") ?? "");
-  if (from === null || to === null)
-    return sendJson(res, 400, { error: "bad_request", message: "from and to must be YYYY-MM-DD dates (UTC)" });
-  if (to <= from || to - from > EXPORT_MAX_DAYS * DAY_MS)
-    return sendJson(res, 400, {
-      error: "bad_request",
-      message: `to must be later than from and at most ${EXPORT_MAX_DAYS} days after it`,
-    });
-  const { rows, asOf } = await loadSpendRows(deps.sessions, { from, to });
+  const days = spendDays(url);
+  if (typeof days === "string") return sendJson(res, 400, { error: "bad_request", message: days });
+  const { from, to } = days;
+  const { rows, asOf } = await loadSpendRows(deps.sessions, days);
   const labels = await discoverScopes(
     app,
     deps,
@@ -429,7 +563,18 @@ export async function spendExport(ctx: BaseCtx): Promise<void> {
   );
   const scope = orgScope(deps);
   const window = { from: isoDay(from / DAY_MS), to: isoDay(to / DAY_MS) };
-  const exported = spendExportRows(rows, (id) => labels.get(id) ?? "");
+  const exported = spendExportRows(rows, (id) => labels.get(id) ?? "", await peopleOf(deps, rows));
+  const crons: SpendExportCron[] = [...(await cronInfoLookup(app, exported)).values()]
+    .sort((a, b) => byCodePoint(a.id, b.id))
+    .map(({ id, title, owner, ownerScopeId, schedule, enabled, archived }) => ({
+      id,
+      title,
+      owner,
+      ownerScopeId,
+      schedule,
+      enabled,
+      archived,
+    }));
   audit(deps, {
     principalId: SPEND_EXPORT_PRINCIPAL,
     action: "spend.export",
@@ -437,7 +582,7 @@ export async function spendExport(ctx: BaseCtx): Promise<void> {
     scopeLabel: scope,
     detail: `${window.from}..${window.to} rows=${exported.length}`,
   });
-  sendJson(res, 200, { scopeId: scope, window, ...(asOf === undefined ? {} : { asOf }), rows: exported });
+  sendJson(res, 200, { scopeId: scope, window, ...(asOf === undefined ? {} : { asOf }), rows: exported, crons });
 }
 
 export async function spend(ctx: ApiCtx): Promise<void> {
@@ -448,13 +593,13 @@ export async function spend(ctx: ApiCtx): Promise<void> {
   audit(deps, { principalId: actor.id, action: "spend.read", resource: "spend", scopeLabel: scope });
 
   const bad = (message: string) => sendJson(res, 400, { error: "bad_request", message });
-  const bucket = url.searchParams.get("bucket") ?? "day";
-  if (bucket !== "day" && bucket !== "week") return bad('bucket must be "day" or "week"');
+  const bucket = spendBucket(url);
+  if (!bucket) return bad('bucket must be "day" or "week"');
   const format = url.searchParams.get("format") ?? "json";
   if (format !== "json" && format !== "csv") return bad('format must be "json" or "csv"');
 
-  const breakdown = url.searchParams.get("breakdown") ?? "entity";
-  if (breakdown !== "entity" && breakdown !== "model") return bad('breakdown must be "entity" or "model"');
+  const breakdown = SPEND_BREAKDOWNS.find((value) => value === (url.searchParams.get("breakdown") ?? "entity"));
+  if (!breakdown) return bad('breakdown must be "entity", "model" or "cron"');
 
   const toRaw = url.searchParams.get("to");
   const to = toRaw === null ? Math.floor(Date.now() / DAY_MS) * DAY_MS + DAY_MS : parseBound(toRaw);
@@ -472,7 +617,16 @@ export async function spend(ctx: ApiCtx): Promise<void> {
     deps,
     rows.map((r) => r.scopeId),
   );
-  const report = summarizeSpend(rows, { from, to, bucket, label: (id) => labels.get(id) ?? "" });
+  const crons =
+    format === "csv" && breakdown !== "cron" ? new Map<string, SpendCronInfo>() : await cronInfoLookup(app, rows);
+  const report = summarizeSpend(rows, {
+    from,
+    to,
+    bucket,
+    label: (id) => labels.get(id) ?? "",
+    cron: (cronId) => crons.get(cronId) ?? null,
+    person: await peopleOf(deps, rows),
+  });
   if (format === "json")
     return sendJson(res, 200, { scopeId: scope, ...report, ...(asOf === undefined ? {} : { asOf }) });
 
@@ -481,10 +635,51 @@ export async function spend(ctx: ApiCtx): Promise<void> {
     "content-type": contentTypeWithUtf8Charset("text/csv"),
     "content-length": String(Buffer.byteLength(body)),
     "content-disposition": contentDispositionAttachment(
-      `qm-spend-${breakdown === "model" ? "models-" : ""}${report.window.from}-${report.window.to}.csv`,
+      `qm-spend-${breakdown === "entity" ? "" : `${breakdown}s-`}${report.window.from}-${report.window.to}.csv`,
     ),
     "x-content-type-options": "nosniff",
   });
   res.end(body);
   return;
+}
+
+export async function selfSpend(ctx: ApiCtx): Promise<void> {
+  const { res, app, deps, url } = ctx;
+  const bad = (message: string) => sendJson(res, 400, { error: "bad_request", message });
+  const principalId = url.searchParams.get("principalId");
+  if (!principalId) return bad("principalId required");
+  const days = spendDays(url);
+  if (typeof days === "string") return bad(days);
+  const bucket = spendBucket(url);
+  if (!bucket) return bad('bucket must be "day" or "week"');
+  if (!deps.sessions) return sendJson(res, 503, { error: "spend_unavailable" });
+
+  const [contexts, crons, { rows, asOf }] = await Promise.all([
+    app.listContexts(principalId),
+    app.listCronsForViewer(principalId),
+    loadSpendRows(deps.sessions, days),
+  ]);
+  const person = await peopleOf(deps, [...rows, { scopeId: personalScope(principalId) }]);
+  const me = resolveScope(personalScope(principalId), person).key;
+  const shared = new Map(
+    contexts.flatMap((context) =>
+      context.kind === "personal" ? [] : [[context.scopeId, context.name ?? ""] as const],
+    ),
+  );
+  const info = new Map([...crons.owned, ...crons.visible].map((cron) => [cron.id, cronInfo(cron)]));
+  const owned = new Set(crons.owned.map((cron) => cron.id));
+  const visible = new Set(
+    [...new Set(rows.map((row) => row.scopeId))].filter((id) => shared.has(id) || resolveScope(id, person).key === me),
+  );
+  const report = summarizeSpend(
+    rows.filter((row) => visible.has(row.scopeId)),
+    { ...days, bucket, label: (id) => shared.get(id) ?? "", cron: (id) => info.get(id) ?? null, person },
+  );
+  audit(deps, { principalId, action: "spend.self.read", resource: "spend", scopeLabel: me });
+  return sendJson(res, 200, {
+    scopeId: me,
+    ...report,
+    crons: report.crons.map((cron) => ({ ...cron, owned: owned.has(cron.cronId) })),
+    ...(asOf === undefined ? {} : { asOf }),
+  });
 }

@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { httpDeploymentLayerTransport, type DeploymentLayerTransport } from "../deployment-layer.ts";
 
 import { randomBytes } from "node:crypto";
@@ -9,7 +10,6 @@ import {
   capture,
   captureBoth,
   deploymentSecretValue,
-  isInvalidSecret,
   readEnvFile,
   resolveBuildRepoRoot,
   runInherit,
@@ -24,6 +24,7 @@ import {
   ordered,
   brandEnvOf,
   orgEnv,
+  PUBLIC_PORT,
   runnableServices,
   hostedServiceEnv,
   serviceHost,
@@ -35,8 +36,15 @@ import {
 } from "../services.ts";
 import { dockerBasePort, localSandboxActive, sandboxCoreEnv, securityScreenEnv, type QmConfig } from "../config.ts";
 import { discoverPlugins, type ResolvedPlugin } from "../plugins.ts";
-import { computedSecrets, runtimeSecretNames, secretsForService } from "../secrets.ts";
-import { readDeploymentState, withDeploymentLock, writeDeploymentState, type DeploymentState } from "../state.ts";
+import { computedSecrets, missingRequiredSecrets, runtimeSecretNames, secretsForService } from "../secrets.ts";
+import { doctorCommon, localDoctorSecrets } from "./doctor.ts";
+import {
+  deploymentDir,
+  readDeploymentState,
+  withDeploymentLock,
+  writeDeploymentState,
+  type DeploymentState,
+} from "../state.ts";
 
 /** Deployment-layer transport for docker: signed HTTP to the locally published core port. */
 export const dockerDeploymentLayerTransport: DeploymentLayerTransport = httpDeploymentLayerTransport({
@@ -47,6 +55,18 @@ const safe = (s: string): string => s.replace(/[^A-Za-z0-9_.-]/g, "-");
 const ORG_LABEL_KEY = "qm.org";
 const orgLabelArgs = (ctx: DockerCtx): string[] => ["--label", `${ORG_LABEL_KEY}=${ctx.config.orgId}`];
 const baseHostPort = (ctx: DockerCtx): number => dockerBasePort(ctx.config);
+const publicHostPort = (ctx: DockerCtx): number => baseHostPort(ctx) + 2;
+const publicBindAddress = (config: QmConfig): string =>
+  ["localhost", "127.0.0.1", "[::1]"].includes(new URL(config.publicUrl).hostname) ? "127.0.0.1:" : "";
+
+function requireFrontDoorPort(config: QmConfig): void {
+  const url = new URL(config.publicUrl);
+  const port = dockerBasePort(config) + 2;
+  if (publicBindAddress(config) && Number(url.port || 80) !== port)
+    throw new CliError(
+      `publicUrl ${url.origin} must use port ${port}, where qm up publishes core's front door (QM_BASE_PORT or basePort + 2)`,
+    );
+}
 
 interface DockerCtx {
   config: QmConfig;
@@ -209,9 +229,8 @@ function resolveImage(ctx: DockerCtx, service: ServiceName): string {
     const dockerfile = join(root, "deploy", service, "Dockerfile");
     if (!existsSync(dockerfile)) throw new CliError(`no Dockerfile at ${dockerfile}`);
     const tag = `qm-${service}:local`;
-    const buildArgs: string[] = [];
     step(`building ${service} from ${dockerfile}`);
-    dockerInherit(["build", "-f", dockerfile, "-t", tag, ...buildArgs, root]);
+    dockerInherit(["build", "-f", dockerfile, "-t", tag, root]);
     return tag;
   }
   const ref = imageRef(ctx, service);
@@ -248,7 +267,7 @@ function externalDatabaseUrl(ctx: DockerCtx): string | undefined {
   return process.env.DATABASE_URL ?? readEnvValue(ctx.envFile, "DATABASE_URL");
 }
 
-function ensurePostgres(ctx: DockerCtx, dryRun: boolean): string {
+async function ensurePostgres(ctx: DockerCtx, dryRun: boolean): Promise<string> {
   const fromEnv = externalDatabaseUrl(ctx);
   if (fromEnv) {
     step("Postgres: using DATABASE_URL from the environment");
@@ -262,7 +281,7 @@ function ensurePostgres(ctx: DockerCtx, dryRun: boolean): string {
     step(`Postgres: would run ${pgName} (image pgvector/pgvector:0.8.1-pg16, volume ${pgVolume(ctx)})`);
     return url(readDeploymentState(ctx.config.orgId)?.pgPassword ?? "<generated>");
   }
-  return withDeploymentLock(ctx.config.orgId, () => {
+  return withDeploymentLock(join(deploymentDir(ctx.config.orgId), "up.lock"), async () => {
     const state = readDeploymentState(ctx.config.orgId);
     let password: string;
     const existing = pgContainerPassword(ctx);
@@ -352,23 +371,18 @@ export function dockerServiceEnv(config: QmConfig, service: ServiceName): Record
   const def = serviceDef(service);
   const out: Record<string, string> = {
     [def.docker.portEnv]: String(def.docker.internalPort),
-    CORE_API_URL: "http://core:8080",
-    ...orgEnv(service, config.orgId, config.publicUrl, config.services.includes("portal"), brandEnvOf(config)),
+    ...orgEnv(service, config.orgId, config.publicUrl, brandEnvOf(config)),
   };
-  if (service === "core" && localSandboxActive(config)) {
+  if (service !== "core") return { ...out, CORE_API_URL: "http://core:8080" };
+  if (localSandboxActive(config)) {
     out.DOCKER_HOST = "unix:///var/run/docker.sock";
     out.QM_CORE_CONTAINER = `${dockerPrefix(config)}-core`;
-  }
-  if (service === "portal") {
-    if (config.services.includes("web-ui")) out.WEB_UI_UPSTREAM = "http://web-ui:8080";
-    if (config.services.includes("admin")) out.ADMIN_UPSTREAM = "http://web-ui:8080/admin";
   }
   if (config.services.includes("auth")) {
     Object.assign(
       out,
-      brokerWiring(service, {
+      brokerWiring({
         publicUrl: config.publicUrl,
-        authBaseUrl: `http://${dockerPrefix(config)}-auth.internal:8080`,
         ...(config.env.auth?.AUTH_ALLOWED_EMAIL_DOMAIN
           ? { allowedEmailDomain: config.env.auth.AUTH_ALLOWED_EMAIL_DOMAIN }
           : {}),
@@ -382,27 +396,15 @@ function serviceEnv(ctx: DockerCtx, service: ServiceName): Record<string, string
   const { config } = ctx;
   const out: Record<string, string> = {};
   if (ctx.signingSecret) out.CORE_SIGNING_SECRET = ctx.signingSecret;
+  Object.assign(out, dockerServiceEnv(config, service));
   if (service === "core") {
-    Object.assign(
-      out,
-      orgEnv("core", config.orgId, config.publicUrl, config.services.includes("portal"), brandEnvOf(config)),
-    );
-    out.PORT = "8080";
     out.DATA_DIR = "/data";
-    out.SESSION_STORE = "postgres";
-    out.RUN_STORE = "postgres";
     out.DATABASE_URL = ctx.databaseUrl;
     if (config.model) out.PI_MODEL = config.model;
     if (config.modelProvider) out.MODEL_PROVIDER = config.modelProvider;
     const layerSubs = existingLayerSubdirs(ctx);
     if (layerSubs.length) out.DEPLOYMENT_LAYER = "/layer";
     Object.assign(out, ctx.sandboxEnv);
-    if (localSandboxActive(config)) {
-      out.DOCKER_HOST = "unix:///var/run/docker.sock";
-      out.QM_CORE_CONTAINER = `${ctx.prefix}-core`;
-    }
-  } else {
-    Object.assign(out, dockerServiceEnv(config, service));
   }
   const virtualEnv = service === "core" ? virtualServiceEnv(config.services, config.env) : {};
   const env = {
@@ -499,6 +501,7 @@ function runArgs(ctx: DockerCtx, service: ServiceName, image: string): { args: s
   if (def.docker.hostPortOffset !== undefined) {
     args.push("-p", `${baseHostPort(ctx) + def.docker.hostPortOffset}:${def.docker.internalPort}`);
   }
+  if (service === "core") args.push("-p", `${publicBindAddress(ctx.config)}${publicHostPort(ctx)}:${PUBLIC_PORT}`);
   args.push(image);
   return { args, cleanup };
 }
@@ -520,22 +523,42 @@ function noteLogTail(name: string, logs: string): void {
   note(tailString(logs, 25));
 }
 
+function frontDoorProbe(name: string): string | null {
+  const r = spawnSync(
+    "docker",
+    [
+      "exec",
+      name,
+      "node",
+      "-e",
+      `fetch("http://127.0.0.1:${PUBLIC_PORT}/healthz").then((r) => process.exit(r.ok ? 0 : (console.error("HTTP " + r.status), 1)), (e) => (console.error(e.message), process.exit(1)))`,
+    ],
+    { encoding: "utf8" },
+  );
+  return r.status === 0 ? null : `${r.stderr ?? ""}${r.stdout ?? ""}`.trim() || `docker exec exited ${r.status}`;
+}
+
 async function waitReady(ctx: DockerCtx, service: ServiceName): Promise<void> {
-  const def = serviceDef(service);
   const name = cname(ctx, service);
+  let last = "no log line matched yet";
   for (let i = 0; i < 90; i++) {
-    const logs = captureBoth("docker", ["logs", name]);
-    if (def.readiness.test(logs)) {
+    const ready =
+      service === "core"
+        ? (last = frontDoorProbe(name) ?? "") === ""
+        : serviceDef(service).readiness.test(captureBoth("docker", ["logs", name]));
+    if (ready) {
       persistRestart(name);
       return;
     }
     if (!containerRunning(name)) {
+      const logs = captureBoth("docker", ["logs", name]);
       noteLogTail(name, logs);
       throw new CliError(`${service} exited before becoming ready (see logs above)`);
     }
     await sleep(1000);
   }
-  throw new CliError(`${service} did not become ready in 90s`);
+  noteLogTail(name, captureBoth("docker", ["logs", name]));
+  throw new CliError(`${service} did not become ready in 90s (last check: ${last})`);
 }
 
 async function waitPluginUp(name: string): Promise<void> {
@@ -602,14 +625,20 @@ function warnUnforwardedEnvKeys(ctx: DockerCtx): void {
   );
 }
 
-function missingRequiredOperatorSecrets(ctx: DockerCtx): string[] {
-  const lookup = (name: string): string | undefined => deploymentSecretValue(name, readEnvValue(ctx.envFile, name));
-  return computedSecrets(ctx.config)
-    .filter(
-      (secret) =>
-        secret.required && secret.managedBy === "operator" && isInvalidSecret(secret.name, lookup(secret.name)),
-    )
-    .map((secret) => secret.name);
+function missingRequiredOperatorSecrets(config: QmConfig, values: ReadonlyMap<string, string>): string[] {
+  return missingRequiredSecrets(
+    computedSecrets(config).filter((secret) => secret.managedBy === "operator"),
+    (name) => deploymentSecretValue(name, values.get(name)),
+  );
+}
+
+export async function dockerDoctor(config: QmConfig, configDir: string, envFile?: string): Promise<void> {
+  const values = localDoctorSecrets(configDir, envFile);
+  requireFrontDoorPort(config);
+  const missing = missingRequiredOperatorSecrets(config, values);
+  if (missing.length) throw new CliError(`required secrets are missing or placeholders: ${missing.join(", ")}`);
+  step("required operator secret values: ok");
+  await doctorCommon(config, values, { configDir });
 }
 
 export async function dockerUp(
@@ -617,6 +646,7 @@ export async function dockerUp(
   configDir: string,
   opts: { sandboxDir?: string; buildFrom?: boolean; buildFromPath?: string; envFile?: string; dryRun?: boolean } = {},
 ): Promise<void> {
+  requireFrontDoorPort(config);
   if (!opts.dryRun) requireDocker();
   const resolvedLocalImage = localSandboxActive(config) ? localSandboxImage(config) : undefined;
   const ctx = buildCtx(config, configDir, {
@@ -634,18 +664,23 @@ export async function dockerUp(
   for (const name of ctx.missingSandboxSecrets) {
     warn(`sandbox.secretEnv "${name}" has no value in .env or the environment — it won't be set in the sandbox.`);
   }
-  const missingRequired = missingRequiredOperatorSecrets(ctx);
+  const missingRequired = missingRequiredOperatorSecrets(
+    ctx.config,
+    ctx.envFile ? readEnvFile(ctx.envFile) : new Map(),
+  );
   if (opts.dryRun && missingRequired.length) {
     warn(`MISSING required secrets — add them to .env before up: ${missingRequired.join(", ")}`);
   }
 
   if (opts.dryRun) {
-    ctx.databaseUrl = ensurePostgres(ctx, true);
+    ctx.databaseUrl = await ensurePostgres(ctx, true);
     step(`network: ${ctx.network}`);
     if (resolvedLocalImage) step(`sandbox: local image ${resolvedLocalImage}`);
     for (const def of ordered(runnableServices(config.services))) {
       const ports =
-        def.docker.hostPortOffset !== undefined ? ` (host :${baseHostPort(ctx) + def.docker.hostPortOffset})` : "";
+        def.docker.hostPortOffset !== undefined
+          ? ` (host :${baseHostPort(ctx) + def.docker.hostPortOffset}${def.name === "core" ? `, public :${publicHostPort(ctx)}` : ""})`
+          : "";
       step(
         `${def.name}: image ${ctx.buildFrom ? `build deploy/${def.name}/Dockerfile` : imageRef(ctx, def.name)}${ports}`,
       );
@@ -677,7 +712,7 @@ export async function dockerUp(
 
   if (localSandboxActive(config)) ensureLocalSandboxImage(config);
   ensureNetwork(ctx);
-  ctx.databaseUrl = ensurePostgres(ctx, false);
+  ctx.databaseUrl = await ensurePostgres(ctx, false);
   if (!externalDatabaseUrl(ctx)) await waitPostgres(ctx);
 
   for (const def of ordered(runnableServices(config.services))) {
@@ -713,7 +748,7 @@ export async function dockerUp(
     ];
     const wiring = {
       ...(p.coreAccess === false ? {} : { CORE_API_URL: "http://core:8080" }),
-      ...orgEnv(p.name, config.orgId, config.publicUrl, config.services.includes("portal"), brandEnvOf(config)),
+      ...orgEnv(p.name, config.orgId, config.publicUrl, brandEnvOf(config)),
       PORT: "8080",
     };
     const env = {
@@ -739,15 +774,10 @@ export async function dockerUp(
 function printUrls(ctx: DockerCtx): void {
   note("");
   ok(`stack up — ${ctx.config.orgId}`);
-  const has = (s: ServiceName): boolean => ctx.config.services.includes(s);
-  const url = (s: ServiceName): string =>
-    `http://localhost:${baseHostPort(ctx) + serviceDef(s).docker.hostPortOffset!}`;
-  if (has("portal")) note(`   portal : ${url("portal")}  (public front door)`);
-  if (has("auth"))
-    note(`   auth   : ${url("portal")}/idp/authorize  (sign-in broker, published only through the portal)`);
-  if (has("web-ui")) note(`   web-ui : ${url("web-ui")}`);
-  if (has("admin")) note(`   admin  : ${url("admin")}/admin`);
-  note(`   core   : ${url("core")}`);
+  note(
+    `   web    : http://localhost:${publicHostPort(ctx)}  (web UI and sign-in${ctx.config.services.includes("auth") ? "; qm admin-login prints an administrator sign-in link" : ""})`,
+  );
+  note(`   core   : http://localhost:${baseHostPort(ctx)}`);
   note(`   status : qm status   ·   logs: qm logs core   ·   stop: qm down`);
 }
 
@@ -832,7 +862,9 @@ export async function dockerDown(config: QmConfig, opts: { purge?: boolean } = {
   if (opts.purge) {
     warn("purging the network and Postgres volume (durable data will be lost)");
     docker(["network", "rm", prefix], /not found|No such/);
-    docker(["volume", "rm", `${prefix}-pgdata`, `${prefix}-coredata`], /No such volume|not found|in use/);
+    const volumes = new Set(capture("docker", ["volume", "ls", "-q", "--filter", `name=${prefix}-`]).split("\n"));
+    const purge = [`${prefix}-pgdata`, `${prefix}-coredata`].filter((name) => volumes.has(name));
+    if (purge.length) docker(["volume", "rm", ...purge]);
   }
   ok("down.");
 }

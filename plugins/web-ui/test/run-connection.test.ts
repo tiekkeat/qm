@@ -1,3 +1,4 @@
+import { item } from "./item-fixture.ts";
 import assert from "node:assert/strict";
 import { test, type TestContext } from "node:test";
 import { Agent } from "@earendil-works/pi-agent-core";
@@ -274,11 +275,13 @@ test("approval activity reaches the visible transcript before any response text"
       result: null,
       activity: [
         {
-          seq: 57,
-          parentSeq: null,
-          type: "approval_resolved",
-          payload: { requestId: "a", command: "help", approved: true, scope: "once" },
-          createdAt: 100,
+          item: item("ElicitationResponse", {
+            seq: 57,
+            createdAt: 100,
+            elicitId: "a",
+            approved: true,
+            body: { command: "help", scope: "once" },
+          }),
         },
       ],
     },
@@ -293,11 +296,13 @@ test("approval activity reaches the visible transcript before any response text"
       result: { status: "ok", reply: "Done" },
       activity: [
         {
-          seq: 57,
-          parentSeq: null,
-          type: "approval_resolved",
-          payload: { requestId: "a", command: "help", approved: true, scope: "once" },
-          createdAt: 100,
+          item: item("ElicitationResponse", {
+            seq: 57,
+            createdAt: 100,
+            elicitId: "a",
+            approved: true,
+            body: { command: "help", scope: "once" },
+          }),
         },
       ],
     },
@@ -341,4 +346,76 @@ test("a resume snapshot replaces whitespace-normalized transcript seeds", async 
   );
   const stream = await fn(model, {} as TranscriptContext, {});
   assert.deepEqual((await stream.result()).content, [{ type: "text", text: "\nChecking.\n\nNext part" }]);
+});
+
+test("reasoning frames and snapshots build live thinking blocks, deduped by per-block offset", async (t) => {
+  const state = streamingFetch(t);
+  const stream = await makeRunResumeStreamFn("r")(model, {} as TranscriptContext, {});
+  await flush();
+  state.send({
+    type: "CUSTOM",
+    name: "reasoning",
+    value: { step: "s1", index: 0, offset: 0, delta: "**Checking** the " },
+  });
+  state.send({
+    type: "CUSTOM",
+    name: "reasoning",
+    value: { step: "s1", index: 0, offset: 0, delta: "**Checking** the " },
+  });
+  state.send({ type: "CUSTOM", name: "reasoning", value: { step: "s1", index: 0, offset: 17, delta: "cache" } });
+  state.send({ type: "CUSTOM", name: "reasoning", value: { step: "s1", index: 0, offset: 99, delta: "gap" } });
+  state.send({
+    type: "CUSTOM",
+    name: "run",
+    value: {
+      status: "running",
+      result: null,
+      partial: "hello",
+      reasoning: [
+        { step: "s1", index: 0, text: "**Checking** the cache and queue" },
+        { step: "s1", index: 2, text: "second" },
+      ],
+    },
+  });
+  state.send({ type: "CUSTOM", name: "delta", value: { offset: 5, delta: " world" } });
+  state.send({ type: "CUSTOM", name: "run", value: { status: "done", result: { status: "ok" } } });
+  const message = await stream.result();
+  assert.deepEqual(message.content, [{ type: "text", text: "hello world" }]);
+  assert.deepEqual((message as unknown as { work: { reasoning: unknown } }).work.reasoning, [
+    { step: "s1", index: 0, text: "**Checking** the cache and queue" },
+    { step: "s1", index: 2, text: "second" },
+  ]);
+});
+
+test("a new step's reasoning replaces unpersisted blocks, so a retried attempt never shows the dead attempt's", async (t) => {
+  const state = streamingFetch(t);
+  const stream = await makeRunResumeStreamFn("r")(model, {} as TranscriptContext, {});
+  await flush();
+  state.send({
+    type: "CUSTOM",
+    name: "reasoning",
+    value: { step: "dead", index: 0, offset: 0, delta: "half a thought" },
+  });
+  state.send({ type: "CUSTOM", name: "reasoning", value: { step: "retry", index: 0, offset: 0, delta: "fresh" } });
+  state.send({ type: "CUSTOM", name: "run", value: { status: "done", result: { status: "ok", reply: "ok" } } });
+  const message = await stream.result();
+  assert.deepEqual((message as unknown as { work: { reasoning: unknown } }).work.reasoning, [
+    { step: "retry", index: 0, text: "fresh" },
+  ]);
+});
+
+test("a new run attempt drops the previous attempt's unpersisted reasoning", async (t) => {
+  const state = streamingFetch(t);
+  const stream = await makeRunResumeStreamFn("r")(model, {} as TranscriptContext, {});
+  await flush();
+  state.send({ type: "CUSTOM", name: "run", value: { status: "running", result: null, attempt: 1 } });
+  state.send({
+    type: "CUSTOM",
+    name: "reasoning",
+    value: { step: "dead", index: 0, offset: 0, delta: "half a thought" },
+  });
+  state.send({ type: "CUSTOM", name: "run", value: { status: "running", result: null, attempt: 2 } });
+  state.send({ type: "CUSTOM", name: "run", value: { status: "done", result: { status: "ok", reply: "ok" } } });
+  const message = await stream.result();
+  assert.deepEqual((message as unknown as { work: { reasoning: unknown } }).work.reasoning, []);
 });
